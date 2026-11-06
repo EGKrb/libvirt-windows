@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>libvirt for Windows</title>
+<meta name="description" content="An unofficial port of libvirt to Windows x64: virsh, the daemons and QEMU guests accelerated by the Windows Hypervisor Platform, with virtual networks.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230e7490'/%3E%3Crect x='7' y='8' width='18' height='6' rx='1.5' fill='none' stroke='white' stroke-width='2.2'/%3E%3Crect x='7' y='18' width='18' height='6' rx='1.5' fill='none' stroke='white' stroke-width='2.2'/%3E%3C/svg%3E">
+<style>
+:root {
+  --bg: #f7f9fb; --surface: #ffffff; --text: #14202b; --muted: #55657a;
+  --border: #dde4ec; --accent: #0e7490; --accent-soft: #e0f2f7;
+  --code-bg: #0f1720; --code-text: #d7e3ee; --code-dim: #7d90a3; --code-hi: #5eead4;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0b1117; --surface: #121b24; --text: #e4ecf3; --muted: #93a4b6;
+    --border: #233140; --accent: #38bdf8; --accent-soft: #10283a;
+    --code-bg: #070c11; --code-text: #d7e3ee; --code-dim: #6d8094; --code-hi: #5eead4;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0b1117; --surface: #121b24; --text: #e4ecf3; --muted: #93a4b6;
+  --border: #233140; --accent: #38bdf8; --accent-soft: #10283a;
+  --code-bg: #070c11; --code-text: #d7e3ee; --code-dim: #6d8094; --code-hi: #5eead4;
+}
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0; background: var(--bg); color: var(--text);
+  font: 16px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+a { color: var(--accent); }
+code, pre { font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: 0.9em; font-variant-ligatures: none; }
+:not(pre) > code { background: var(--accent-soft); padding: 0.1em 0.35em; border-radius: 4px; }
+.wrap { max-width: 980px; margin: 0 auto; padding: 0 16px; }
+header.top { border-bottom: 1px solid var(--border); background: var(--surface); }
+header.top .wrap { display: flex; align-items: center; justify-content: space-between; gap: 12px; height: 56px; }
+.brand { display: flex; align-items: center; gap: 10px; font-weight: 700; color: var(--text); text-decoration: none; }
+nav { display: flex; gap: 18px; flex-wrap: wrap; }
+nav a { color: var(--muted); text-decoration: none; font-size: 0.95rem; }
+nav a:hover { color: var(--accent); }
+.hero { padding-top: 56px; padding-bottom: 32px; }
+.hero h1 { font-size: clamp(2rem, 5vw, 3rem); line-height: 1.15; margin: 0 0 14px; letter-spacing: -0.02em; }
+.hero p.lead { font-size: 1.15rem; color: var(--muted); max-width: 680px; margin: 0 0 24px; }
+.buttons { display: flex; gap: 12px; flex-wrap: wrap; }
+.btn { display: inline-block; padding: 10px 18px; border-radius: 8px; text-decoration: none; font-weight: 600; border: 1px solid var(--border); color: var(--text); background: var(--surface); }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+:root[data-theme="dark"] .btn.primary { color: #06121c; }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .btn.primary { color: #06121c; } }
+pre.term { background: var(--code-bg); color: var(--code-text); border-radius: 10px; padding: 18px 20px; overflow-x: auto; margin: 28px 0 0; line-height: 1.5; }
+.term .p { color: var(--code-hi); }
+.term .d { color: var(--code-dim); }
+section { padding: 36px 0; border-top: 1px solid var(--border); }
+section h2 { font-size: 1.5rem; margin: 0 0 8px; letter-spacing: -0.01em; }
+section > .wrap > p.sub { color: var(--muted); margin: 0 0 24px; max-width: 720px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px; }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 18px; }
+.card h3 { margin: 0 0 6px; font-size: 1.05rem; }
+.card p { margin: 0; color: var(--muted); font-size: 0.95rem; }
+.table-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }
+table { border-collapse: collapse; width: 100%; font-size: 0.95rem; }
+th, td { text-align: left; padding: 9px 14px; border-bottom: 1px solid var(--border); vertical-align: top; }
+th { color: var(--muted); font-weight: 600; font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.04em; }
+tr:last-child td { border-bottom: 0; }
+td code { white-space: nowrap; }
+pre.block { background: var(--code-bg); color: var(--code-text); border-radius: 10px; padding: 16px 18px; overflow-x: auto; margin: 0 0 16px; }
+.steps { counter-reset: s; list-style: none; padding: 0; margin: 0 0 20px; }
+.steps li { counter-increment: s; position: relative; padding-left: 40px; margin-bottom: 12px; }
+.steps li::before { content: counter(s); position: absolute; left: 0; top: 0; width: 28px; height: 28px; border-radius: 50%; background: var(--accent-soft); color: var(--accent); font-weight: 700; display: grid; place-items: center; font-size: 0.9rem; }
+.note { border-left: 3px solid var(--accent); background: var(--surface); padding: 12px 16px; border-radius: 0 8px 8px 0; color: var(--muted); }
+footer { border-top: 1px solid var(--border); padding: 28px 0 40px; color: var(--muted); font-size: 0.9rem; }
+footer .wrap { display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+@media (max-width: 640px) { nav { display: none; } .hero { padding-top: 36px; } }
+</style>
+</head>
+<body>
+<header class="top">
+  <div class="wrap">
+    <a class="brand" href="#">
+      <svg width="28" height="28" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="#0e7490"/><rect x="7" y="8" width="18" height="6" rx="1.5" fill="none" stroke="#fff" stroke-width="2.2"/><rect x="7" y="18" width="18" height="6" rx="1.5" fill="none" stroke="#fff" stroke-width="2.2"/><circle cx="11" cy="11" r="1.3" fill="#fff"/><circle cx="11" cy="21" r="1.3" fill="#fff"/></svg>
+      libvirt-windows
+    </a>
+    <nav>
+      <a href="#status">Status</a>
+      <a href="#how">How it works</a>
+      <a href="#start">Quick start</a>
+      <a href="https://github.com/EGKrb/libvirt-windows">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+  <div class="wrap hero">
+    <h1>libvirt, native on Windows.</h1>
+    <p class="lead">An unofficial port of libvirt 12.9.0 to Windows x64: <code>virsh</code>, the daemons and QEMU guests accelerated by the Windows Hypervisor Platform. libvirt's own code with its platform layers ported, so the same API, XML and commands.</p>
+    <div class="buttons">
+      <a class="btn primary" href="https://github.com/EGKrb/libvirt-windows#build">Build it</a>
+      <a class="btn" href="https://github.com/EGKrb/libvirt-windows">View on GitHub</a>
+      <a class="btn" href="https://github.com/EGKrb/libvirt-windows/blob/main/README.fr.md">Français</a>
+    </div>
+<pre class="term"><span class="d">PS&gt;</span> install\sbin\virtqemud.exe --daemon
+<span class="d">PS&gt;</span> virsh -c qemu:///system start guest
+Domain 'guest' started
+<span class="d">PS&gt;</span> virsh -c qemu:///system net-dhcp-leases default
+ Expiry Time           MAC address         Protocol   IP address         Hostname
+<span class="d">--------------------------------------------------------------------------------</span>
+ 2026-11-06 17:54:49   52:54:00:6e:65:74   ipv4       192.168.122.2/24   ubuntu
+<span class="d">PS&gt;</span> virsh -c qemu:///system console guest
+Connected to domain 'guest'
+Escape character is ^] (Ctrl + ])
+<span class="p">ubuntu@ubuntu:~$</span></pre>
+  </div>
+
+  <section>
+    <div class="wrap">
+      <p class="note"><strong>Not an official libvirt release</strong>, and not affiliated with the libvirt project. The Windows changes were written with an AI assistant; libvirt declines contributions that include AI-generated content, so nothing here is to be submitted upstream. Experimental: try it on machines you can afford to break.</p>
+    </div>
+  </section>
+
+  <section>
+    <div class="wrap">
+      <h2>What it does</h2>
+      <p class="sub">Tested on Windows 11 with Ubuntu 24.04 guests.</p>
+      <div class="grid">
+        <div class="card"><h3>The libvirt daemons</h3><p><code>libvirtd</code> or the modular <code>virtqemud</code>, <code>virtnetworkd</code>, <code>virtsecretd</code>…, on AF_UNIX sockets, running in the background and taking guests back after a restart.</p></div>
+        <div class="card"><h3>QEMU with WHPX</h3><p><code>&lt;domain type='whpx'&gt;</code>: start, stop, suspend, resume, screenshots, QMP, NIC hotplug, a memory balloon that gives memory back.</p></div>
+        <div class="card"><h3>virsh console</h3><p>The guest's serial port on a UNIX socket, typed into from the Windows console, with libvirt's single-session rule and <code>--force</code>.</p></div>
+        <div class="card"><h3>Virtual networks</h3><p>NAT and isolated networks without any driver: DHCP, DHCPv6, DNS, IPv6, <code>net-update</code>, leases, guests talking to each other and to the host.</p></div>
+        <div class="card"><h3>QoS and statistics</h3><p><code>domiftune</code> limits, floors and network bandwidth, applied by the network's switch; <code>domifstat</code> counters.</p></div>
+        <div class="card"><h3>Upgrade in place</h3><p>Install over running daemons, networks and guests; edited configuration files are kept.</p></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="status">
+    <div class="wrap">
+      <h2>Status</h2>
+      <p class="sub">What works, and what is not done or not tested yet.</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Area</th><th>Works and tested</th><th>Not yet</th></tr></thead>
+          <tbody>
+            <tr><td>Daemons</td><td>modular and monolithic, reload, stop, reconnection</td><td>Windows services</td></tr>
+            <tr><td>Remote</td><td>UNIX sockets, <code>ext</code> transport</td><td><code>ssh</code> (untested), TLS</td></tr>
+            <tr><td>QEMU</td><td>lifecycle, console, screenshot, QMP, hotplug, balloon, memory stats</td><td>save/restore, migration, snapshots</td></tr>
+            <tr><td>Guest networking</td><td><code>user</code>, <code>network</code>, <code>bridge</code> to a libvirt network</td><td><code>ethernet</code> and host bridges (TAP)</td></tr>
+            <tr><td>Virtual networks</td><td><code>nat</code>, isolated, DHCP, DHCPv6, DNS, IPv6, QoS</td><td><code>route</code> and <code>open</code> (need Wintun, untested)</td></tr>
+            <tr><td>Other drivers</td><td>secrets</td><td>storage, nodedev, interface, nwfilter, LXC</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <section id="how">
+    <div class="wrap">
+      <h2>How it works</h2>
+      <p class="sub">The POSIX and Linux mechanisms libvirt relies on, and what takes their place.</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>On Linux</th><th>On this port</th></tr></thead>
+          <tbody>
+            <tr><td><code>fork</code> + <code>exec</code></td><td><code>CreateProcess</code> suspended, resumed after the handshake</td></tr>
+            <tr><td>Signals</td><td>named events, console control handlers</td></tr>
+            <tr><td>PTY consoles</td><td>QEMU serial on a UNIX socket</td></tr>
+            <tr><td>KVM</td><td>WHPX, TCG otherwise</td></tr>
+            <tr><td>Bridge, TAP, dnsmasq, iptables</td><td><code>libvirt_netswitch</code>: one process per network, an Ethernet switch that QEMU joins with <code>-netdev stream</code>, libslirp for NAT, its own DHCP and DNS</td></tr>
+            <tr><td><code>tc</code></td><td>token buckets in the switch</td></tr>
+            <tr><td>Symbolic links</td><td>symbolic links, or the system files of Cygwin and MSYS2</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <section id="start">
+    <div class="wrap">
+      <h2>Quick start</h2>
+      <p class="sub">Windows 10 1803 or later, x64, with MSYS2 (UCRT64) and QEMU for Windows built with the patch in <code>windows/qemu</code>.</p>
+      <ol class="steps">
+        <li>Build and install from an MSYS2 UCRT64 shell:
+<pre class="block">git clone --recurse-submodules https://github.com/EGKrb/libvirt-windows
+cd libvirt-windows
+windows/build.sh deps
+windows/build.sh</pre></li>
+        <li>Put <code>install\bin</code>, <code>C:\msys64\ucrt64\bin</code> and QEMU on <code>PATH</code>, then start the daemons:
+<pre class="block">install\sbin\virtnetworkd.exe --daemon
+install\sbin\virtqemud.exe --daemon</pre></li>
+        <li>Define a guest of type <code>whpx</code> and start it, as with libvirt anywhere:
+<pre class="block">virsh -c qemu:///system define guest.xml
+virsh -c qemu:///system start guest</pre></li>
+      </ol>
+      <p class="note">The <a href="https://github.com/EGKrb/libvirt-windows#run">README</a> has a complete guest definition, how to stop a daemon and where the files are.</p>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <span>libvirt-windows · LGPL-2.1-or-later and GPL-2.0-or-later, as libvirt</span>
+    <span>Unofficial; libvirt is a project of the <a href="https://libvirt.org">libvirt developers</a></span>
+  </div>
+</footer>
+</body>
+</html>

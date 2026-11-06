@@ -1,0 +1,63 @@
+QEMU changes the Windows port of libvirt needs (apply to QEMU's source tree
+with: patch -p1 < qemu-for-libvirt-windows.patch).
+
+- target/i386/whpx: WHPX initialisation crashed with -machine none, which
+  libvirt uses to probe QEMU's capabilities.
+- system/physmem.c: RAM discard on Windows, so that the memory a virtio
+  balloon takes from the guest goes back to the host.
+
+Like QEMU, GPL-2.0-or-later.  Written with an AI assistant: QEMU's policy
+(docs/devel/code-provenance.rst) forbids submitting it upstream.
+
+--- a/target/i386/whpx/whpx-all.c
++++ b/target/i386/whpx/whpx-all.c
+@@ -3044,10 +3044,13 @@
+         0x80000002, 0x80000003, 0x80000004, 0x80000007, 0x80000008,
+         0x8000000A, 0x80000021, 0x80000022, 0xC0000000, 0xC0000001};
+ 
+-    X86MachineState *x86ms = X86_MACHINE(ms);
++    /* not an x86 machine with -machine none, as when libvirt probes QEMU */
++    X86MachineState *x86ms = (X86MachineState *)
++        object_dynamic_cast(OBJECT(ms), TYPE_X86_MACHINE);
+     bool pic_enabled = false;
+ 
+-    if (x86ms->pic == ON_OFF_AUTO_ON || x86ms->pic == ON_OFF_AUTO_AUTO) {
++    if (x86ms &&
++        (x86ms->pic == ON_OFF_AUTO_ON || x86ms->pic == ON_OFF_AUTO_AUTO)) {
+         pic_enabled = true;
+     }
+ 
+--- a/system/physmem.c
++++ b/system/physmem.c
+@@ -4244,6 +4244,31 @@
+                              __func__, rb->idstr, offset, length, ret);
+                 goto err;
+             }
++#elif defined(_WIN32)
++            /*
++             * No madvise() on Windows: decommitting the pages gives them
++             * back to the host, and committing them again makes them read
++             * as zero when next touched, as MADV_DONTNEED does for the
++             * anonymous memory of qemu_anon_ram_alloc().
++             */
++            if (rb->fd >= 0 || qemu_ram_is_shared(rb)) {
++                ret = -ENOTSUP;
++                error_report("%s: cannot discard shared memory %s:%" PRIx64
++                             " +%zx on Windows", __func__, rb->idstr, offset,
++                             length);
++                goto err;
++            }
++            if (!VirtualFree(host_startaddr, length, MEM_DECOMMIT) ||
++                !VirtualAlloc(host_startaddr, length, MEM_COMMIT,
++                              PAGE_READWRITE)) {
++                ret = -EINVAL;
++                error_report("%s: Failed to discard range "
++                             "%s:%" PRIx64 " +%zx (Windows error %lu)",
++                             __func__, rb->idstr, offset, length,
++                             GetLastError());
++                goto err;
++            }
++            ret = 0;
+ #else
+             ret = -ENOSYS;
+             error_report("%s: MADVISE not available %s:%" PRIx64 " +%zx (%d)",

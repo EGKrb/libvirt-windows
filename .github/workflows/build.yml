@@ -1,0 +1,70 @@
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+
+      - name: Dependencies
+        run: windows/build.sh deps
+
+      - name: Build and install
+        run: windows/build.sh
+
+      - name: virsh with the test driver
+        run: |
+          export PATH="$PWD/install/bin:$PATH"
+          virsh --version
+          virsh -c test:///default list --all
+          virsh -c test:///default net-list --all
+
+      - name: Daemons and the default network
+        run: |
+          export PATH="$PWD/install/bin:$PATH"
+          install/sbin/virtnetworkd.exe --daemon
+          install/sbin/virtqemud.exe --daemon
+          sleep 5
+          virsh -c qemu:///system net-list --all
+          virsh -c qemu:///system net-info default
+          virsh -c qemu:///system net-list | grep -q 'default.*act'
+          virsh -c qemu:///system list --all
+          tasklist | grep -i libvirt_netswitch
+          cat install/var/log/libvirt/network/default.log
+
+      - name: Stop the daemons
+        if: always()
+        shell: pwsh
+        run: |
+          foreach ($d in 'virtqemud', 'virtnetworkd') {
+            $f = "install\var\run\$d.pid"
+            if (Test-Path $f) {
+              $p = (Get-Content $f).Trim()
+              try { [System.Threading.EventWaitHandle]::OpenExisting("Local\libvirt-signal-$p-15").Set() | Out-Null } catch {}
+            }
+          }
+          Get-ChildItem install\var\run\libvirt\network -Filter *.pid -ErrorAction SilentlyContinue | ForEach-Object {
+            $p = (Get-Content $_.FullName).Trim()
+            try { [System.Threading.EventWaitHandle]::OpenExisting("Local\libvirt-signal-$p-15").Set() | Out-Null } catch {}
+          }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libvirt-windows-install
+          path: install/
+          retention-days: 14
