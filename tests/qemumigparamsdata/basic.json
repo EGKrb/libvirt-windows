@@ -1,0 +1,6 @@
+{
+  "cpu-throttle-initial": 20,
+  "cpu-throttle-increment": 10,
+  "max-bandwidth": 33554432,
+  "downtime-limit": 300
+}

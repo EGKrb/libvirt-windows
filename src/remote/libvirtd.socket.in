@@ -1,0 +1,13 @@
+[Unit]
+Description=libvirt legacy monolithic daemon socket
+
+[Socket]
+ListenStream=@runstatedir@/libvirt/libvirt-sock
+Service=libvirtd.service
+SocketMode=@sockmode@
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target
+Also=libvirtd-ro.socket
+Also=libvirtd-admin.socket

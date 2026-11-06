@@ -1,0 +1,7 @@
+qemu-img \
+convert \
+-f raw \
+-O qcow2 \
+-o compat=1.1 \
+/dev/HostVG/Swap \
+/var/lib/libvirt/images/OtherDemo.img

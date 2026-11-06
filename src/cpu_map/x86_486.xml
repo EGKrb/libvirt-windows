@@ -1,0 +1,9 @@
+<cpus>
+  <model name='486'>
+    <check partial='compat'/>
+    <decode host='on' guest='on'/>
+    <feature name='fpu'/>
+    <feature name='pse'/>
+    <feature name='vme'/>
+  </model>
+</cpus>

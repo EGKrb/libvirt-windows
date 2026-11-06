@@ -1,0 +1,9 @@
+{
+  "id": "libvirt-1",
+  "return": {
+    "cpu-throttle-increment": 10,
+    "cpu-throttle-initial": 20,
+    "max-bandwidth": 33554432,
+    "downtime-limit": 300
+  }
+}

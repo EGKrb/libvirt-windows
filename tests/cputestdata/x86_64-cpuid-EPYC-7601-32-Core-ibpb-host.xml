@@ -1,0 +1,20 @@
+<cpu>
+  <arch>x86_64</arch>
+  <model>EPYC-v5</model>
+  <vendor>AMD</vendor>
+  <signature family='23' model='1' stepping='2'/>
+  <feature name='monitor'/>
+  <feature name='osxsave'/>
+  <feature name='ht'/>
+  <feature name='cmp_legacy'/>
+  <feature name='extapic'/>
+  <feature name='skinit'/>
+  <feature name='wdt'/>
+  <feature name='tce'/>
+  <feature name='topoext'/>
+  <feature name='perfctr_nb'/>
+  <feature name='invtsc'/>
+  <feature name='svm-lock'/>
+  <feature name='decodeassists'/>
+  <feature name='avic'/>
+</cpu>

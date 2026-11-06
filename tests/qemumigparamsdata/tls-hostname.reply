@@ -1,0 +1,11 @@
+{
+  "id": "libvirt-1",
+  "return": {
+    "cpu-throttle-increment": 10,
+    "tls-hostname": "f27-1.virt",
+    "cpu-throttle-initial": 20,
+    "tls-creds": "objlibvirt_migrate_tls0",
+    "max-bandwidth": 33554432,
+    "downtime-limit": 300
+  }
+}

@@ -1,0 +1,47 @@
+[Unit]
+Description=libvirt legacy monolithic daemon
+Documentation=man:libvirtd(8)
+Documentation=https://libvirt.org/
+# Use Wants instead of Requires so that users
+# can disable these three .socket units to revert
+# to a traditional non-activation deployment setup
+Wants=libvirtd.socket
+Wants=libvirtd-ro.socket
+Wants=libvirtd-admin.socket
+After=libvirtd.socket
+After=libvirtd-ro.socket
+After=libvirtd-admin.socket
+Requires=virtlogd.socket
+Wants=virtlockd.socket
+After=virtlogd.socket
+After=virtlockd.socket
+# To ensure that our helper daemons are not shut down before the main daemon
+# shuts down we need also explicit ordering with the .service unit
+After=virtlogd.service
+After=virtlockd.service
+Wants=systemd-machined.service
+After=network.target
+After=dbus.service
+After=iscsid.service
+After=apparmor.service
+After=remote-fs.target
+After=systemd-machined.service
+After=xencommons.service
+Conflicts=xendomains.service
+
+[Service]
+Type=notify-reload
+Environment=LIBVIRTD_ARGS="--timeout 120"
+EnvironmentFile=-@initconfdir@/libvirtd
+ExecStart=@sbindir@/libvirtd $LIBVIRTD_ARGS
+ExecReload=/bin/kill -HUP $MAINPID
+KillMode=process
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+Also=virtlockd.socket
+Also=virtlogd.socket
+Also=libvirtd.socket
+Also=libvirtd-ro.socket
+Also=libvirtd-admin.socket

@@ -1,0 +1,714 @@
+#!/usr/bin/env python3
+#
+# SPDX-License-Identifier: LGPL-2.1-or-later
+#
+# A "swiss army knife" tool for qemu capability probing '.replies' files. See
+# below in 'description' for more information.
+
+from pathlib import Path
+import argparse
+import json
+import os
+import sys
+import re
+
+
+class qrtException(Exception):
+    pass
+
+
+class qmpSchemaException(Exception):
+    pass
+
+
+# Load the 'replies' file into a list of (command, reply) tuples of parsed JSON
+def qemu_replies_load(filename):
+    conv = []
+
+    with open(filename, "r") as fh:
+        command = None
+        jsonstr = ''
+
+        try:
+            for line in fh:
+                jsonstr += line
+
+                if line == '\n':
+                    if command is None:
+                        command = json.loads(jsonstr)
+                    else:
+                        conv.append({'cmd': command, 'rep': json.loads(jsonstr)})
+                        command = None
+
+                    jsonstr = ''
+
+            if command is not None and jsonstr != '':
+                conv.append({'cmd': command, 'rep': json.loads(jsonstr)})
+                command = None
+                jsonstr = ''
+
+        except json.decoder.JSONDecodeError as je:
+            raise qrtException("JSON error:\n'%s'\nwhile processing snippet:\n'%s'" % (je, jsonstr))
+
+        if command is not None or jsonstr != '':
+            if command is not None:
+                errorstr = json.dumps(command, indent=2)
+            else:
+                errorstr = jsonstr
+
+            raise qrtException("replies file error: Missing reply for command:\n'%s'" % errorstr)
+
+    return conv
+
+
+# Format the list of (command, reply) tuples into a string and compare it with
+# the 'replies' file. Optionally regenerate the replies file if the output doesn't match
+def qemu_replies_compare_or_replace(filename, conv, regenerate_on_error):
+    actual = ''
+    seq = 9999  # poison the initial counter state
+
+    # possibly fix mis-ordererd 'id' fields
+    for c in conv:
+        # 'qmp_capabilities' command restarts the numbering sequence
+        if c['cmd']['execute'] == 'qmp_capabilities':
+            seq = 1
+
+        newid = 'libvirt-%d' % seq
+        c['cmd']['id'] = newid
+        c['rep']['id'] = newid
+
+        seq += 1
+
+        # format the output string
+        if len(actual) != 0:
+            actual += '\n\n'
+
+        actual += json.dumps(c['cmd'], indent=2) + '\n\n' + json.dumps(c['rep'], indent=2)
+
+    expect = ''
+    actual += '\n'
+
+    with open(filename, "r") as fh:
+        expect = fh.read()
+
+    if actual != expect:
+        if regenerate_on_error:
+            with open(filename, "w") as fh:
+                fh.write(actual)
+
+        raise qrtException("replies file error: Expected content of '%s' doesn't match actual content" % filename)
+
+
+# Process the replies file programmatically here.
+# The 'conv' argument contains the whole conversation as a list of
+# (command, reply) tuples, where both command and reply are already parsed JSON
+# and thus represented by native python types (dict, list, etc ...)
+#
+# The code below contains a few examples and hints how to use the programatic
+# processing. Do not forget to use '--regenerate' flag to update the output files.
+#
+# Beware that this updates the output file which is used as input for any
+# subsequent re-run of the tool which can re-apply the modification.
+def modify_replies(conv):
+    return  # remove this to enable modifications
+
+    version = None  # filled with a dictionary  with 'major', 'minor', 'micro' keys
+
+    # find version of current qemu for later use
+    for c in conv:
+        if c['cmd']['execute'] == 'query-version':
+            version = c['rep']['return']['qemu']
+            break
+
+    if version is None:
+        raise Exception("'query-version' not found in the .replies file")
+
+    idx = -1
+    # Find index of a command, in this case we're looking for the last
+    # invocation of given command
+    for i in range(len(conv)):
+        c = conv[i]
+
+        if c['cmd']['execute'] == 'device-list-properties':
+            idx = i
+
+    if idx == -1:
+        raise Exception("entry not found")
+
+    # Prepare data for inserting a new command
+
+    # Command definition and error are instantiated via native python types
+    cmd = {'execute': 'device-list-properties',
+           'arguments': {'typename': 'example-device'}}
+
+    reply_unsupp = {'error': {'class': 'DeviceNotFound',
+                              'desc': "Device 'example-device' not found"}}
+
+    # Real reply data can be also parsed from JSON
+    reply = json.loads('''
+    {
+      "return": [
+        {
+          "name": "dummy_prop",
+          "type": "str"
+        },
+        {
+          "name": "test",
+          "type": "str"
+        }
+        ]
+    }
+    ''')
+
+    # insert command into the QMP conversation based on version of qemu
+    if version['major'] >= 8 and version['minor'] > 0:
+        conv.insert(idx, {'cmd': cmd, 'rep': reply})
+    else:
+        conv.insert(idx, {'cmd': cmd, 'rep': reply_unsupp})
+
+
+# Validates that 'entry' (an member of the QMP schema):
+# - checks that it's a Dict (imported from a JSON object)
+# - checks that all 'mandatory' fields are present and their types match
+# - checks the types of all 'optional' fields
+# - checks that no unknown fields are present
+def validate_qmp_schema_check_keys(entry, mandatory, optional):
+    keys = set(entry.keys())
+
+    for k, t in mandatory:
+        try:
+            keys.remove(k)
+        except KeyError:
+            raise qmpSchemaException("missing mandatory key '%s' in schema '%s'" % (k, entry))
+
+        if not isinstance(entry[k], t):
+            raise qmpSchemaException("key '%s' is not of the expected type '%s' in schema '%s'" % (k, t, entry))
+
+    for k, t in optional:
+        if k in keys:
+            keys.discard(k)
+
+            if not isinstance(entry[k], t):
+                raise qmpSchemaException("key '%s' is not of the expected type '%s' in schema '%s'" % (k, t, entry))
+
+    if len(keys) > 0:
+        raise qmpSchemaException("unhandled keys '%s' in schema '%s'" % (','.join(list(keys)), entry))
+
+
+# Validates the optional 'features' and that they consist only of strings
+def validate_qmp_schema_check_features_list(entry):
+    for f in entry.get('features', []):
+        if not isinstance(f, str):
+            raise qmpSchemaException("broken 'features' list in schema entry '%s'" % entry)
+
+
+# Validate that the passed schema has only members supported by this script and
+# by the libvirt internals. This is useful to stay up to date with any changes
+# to the schema.
+def validate_qmp_schema(schemalist):
+    for entry in schemalist:
+        if not isinstance(entry, dict):
+            raise qmpSchemaException("schema entry '%s' is not a JSON Object (dict)" % (entry))
+
+        if entry.get('meta-type', None) == 'command':
+            validate_qmp_schema_check_keys(entry,
+                                           mandatory=[('name', str),
+                                                      ('meta-type', str),
+                                                      ('arg-type', str),
+                                                      ('ret-type', str)],
+                                           optional=[('features', list),
+                                                     ('allow-oob', bool)])
+
+            validate_qmp_schema_check_features_list(entry)
+
+        elif entry.get('meta-type', None) == 'event':
+            validate_qmp_schema_check_keys(entry,
+                                           mandatory=[('name', str),
+                                                      ('meta-type', str),
+                                                      ('arg-type', str)],
+                                           optional=[('features', list)])
+
+            validate_qmp_schema_check_features_list(entry)
+
+        elif entry.get('meta-type', None) == 'object':
+            validate_qmp_schema_check_keys(entry,
+                                           mandatory=[('name', str),
+                                                      ('meta-type', str),
+                                                      ('members', list)],
+                                           optional=[('tag', str),
+                                                     ('variants', list),
+                                                     ('features', list)])
+
+            validate_qmp_schema_check_features_list(entry)
+
+            for m in entry.get('members', []):
+                validate_qmp_schema_check_keys(m,
+                                               mandatory=[('name', str),
+                                                          ('type', str)],
+                                               optional=[('default', type(None)),
+                                                         ('features', list)])
+                validate_qmp_schema_check_features_list(m)
+
+            for m in entry.get('variants', []):
+                validate_qmp_schema_check_keys(m,
+                                               mandatory=[('case', str),
+                                                          ('type', str)],
+                                               optional=[])
+
+        elif entry.get('meta-type', None) == 'array':
+            validate_qmp_schema_check_keys(entry,
+                                           mandatory=[('name', str),
+                                                      ('meta-type', str),
+                                                      ('element-type', str)],
+                                           optional=[])
+
+        elif entry.get('meta-type', None) == 'enum':
+            validate_qmp_schema_check_keys(entry,
+                                           mandatory=[('name', str),
+                                                      ('meta-type', str)],
+                                           optional=[('members', list),
+                                                     ('values', list)])
+
+            for m in entry.get('members', []):
+                validate_qmp_schema_check_keys(m,
+                                               mandatory=[('name', str)],
+                                               optional=[('features', list)])
+                validate_qmp_schema_check_features_list(m)
+
+        elif entry.get('meta-type', None) == 'alternate':
+            validate_qmp_schema_check_keys(entry,
+                                           mandatory=[('name', str),
+                                                      ('meta-type', str),
+                                                      ('members', list)],
+                                           optional=[])
+
+            for m in entry.get('members', []):
+                validate_qmp_schema_check_keys(m,
+                                               mandatory=[('type', str)],
+                                               optional=[])
+
+        elif entry.get('meta-type', None) == 'builtin':
+            validate_qmp_schema_check_keys(entry,
+                                           mandatory=[('name', str),
+                                                      ('meta-type', str),
+                                                      ('json-type', str)],
+                                           optional=[])
+
+        else:
+            raise qmpSchemaException("unknown or missing 'meta-type' in schema entry '%s'" % entry)
+
+
+# Recursively traverse the schema and print out the schema query strings for
+# the corresponding entries. In certain cases the schema references itself,
+# which is handled by passing a 'trace' list which contains the current path
+def dump_qmp_probe_strings_iter(name, cur, trace, schema):
+    obj = schema[name]
+
+    if name in trace:
+        # The following is not a query string but sometimes useful for debugging
+        # print('%s (recursion)' % cur)
+        return
+
+    trace = trace + [name]
+
+    if obj['meta-type'] == 'command' or obj['meta-type'] == 'event':
+        arguments = obj.get('arg-type', None)
+        returns = obj.get('ret-type', None)
+
+        print(cur)
+
+        for f in obj.get('features', []):
+            print('%s/$%s' % (cur, f))
+
+        if arguments:
+            dump_qmp_probe_strings_iter(arguments, cur + '/arg-type', trace, schema)
+
+        if returns:
+            dump_qmp_probe_strings_iter(returns, cur + '/ret-type', trace, schema)
+
+    elif obj['meta-type'] == 'object':
+        members = sorted(obj.get('members', []), key=lambda d: d['name'])
+        variants = sorted(obj.get('variants', []), key=lambda d: d['case'])
+
+        for f in obj.get('features', []):
+            print('%s/$%s' % (cur, f))
+
+        for memb in members:
+            membpath = "%s/%s" % (cur, memb['name'])
+            print(membpath)
+
+            # object members can be queried for optionality by '*'
+            if 'default' in memb:
+                print("%s/*%s" % (cur, memb['name']))
+
+            for f in memb.get('features', []):
+                print('%s/$%s' % (membpath, f))
+
+            dump_qmp_probe_strings_iter(memb['type'], membpath, trace, schema)
+
+        for var in variants:
+            varpath = "%s/+%s" % (cur, var['case'])
+            print(varpath)
+            dump_qmp_probe_strings_iter(var['type'], varpath, trace, schema)
+
+    elif obj['meta-type'] == 'enum':
+        members = sorted(obj.get('members', []), key=lambda d: d['name'])
+
+        for m in members:
+            print('%s/^%s' % (cur, m['name']))
+
+            for f in m.get('features', []):
+                print('%s/^%s/$%s' % (cur, m['name'], f))
+
+    elif obj['meta-type'] == 'array':
+        dump_qmp_probe_strings_iter(obj['element-type'], cur, trace, schema)
+
+    elif obj['meta-type'] == 'builtin':
+        print('%s/!%s' % (cur, name))
+
+    elif obj['meta-type'] == 'alternate':
+        for var in obj['members']:
+            dump_qmp_probe_strings_iter(var['type'], cur, trace, schema)
+
+
+def dump_qmp_probe_strings(schemalist, dumpprefix):
+    schemadict = {}
+    toplevel = []
+
+    for memb in schemalist:
+        schemadict[memb['name']] = memb
+
+        if memb['meta-type'] == 'command' or memb['meta-type'] == 'event':
+            toplevel.append(memb['name'])
+
+    toplevel.sort()
+
+    for c in toplevel:
+        dump_qmp_probe_strings_iter(c, dumpprefix + '(qmp) ' + c, [], schemadict)
+
+
+def dump_qom_list_types(conv, dumpprefix):
+    types = []
+
+    for c in conv:
+        if c['cmd']['execute'] == 'qom-list-types':
+            for qomtype in c['rep']['return']:
+                # validate known fields:
+                # 'parent' is ignored below as it causes output churn
+                for k in qomtype:
+                    if k not in ['name', 'parent']:
+                        raise Exception("Unhandled 'qom-list-types' field '%s'" % k)
+
+                types.append(qomtype['name'])
+
+            c['processed'] = True
+
+            break
+
+    types.sort()
+
+    for t in types:
+        print(dumpprefix + '(qom) ' + t)
+
+
+def dump_device_and_object_properties(conv, dumpprefix):
+    ent = []
+
+    for c in conv:
+        prefix = None
+
+        if c['cmd']['execute'] == 'device-list-properties':
+            prefix = '(dev-prop)'
+
+        if c['cmd']['execute'] == 'qom-list-properties':
+            prefix = '(qom-prop)'
+
+        if prefix is None:
+            continue
+
+        c['processed'] = True
+
+        if 'return' not in c['rep']:
+            continue
+
+        for arg in c['rep']['return']:
+            for k in arg:
+                if k not in ['name', 'type', 'description', 'default-value']:
+                    raise Exception("Unhandled 'device-list-properties'/'qom-list-properties' typename '%s' field '%s'" % (c['cmd']['arguments']['typename'], k))
+
+            if 'default-value' in arg:
+                defval = ' (%s)' % str(arg['default-value'])
+            else:
+                defval = ''
+
+            ent.append('%s %s %s %s%s' % (prefix,
+                                          c['cmd']['arguments']['typename'],
+                                          arg['name'],
+                                          arg['type'],
+                                          defval))
+    ent.sort()
+
+    for e in ent:
+        print(dumpprefix + e)
+
+
+# Sort helper for version string e.g. '11.0', '1.2' etc. Tolerates empty version.
+def machine_type_sorter(item):
+    key = item[0]
+
+    if key == '':
+        return [0]
+
+    return list(map(int, key.split('.')))
+
+
+def dump_machine_types(conv, dumpprefix):
+    machines = dict()
+    aliases = []
+    dumped_kvm = False
+
+    for c in conv:
+        if c['cmd']['execute'] == 'query-machines':
+
+            c['processed'] = True
+
+            if dumped_kvm:
+                continue
+
+            for machine in c['rep']['return']:
+                deprecated = False
+                name = machine['name']
+                version = ''
+                match = re.fullmatch(r'(.+)-(\d+\.\d+)', name)
+
+                if match is not None:
+                    name = match.group(1)
+                    version = match.group(2)
+
+                if 'deprecated' in machine:
+                    deprecated = machine['deprecated']
+
+                if 'alias' in machine:
+                    aliases.append('%s -> %s' % (machine['alias'], machine['name']))
+
+                if name not in machines:
+                    machines[name] = {}
+
+                machines[name][version] = deprecated
+
+                # Dump only the machines for the first occurence of 'query-machines'
+                dumped_kvm = True
+
+    for (machine, versions) in sorted(machines.items()):
+        for (version, deprecated) in sorted(versions.items(), key=machine_type_sorter):
+            d = ''
+            if deprecated:
+                d = ' (deprecated)'
+
+            if len(version) > 0:
+                version = '-' + version
+
+            print('(machine) %s%s%s' % (machine, version, d))
+
+    aliases.sort()
+
+    for a in aliases:
+        print(dumpprefix + '(machine alias) ' + a)
+
+
+def dump_command_line_options(c, dumpprefix):
+    optpar = []
+
+    for opt in c['rep']['return']:
+        for par in opt['parameters']:
+            optpar.append('%s %s' % (opt['option'], par['name']))
+
+    optpar.sort()
+
+    for o in optpar:
+        print(dumpprefix + '(cl-opt) ' + o)
+
+
+def dump_other(conv, dumpprefix):
+    for c in conv:
+        if c['cmd']['execute'] == 'query-version':
+            print('%s(version) %s.%s.%s %s' % (dumpprefix,
+                                               c['rep']['return']['qemu']['major'],
+                                               c['rep']['return']['qemu']['minor'],
+                                               c['rep']['return']['qemu']['micro'],
+                                               c['rep']['return']['package']))
+            c['processed'] = True
+
+        if c['cmd']['execute'] == 'query-target':
+            print('%s(target) %s' % (dumpprefix, c['rep']['return']['arch']))
+            c['processed'] = True
+
+        if c['cmd']['execute'] == 'query-kvm':
+            print('%s(kvm) present:%s enabled:%s' % (dumpprefix,
+                                                     c['rep']['return']['present'],
+                                                     c['rep']['return']['enabled']))
+            c['processed'] = True
+
+        if c['cmd']['execute'] == 'query-command-line-options':
+            dump_command_line_options(c, dumpprefix)
+            c['processed'] = True
+
+
+# dumps the parts of the .replies file which are not handled by the various dump_
+# helpers
+def dump_unprocessed(conv):
+    actual = ''
+
+    for c in conv:
+        if 'processed' in c and c['processed'] is True:
+            continue
+
+        # skip stuf not making sense to be processed:
+        # 'qmp_capabilities' - startup of QMP, no interesting data
+        # 'query-cpu-model-expansion' - too host dependant, nothing relevant
+        if c['cmd']['execute'] in ['qmp_capabilities', 'query-cpu-model-expansion']:
+            continue
+
+        # skip commands not having successful return
+        if 'return' not in c['rep']:
+            continue
+
+        actual += json.dumps(c['cmd'], indent=2) + '\n\n' + json.dumps(c['rep'], indent=2)
+
+    if actual != '':
+        for line in actual.split('\n'):
+            print('(unprocessed) ' + line)
+
+
+def process_one(filename, args):
+    try:
+        conv = qemu_replies_load(filename)
+        dumped = False
+        dumpprefix = ''
+
+        if args.repliesdir:
+            dumpprefix = filename + ': '
+
+        modify_replies(conv)
+
+        for c in conv:
+            if c['cmd']['execute'] == 'query-qmp-schema':
+                validate_qmp_schema(c['rep']['return'])
+
+                if args.dump_all or args.dump_qmp_query_strings:
+                    dump_qmp_probe_strings(c['rep']['return'], dumpprefix)
+                    c['processed'] = True
+                    dumped = True
+
+        if args.dump_all:
+            dump_other(conv, dumpprefix)
+            dump_qom_list_types(conv, dumpprefix)
+            dump_device_and_object_properties(conv, dumpprefix)
+            dump_machine_types(conv, dumpprefix)
+            dumped = True
+
+        if args.dump_unprocessed:
+            dump_unprocessed(conv)
+            dumped = True
+
+        if dumped:
+            return True
+
+        qemu_replies_compare_or_replace(filename, conv, args.regenerate)
+
+    except qrtException as e:
+        print("'%s' ... FAIL\n%s" % (filename, e))
+        return False
+    except qmpSchemaException as qe:
+        print("'%s' ... FAIL\nqmp schema error: %s" % (filename, qe))
+        return False
+
+    print("'%s' ... OK" % filename)
+    return True
+
+
+description = '''A Swiss army knife tool for '.replies' files used by 'qemucapabilitiestest'
+
+This tool is used to validate, programmatically update or inspect the
+'.*replies' normally stored files under 'tests/qemucapabilitiesdata'.
+
+By default the file(s) passed as positional argument are used. All '.replies'
+files in a directory can be processed by specifying '--repliesdir /path/to/dir'
+argument.
+
+The default mode is validation which checks the following:
+    - each command has a reply and both are valid JSON
+    - numbering of the 'id' field is as expected
+    - the input file has the expected JSON formatting
+    - the QMP schema from qemu is fully covered by libvirt's code
+
+In 'dump' mode if '-dump-all' or one of the specific '-dump-*' flags (below)
+is selected the script outputs information gathered from the given '.replies'
+file. The data is also usable for comparing two '.replies' files in a "diffable"
+fashion as many of the query commands may change ordering or naming without
+functional impact on libvirt. The following specific dump options are useful
+on it's own:
+
+  --dump-qmp-query-strings
+
+    Dumps all possible valid QMP capability query strings based on the current
+    qemu version in format used by virQEMUQAPISchemaPathGet or
+    virQEMUCapsQMPSchemaQueries. It's useful to find specific query string
+    without having to piece the information together from 'query-qmp-schema'
+
+The tool can be also used to programmaticaly modify the '.replies' file by
+editing the 'modify_replies' method directly in the source, or for
+re-formatting and re-numbering the '.replies' file to conform with the required
+format. To update the output file the '--regenerate' flag can be used or the
+'VIR_TEST_REGENERATE_OUTPUT' environment variable must be set to '1'.
+'''
+
+if os.environ.get('VIR_TEST_REGENERATE_OUTPUT', '0') == '1':
+    default_regenerate = True
+else:
+    default_regenerate = False
+
+parser = argparse.ArgumentParser(formatter_class=argparse.RawDescriptionHelpFormatter,
+                                 description=description)
+
+parser.add_argument('--regenerate', action="store_true", default=default_regenerate,
+                    help="regenerate output file if actual output doesn't match")
+
+parser.add_argument('--repliesdir', default='',
+                    help='use all .replies files from the directory')
+
+parser.add_argument('replyfiles', nargs='*',
+                    help='.replies file(s) to process')
+
+parser.add_argument('--dump-all', action='store_true',
+                    help='invoke all --dump-* sub-commands')
+
+parser.add_argument('--dump-qmp-query-strings', action='store_true',
+                    help='dump QMP schema in form of query strings used to probe capabilities')
+
+
+parser.add_argument('--dump-unprocessed', action='store_true',
+                    help='dump JSON of commands unprocessed by any of the --dump-* options')
+
+args = parser.parse_args()
+
+files = []
+
+if args.replyfiles:
+    files += args.replyfiles
+
+if args.repliesdir:
+    files += Path(args.repliesdir).glob('*.replies')
+
+if len(files) == 0:
+    parser.print_help()
+    sys.exit(1)
+
+fail = False
+
+for file in files:
+    if not process_one(str(file), args):
+        fail = True
+
+if fail:
+    sys.exit(1)

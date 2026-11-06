@@ -1,0 +1,328 @@
+/*
+ * Copyright (C) 2014-2016 Red Hat, Inc.
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library.  If not, see
+ * <http://www.gnu.org/licenses/>.
+ */
+
+#include <config.h>
+
+#define LIBVIRT_VIRIDENTITYPRIV_H_ALLOW
+
+#include "internal.h"
+#include "viralloc.h"
+#include "vircommand.h"
+#include "viridentitypriv.h"
+#include "virmock.h"
+#include "virnetdev.h"
+#include "virnetdevbandwidth.h"
+#include "virnetdevip.h"
+#include "virnetdevtap.h"
+#include "virnetdevopenvswitch.h"
+#include "virscsivhost.h"
+#include "virtpm.h"
+#include "virutil.h"
+#include "virfile.h"
+#include "qemu/qemu_interface.h"
+#include "qemu/qemu_command.h"
+#include "domain_interface.h"
+#include <unistd.h>
+#include <fcntl.h>
+
+#include "testutils.h"
+
+#define VIR_FROM_THIS VIR_FROM_NONE
+
+long virGetSystemPageSize(void)
+{
+    return 4096;
+}
+
+GDateTime *g_date_time_new_now_utc(void)
+{
+    return g_date_time_new_from_unix_utc(1234567890);
+}
+
+GDateTime *g_date_time_new_now_local(void)
+{
+    return g_date_time_new_from_unix_local(1234567890);
+}
+
+
+char *
+virTPMCreateCancelPath(const char *devpath)
+{
+    (void)devpath;
+
+    return g_strdup("/sys/class/misc/tpm0/device/cancel");
+}
+
+/**
+ * Large values for memory would fail on 32 bit systems, despite having
+ * variables that support it.
+ */
+unsigned long long
+virMemoryMaxValue(bool capped G_GNUC_UNUSED)
+{
+    return LLONG_MAX;
+}
+
+int
+virSCSIVHostOpenVhostSCSI(int *vhostfd)
+{
+    *vhostfd = STDERR_FILENO + 1;
+
+    return 0;
+}
+
+char *
+virSCSIDeviceGetSgName(const char *sysfs_prefix G_GNUC_UNUSED,
+                       const char *adapter G_GNUC_UNUSED,
+                       unsigned int bus G_GNUC_UNUSED,
+                       unsigned int target G_GNUC_UNUSED,
+                       unsigned long long unit G_GNUC_UNUSED)
+{
+    return g_strdup_printf("sg0");
+}
+
+int
+virNetDevTapCreate(char **ifname,
+                   const char *tunpath G_GNUC_UNUSED,
+                   int *tapfd,
+                   size_t tapfdSize,
+                   unsigned int flags G_GNUC_UNUSED)
+{
+    size_t i;
+
+    if (STRNEQ_NULLABLE(*ifname, "mytap0")) {
+        VIR_FREE(*ifname);
+        *ifname = g_strdup("vnet0");
+    }
+
+    for (i = 0; i < tapfdSize; i++)
+        tapfd[i] = virTestMakeDummyFD(g_strdup_printf("@tap-%s-fd@", *ifname));
+
+    return 0;
+}
+
+
+int
+virDomainInterfaceBridgeConnect(virDomainDef *def G_GNUC_UNUSED,
+                                virDomainNetDef *net,
+                                int *tapfd,
+                                size_t *tapfdSize,
+                                bool privileged G_GNUC_UNUSED,
+                                ebtablesContext *ebtables G_GNUC_UNUSED,
+                                bool macFilter G_GNUC_UNUSED,
+                                const char *bridgeHelperName G_GNUC_UNUSED)
+{
+    size_t i;
+
+    for (i = 0; i < *tapfdSize; i++)
+        tapfd[i] = virTestMakeDummyFD(g_strdup_printf("@iface-%s-fd@", net->info.alias));
+
+    return 0;
+}
+
+
+int
+virNetDevSetMAC(const char *ifname G_GNUC_UNUSED,
+                const virMacAddr *macaddr G_GNUC_UNUSED)
+{
+    return 0;
+}
+
+
+int
+virNetDevExists(const char *ifname)
+{
+    return STREQ(ifname, "mytap0");
+}
+
+
+int virNetDevIPAddrAdd(const char *ifname G_GNUC_UNUSED,
+                       virSocketAddr *addr G_GNUC_UNUSED,
+                       virSocketAddr *peer G_GNUC_UNUSED,
+                       unsigned int prefix G_GNUC_UNUSED)
+{
+    return 0;
+}
+
+int
+virNetDevSetOnline(const char *ifname G_GNUC_UNUSED,
+                   bool online G_GNUC_UNUSED)
+{
+    return 0;
+}
+
+int
+virNetDevRunEthernetScript(const char *ifname G_GNUC_UNUSED,
+                           const char *script G_GNUC_UNUSED)
+{
+    return 0;
+}
+
+char *
+virHostGetDRMRenderNode(void)
+{
+    return g_strdup("/dev/dri/foo");
+}
+
+static void (*real_virCommandPassFD)(virCommand *cmd, int fd, unsigned int flags);
+
+
+void
+virCommandPassFD(virCommand *cmd,
+                 int fd,
+                 unsigned int flags)
+{
+    /* Test cases run in the context of the test program, so attempting to use
+     * the STDIO fds with virCommand could break/close them and thus break
+     * output of the test itself. */
+    if (fd == STDIN_FILENO ||
+        fd == STDOUT_FILENO ||
+        fd == STDERR_FILENO) {
+        virTestDummyFDContextMarkError(g_strdup("test case tried to pass stdio FDs to virCommandPassFD"));
+        return;
+    }
+
+    /* Some test scenarios pass invalid FDs to virCommand. We want to skip
+     * operations on those since they cause errors in e.g. valgrind.
+     */
+    if (fcntl(fd, F_GETFD) == -1) {
+        virTestDummyFDContextMarkError(g_strdup_printf("test case tried to pass invalid FD '%d' to virCommandPassFD",
+                                                       fd));
+        return;
+    }
+
+    if (!real_virCommandPassFD)
+        VIR_MOCK_REAL_INIT(virCommandPassFD);
+
+    real_virCommandPassFD(cmd, fd, flags);
+}
+
+int
+virNetDevOpenvswitchGetVhostuserIfname(const char *path G_GNUC_UNUSED,
+                                       bool server G_GNUC_UNUSED,
+                                       char **ifname)
+{
+    *ifname = g_strdup("vhost-user0");
+    return 1;
+}
+
+int
+qemuInterfaceOpenVhostNet(virDomainObj *vm,
+                          virDomainNetDef *net)
+{
+    qemuDomainNetworkPrivate *netpriv = QEMU_DOMAIN_NETWORK_PRIVATE(net);
+    size_t vhostfdSize = net->driver.virtio.queues;
+    size_t i;
+
+    if (!vhostfdSize)
+         vhostfdSize = 1;
+
+    if ((vm->def->virtType != VIR_DOMAIN_VIRT_KVM &&
+         vm->def->virtType != VIR_DOMAIN_VIRT_HYPERV) ||
+        net->driver.virtio.name == VIR_DOMAIN_NET_DRIVER_TYPE_QEMU) {
+        return 0;
+    }
+
+    if (!virDomainNetIsVirtioModel(net))
+        return 0;
+
+    for (i = 0; i < vhostfdSize; i++) {
+        g_autofree char *name = g_strdup_printf("vhostfd-%s%zu", net->info.alias, i);
+        int fd = virTestMakeDummyFD(g_strdup_printf("@vhostfd-%s-fd@", net->info.alias));
+
+        netpriv->vhostfds = g_slist_prepend(netpriv->vhostfds, qemuFDPassDirectNew(name, &fd));
+    }
+
+    netpriv->vhostfds = g_slist_reverse(netpriv->vhostfds);
+
+    return 0;
+}
+
+
+int
+qemuBuildTPMOpenBackendFDs(const char *tpmdev,
+                           int *tpmfd,
+                           int *cancelfd)
+{
+    *tpmfd = virTestMakeDummyFD(g_strdup_printf("@tpm-%s-fd@", tpmdev));
+    *cancelfd = virTestMakeDummyFD(g_strdup_printf("@tpm-%s-cancelfd@", tpmdev));
+    return 0;
+}
+
+
+int
+virNetDevBandwidthSetRootQDisc(const char *ifname G_GNUC_UNUSED,
+                               const char *qdisc G_GNUC_UNUSED)
+{
+    return 0;
+}
+
+
+int
+qemuVDPAConnect(const char *devicepath)
+{
+    return virTestMakeDummyFD(g_strdup_printf("@vdpa-%s-fd@", devicepath));
+}
+
+char *
+virIdentityEnsureSystemToken(void)
+{
+    return g_strdup("3de80bcbf22d4833897f1638e01be9b2");
+}
+
+
+int
+virNetDevSetMTU(const char *ifname G_GNUC_UNUSED,
+                int mtu G_GNUC_UNUSED)
+{
+    return 0;
+}
+
+static char *(*real_virFileCanonicalizePath)(const char *path);
+
+char *
+virFileCanonicalizePath(const char *path)
+{
+    size_t i;
+    const char *fws[] = {
+        /* These are locations from our firmware descriptors
+         * stored in qemufirmwaredata/. */
+        "/usr/share/edk2/",
+        "/usr/share/OVMF/",
+        "/usr/share/AAVMF/",
+        "/usr/share/seabios/",
+
+        /* These are 'random' locations from domain XMLs stored
+         * in qemuxmlconfdata/. */
+        "/path/to/OVMF_CODE.fd",
+        "/path/to/guest_BOTH.fd",
+        "/path/to/OVMF_VARS.fd",
+    };
+
+    for (i = 0; i < G_N_ELEMENTS(fws); i++) {
+        if (STRPREFIX(path, fws[i])) {
+            return g_strdup(path);
+        }
+    }
+
+    if (!real_virFileCanonicalizePath) {
+        VIR_MOCK_REAL_INIT(virFileCanonicalizePath);
+    }
+
+    return real_virFileCanonicalizePath(path);
+}

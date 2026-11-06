@@ -1,0 +1,28 @@
+[Unit]
+Description=libvirt guests suspend/resume service
+Documentation=man:libvirt-guests(8)
+Documentation=https://libvirt.org/
+Requires=virt-guest-shutdown.target
+After=network.target
+After=time-sync.target
+After=libvirtd.socket
+After=virtqemud.socket
+After=virtlxcd.socket
+After=virtvboxd.socket
+After=virtvzd.socket
+After=virtxend.socket
+After=virt-guest-shutdown.target
+
+[Service]
+EnvironmentFile=-@initconfdir@/libvirt-guests
+# Hack just call traditional service until we factor
+# out the code
+ExecStart=@libexecdir@/libvirt-guests.sh start
+ExecStop=@libexecdir@/libvirt-guests.sh stop
+Type=exec
+RemainAfterExit=yes
+StandardOutput=journal+console
+TimeoutStopSec=0
+
+[Install]
+WantedBy=multi-user.target

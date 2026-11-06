@@ -1,0 +1,11 @@
+{
+  "id": "libvirt-1",
+  "return": {
+    "cpu-throttle-increment": 10,
+    "tls-hostname": "",
+    "cpu-throttle-initial": 20,
+    "tls-creds": "",
+    "max-bandwidth": 33554432,
+    "downtime-limit": 300
+  }
+}

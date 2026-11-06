@@ -1,0 +1,989 @@
+/*
+ * domain_capabilities.c: domain capabilities XML processing
+ *
+ * Copyright (C) 2014 Red Hat, Inc.
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library.  If not, see
+ * <http://www.gnu.org/licenses/>.
+ */
+
+#include <config.h>
+
+#include "domain_capabilities.h"
+#include "domain_conf.h"
+#include "viralloc.h"
+#include "virstring.h"
+
+#define VIR_FROM_THIS VIR_FROM_CAPABILITIES
+
+VIR_ENUM_IMPL(virDomainCapsCPUUsable,
+              VIR_DOMCAPS_CPU_USABLE_LAST,
+              "unknown", "yes", "no",
+);
+
+
+VIR_ENUM_DECL(virDomainCapsFeature);
+VIR_ENUM_IMPL(virDomainCapsFeature,
+              VIR_DOMAIN_CAPS_FEATURE_LAST,
+              "iothreads",
+              "vmcoreinfo",
+              "genid",
+              "backingStoreInput",
+              "backup",
+              "async-teardown",
+              "s390-pv",
+              "ps2",
+              "tdx",
+);
+
+static virClass *virDomainCapsClass;
+static virClass *virDomainCapsCPUModelsClass;
+
+static void virDomainCapsDispose(void *obj);
+static void virDomainCapsCPUModelsDispose(void *obj);
+
+static int virDomainCapsOnceInit(void)
+{
+    if (!VIR_CLASS_NEW(virDomainCaps, virClassForObjectLockable()))
+        return -1;
+
+    if (!VIR_CLASS_NEW(virDomainCapsCPUModels, virClassForObject()))
+        return -1;
+
+    return 0;
+}
+
+
+VIR_ONCE_GLOBAL_INIT(virDomainCaps);
+
+
+void
+virSEVCapabilitiesFree(virSEVCapability *cap)
+{
+    if (!cap)
+        return;
+
+    g_free(cap->pdh);
+    g_free(cap->cert_chain);
+    g_free(cap->cpu0_id);
+    g_free(cap);
+}
+
+
+void
+virSGXCapabilitiesFree(virSGXCapability *cap)
+{
+    if (!cap)
+        return;
+
+    g_free(cap->sgxSections);
+    g_free(cap);
+}
+
+
+void
+virDomainCapsFeatureHypervFree(virDomainCapsFeatureHyperv *cap)
+{
+    if (!cap)
+        return;
+
+    g_free(cap->vendor_id);
+    g_free(cap);
+}
+
+
+virDomainCapsFeatureHyperv *
+virDomainCapsFeatureHypervCopy(virDomainCapsFeatureHyperv *cap)
+{
+    virDomainCapsFeatureHyperv *ret = NULL;
+
+    if (!cap)
+        return NULL;
+
+    ret = g_memdup2(cap, sizeof(virDomainCapsFeatureHyperv));
+    ret->vendor_id = g_strdup(cap->vendor_id);
+
+    return ret;
+}
+
+
+static void
+virDomainCapsDispose(void *obj)
+{
+    virDomainCaps *caps = obj;
+    virDomainCapsStringValues *values;
+    size_t i;
+
+    g_free(caps->path);
+    g_free(caps->machine);
+    virObjectUnref(caps->cpu.custom);
+    virCPUDefFree(caps->cpu.hostModel);
+    virSEVCapabilitiesFree(caps->sev);
+    virSGXCapabilitiesFree(caps->sgx);
+    virDomainCapsFeatureHypervFree(caps->hyperv);
+
+    values = &caps->os.loader.values;
+    for (i = 0; i < values->nvalues; i++)
+        g_free(values->values[i]);
+    g_free(values->values);
+}
+
+
+static void
+virDomainCapsCPUModelsDispose(void *obj)
+{
+    virDomainCapsCPUModels *cpuModels = obj;
+    size_t i;
+
+    for (i = 0; i < cpuModels->nmodels; i++) {
+        g_free(cpuModels->models[i].name);
+        g_strfreev(cpuModels->models[i].blockers);
+        g_free(cpuModels->models[i].vendor);
+        g_free(cpuModels->models[i].canonical);
+    }
+
+    g_free(cpuModels->models);
+}
+
+
+virDomainCaps *
+virDomainCapsNew(const char *path,
+                 const char *machine,
+                 virArch arch,
+                 virDomainVirtType virttype)
+{
+    virDomainCaps *caps = NULL;
+
+    if (virDomainCapsInitialize() < 0)
+        return NULL;
+
+    if (!(caps = virObjectLockableNew(virDomainCapsClass)))
+        return NULL;
+
+    caps->path = g_strdup(path);
+    caps->machine = g_strdup(machine);
+    caps->arch = arch;
+    caps->virttype = virttype;
+
+    return caps;
+}
+
+
+virDomainCapsCPUModels *
+virDomainCapsCPUModelsNew(size_t nmodels)
+{
+    virDomainCapsCPUModels *cpuModels = NULL;
+
+    if (virDomainCapsInitialize() < 0)
+        return NULL;
+
+    if (!(cpuModels = virObjectNew(virDomainCapsCPUModelsClass)))
+        return NULL;
+
+    cpuModels->models = g_new0(virDomainCapsCPUModel, nmodels);
+    cpuModels->nmodels_max = nmodels;
+
+    return cpuModels;
+}
+
+
+virDomainCapsCPUModels *
+virDomainCapsCPUModelsCopy(virDomainCapsCPUModels *old)
+{
+    virDomainCapsCPUModels *cpuModels = NULL;
+    size_t i;
+
+    if (!(cpuModels = virDomainCapsCPUModelsNew(old->nmodels)))
+        return NULL;
+
+    for (i = 0; i < old->nmodels; i++) {
+        virDomainCapsCPUModelsAdd(cpuModels,
+                                  old->models[i].name,
+                                  old->models[i].usable,
+                                  old->models[i].blockers,
+                                  old->models[i].deprecated,
+                                  old->models[i].vendor,
+                                  old->models[i].canonical);
+    }
+
+    return cpuModels;
+}
+
+
+void
+virDomainCapsCPUModelsAdd(virDomainCapsCPUModels *cpuModels,
+                          const char *name,
+                          virDomainCapsCPUUsable usable,
+                          char **blockers,
+                          bool deprecated,
+                          const char *vendor,
+                          const char *canonical)
+{
+    virDomainCapsCPUModel *cpu;
+
+    VIR_RESIZE_N(cpuModels->models, cpuModels->nmodels_max,
+                 cpuModels->nmodels, 1);
+
+    cpu = cpuModels->models + cpuModels->nmodels;
+    cpuModels->nmodels++;
+
+    cpu->usable = usable;
+    cpu->name = g_strdup(name);
+    cpu->blockers = g_strdupv(blockers);
+    cpu->deprecated = deprecated;
+    cpu->vendor = g_strdup(vendor);
+    cpu->canonical = g_strdup(canonical);
+}
+
+
+virDomainCapsCPUModel *
+virDomainCapsCPUModelsGet(virDomainCapsCPUModels *cpuModels,
+                          const char *name)
+{
+    size_t i;
+
+    if (!cpuModels)
+        return NULL;
+
+    for (i = 0; i < cpuModels->nmodels; i++) {
+        if (STREQ(cpuModels->models[i].name, name))
+            return cpuModels->models + i;
+    }
+
+    return NULL;
+}
+
+
+static int
+virDomainCapsCPUModelsCompare(const void *m1,
+                              const void *m2,
+                              void *opaque G_GNUC_UNUSED)
+{
+    const virDomainCapsCPUModel *model1 = m1;
+    const virDomainCapsCPUModel *model2 = m2;
+
+    return strcmp(model1->name, model2->name);
+}
+
+
+void
+virDomainCapsCPUModelsSort(virDomainCapsCPUModels *cpuModels)
+{
+    size_t i;
+
+    g_qsort_with_data(cpuModels->models, cpuModels->nmodels,
+                      sizeof(*cpuModels->models),
+                      virDomainCapsCPUModelsCompare, NULL);
+
+    for (i = 0; i < cpuModels->nmodels; i++) {
+        virDomainCapsCPUModel *model = cpuModels->models + i;
+
+        if (!model->blockers)
+            continue;
+
+        g_qsort_with_data(model->blockers, g_strv_length(model->blockers),
+                          sizeof(*model->blockers),
+                          virStringSortCompare, NULL);
+        virStringListRemoveDuplicates(&model->blockers);
+    }
+}
+
+
+int
+virDomainCapsEnumSet(virDomainCapsEnum *capsEnum,
+                     const char *capsEnumName,
+                     size_t nvalues,
+                     unsigned int *values)
+{
+    size_t i;
+
+    for (i = 0; i < nvalues; i++) {
+        unsigned int val = 1 << values[i];
+
+        if (!val) {
+            /* Integer overflow */
+            virReportError(VIR_ERR_INTERNAL_ERROR,
+                           _("integer overflow on %1$s. Please contact the libvirt development team at devel@lists.libvirt.org"),
+                           capsEnumName);
+            return -1;
+        }
+
+        capsEnum->values |= val;
+    }
+
+    return 0;
+}
+
+
+void
+virDomainCapsEnumClear(virDomainCapsEnum *capsEnum)
+{
+    capsEnum->values = 0;
+}
+
+
+static void
+virDomainCapsEnumFormat(virBuffer *buf,
+                        const virDomainCapsEnum *capsEnum,
+                        const char *capsEnumName,
+                        virDomainCapsValToStr valToStr)
+{
+    g_auto(virBuffer) attrBuf = VIR_BUFFER_INITIALIZER;
+    g_auto(virBuffer) childBuf = VIR_BUFFER_INIT_CHILD(buf);
+    size_t i;
+
+    if (!capsEnum->report)
+        return;
+
+    virBufferAsprintf(&attrBuf, " name='%s'", capsEnumName);
+
+    for (i = 0; i < sizeof(capsEnum->values) * CHAR_BIT; i++) {
+        const char *val;
+
+        if (!VIR_DOMAIN_CAPS_ENUM_IS_SET(*capsEnum, i))
+            continue;
+
+        if ((val = (valToStr)(i)))
+            virBufferAsprintf(&childBuf, "<value>%s</value>\n", val);
+    }
+
+    virXMLFormatElement(buf, "enum", &attrBuf, &childBuf);
+}
+
+
+static void
+virDomainCapsStringValuesFormat(virBuffer *buf,
+                                const virDomainCapsStringValues *values)
+{
+    size_t i;
+
+    for (i = 0; i < values->nvalues; i++)
+        virBufferEscapeString(buf, "<value>%s</value>\n", values->values[i]);
+}
+
+
+/**
+ * FORMAT_PROLOGUE:
+ * @item: item to format
+ *
+ * Formats part of domain capabilities for @item. The element name is #item so
+ * variable name is important. If the particular capability is not supported,
+ * then the macro also returns early.
+ *
+ * Additionally, the macro declares two variables: @childBuf and @attrBuf where
+ * the former holds contents of the child elements and the latter holds
+ * contents of <#item/> attributes (so far limited to "supported='yes/no'").
+ */
+#define FORMAT_PROLOGUE(item) \
+    g_auto(virBuffer) childBuf = VIR_BUFFER_INIT_CHILD(buf); \
+    g_auto(virBuffer) attrBuf = VIR_BUFFER_INITIALIZER; \
+    do { \
+        if (!item || item->supported == VIR_TRISTATE_BOOL_ABSENT) \
+            return; \
+        virBufferAsprintf(&attrBuf, " supported='%s'", \
+                          (item->supported == VIR_TRISTATE_BOOL_YES) ? "yes" : "no"); \
+        if (item->supported == VIR_TRISTATE_BOOL_NO) { \
+            virXMLFormatElement(buf, #item, &attrBuf, NULL); \
+            return; \
+        } \
+    } while (0)
+
+#define FORMAT_EPILOGUE(item) \
+    virXMLFormatElement(buf, #item, &attrBuf, &childBuf)
+
+#define ENUM_PROCESS(master, capsEnum, valToStr) \
+    do { \
+        virDomainCapsEnumFormat(&childBuf, &master->capsEnum, \
+                                #capsEnum, valToStr); \
+    } while (0)
+
+
+static void
+virDomainCapsFeatureFormatSimple(virBuffer *buf,
+                                 const char *featurename,
+                                 virTristateBool supported)
+{
+    if (supported == VIR_TRISTATE_BOOL_ABSENT)
+        return;
+
+    virBufferAsprintf(buf, "<%s supported='%s'/>\n", featurename,
+                      virTristateBoolTypeToString(supported));
+}
+
+
+static void
+virDomainCapsFirmwareFeaturesFormat(virBuffer *buf,
+                                    const virDomainCapsFirmwareFeatures *firmwareFeatures)
+{
+    FORMAT_PROLOGUE(firmwareFeatures);
+
+    ENUM_PROCESS(firmwareFeatures, secureBoot, virTristateBoolTypeToString);
+    ENUM_PROCESS(firmwareFeatures, enrolledKeys, virTristateBoolTypeToString);
+
+    FORMAT_EPILOGUE(firmwareFeatures);
+}
+
+
+static void
+virDomainCapsLoaderFormat(virBuffer *buf,
+                          const virDomainCapsLoader *loader)
+{
+    FORMAT_PROLOGUE(loader);
+
+    virDomainCapsStringValuesFormat(&childBuf, &loader->values);
+    ENUM_PROCESS(loader, type, virDomainLoaderTypeToString);
+    ENUM_PROCESS(loader, readonly, virTristateBoolTypeToString);
+    ENUM_PROCESS(loader, secure, virTristateBoolTypeToString);
+
+    FORMAT_EPILOGUE(loader);
+}
+
+static void
+virDomainCapsVarstoreFormat(virBuffer *buf,
+                            const virDomainCapsVarstore *varstore)
+{
+    FORMAT_PROLOGUE(varstore);
+    FORMAT_EPILOGUE(varstore);
+}
+
+static void
+virDomainCapsOSFormat(virBuffer *buf,
+                      const virDomainCapsOS *os)
+{
+    const virDomainCapsFirmwareFeatures *firmwareFeatures = &os->firmwareFeatures;
+    const virDomainCapsLoader *loader = &os->loader;
+    const virDomainCapsVarstore *varstore = &os->varstore;
+
+    FORMAT_PROLOGUE(os);
+
+    ENUM_PROCESS(os, firmware, virDomainOsDefFirmwareTypeToString);
+
+    virDomainCapsFirmwareFeaturesFormat(&childBuf, firmwareFeatures);
+    virDomainCapsLoaderFormat(&childBuf, loader);
+    virDomainCapsVarstoreFormat(&childBuf, varstore);
+
+    FORMAT_EPILOGUE(os);
+}
+
+static void
+virDomainCapsCPUCustomFormat(virBuffer *buf,
+                             virDomainCapsCPUModels *custom)
+{
+    size_t i;
+
+    for (i = 0; i < custom->nmodels; i++) {
+        g_auto(virBuffer) attrBuf = VIR_BUFFER_INITIALIZER;
+        g_auto(virBuffer) childBuf = VIR_BUFFER_INITIALIZER;
+        virDomainCapsCPUModel *model = custom->models + i;
+
+        virBufferAsprintf(&attrBuf, " usable='%s'",
+                          virDomainCapsCPUUsableTypeToString(model->usable));
+
+        if (model->deprecated)
+            virBufferAddLit(&attrBuf, " deprecated='yes'");
+
+        if (model->vendor)
+            virBufferAsprintf(&attrBuf, " vendor='%s'", model->vendor);
+        else
+            virBufferAddLit(&attrBuf, " vendor='unknown'");
+
+        if (model->canonical)
+            virBufferAsprintf(&attrBuf, " canonical='%s'", model->canonical);
+
+        virBufferAddStr(&childBuf, model->name);
+
+        virXMLFormatElementDirect(buf, "model", &attrBuf, &childBuf);
+
+        if (model->blockers) {
+            g_auto(virBuffer) blockerAttrBuf = VIR_BUFFER_INITIALIZER;
+            g_auto(virBuffer) blockerChildBuf = VIR_BUFFER_INIT_CHILD(buf);
+            char **blocker;
+
+            virBufferAsprintf(&blockerAttrBuf, " model='%s'", model->name);
+
+            for (blocker = model->blockers; *blocker; blocker++)
+                virBufferAsprintf(&blockerChildBuf, "<feature name='%s'/>\n", *blocker);
+
+            virXMLFormatElement(buf, "blockers", &blockerAttrBuf, &blockerChildBuf);
+        }
+    }
+}
+
+static void
+virDomainCapsCPUFormat(virBuffer *buf,
+                       const virDomainCapsCPU *cpu)
+{
+    g_auto(virBuffer) childBuf = VIR_BUFFER_INIT_CHILD(buf);
+    g_auto(virBuffer) hostPassModeChildBuf = VIR_BUFFER_INIT_CHILD(&childBuf);
+    g_auto(virBuffer) hostPassModeAttrBuf = VIR_BUFFER_INITIALIZER;
+    g_auto(virBuffer) maxModeChildBuf = VIR_BUFFER_INIT_CHILD(&childBuf);
+    g_auto(virBuffer) maxModeAttrBuf = VIR_BUFFER_INITIALIZER;
+    g_auto(virBuffer) hostModeChildBuf = VIR_BUFFER_INIT_CHILD(&childBuf);
+    g_auto(virBuffer) hostModeAttrBuf = VIR_BUFFER_INITIALIZER;
+    g_auto(virBuffer) customModeChildBuf = VIR_BUFFER_INIT_CHILD(&childBuf);
+    g_auto(virBuffer) customModeAttrBuf = VIR_BUFFER_INITIALIZER;
+
+    virBufferAsprintf(&hostPassModeAttrBuf, " name='%s' supported='%s'",
+                      virCPUModeTypeToString(VIR_CPU_MODE_HOST_PASSTHROUGH),
+                      cpu->hostPassthrough ? "yes" : "no");
+
+    if (cpu->hostPassthrough && cpu->hostPassthroughMigratable.report) {
+        virDomainCapsEnumFormat(&hostPassModeChildBuf,
+                                &cpu->hostPassthroughMigratable,
+                                "hostPassthroughMigratable",
+                                virTristateSwitchTypeToString);
+    }
+
+    virXMLFormatElement(&childBuf, "mode", &hostPassModeAttrBuf, &hostPassModeChildBuf);
+
+    virBufferAsprintf(&maxModeAttrBuf, " name='%s' supported='%s'",
+                      virCPUModeTypeToString(VIR_CPU_MODE_MAXIMUM),
+                      cpu->maximum ? "yes" : "no");
+
+    if (cpu->maximum && cpu->maximumMigratable.report) {
+        virDomainCapsEnumFormat(&maxModeChildBuf,
+                                &cpu->maximumMigratable,
+                                "maximumMigratable",
+                                virTristateSwitchTypeToString);
+    }
+
+    virXMLFormatElement(&childBuf, "mode", &maxModeAttrBuf, &maxModeChildBuf);
+
+    virBufferAsprintf(&hostModeAttrBuf, " name='%s' supported='%s'",
+                      virCPUModeTypeToString(VIR_CPU_MODE_HOST_MODEL),
+                      cpu->hostModel ? "yes" : "no");
+
+    if (cpu->hostModel) {
+        virCPUDefFormatBuf(&hostModeChildBuf, cpu->hostModel);
+    }
+
+    virXMLFormatElement(&childBuf, "mode", &hostModeAttrBuf, &hostModeChildBuf);
+
+    virBufferAsprintf(&customModeAttrBuf, " name='%s'",
+                      virCPUModeTypeToString(VIR_CPU_MODE_CUSTOM));
+    if (cpu->custom && cpu->custom->nmodels) {
+        virBufferAddLit(&customModeAttrBuf, " supported='yes'");
+        virDomainCapsCPUCustomFormat(&customModeChildBuf, cpu->custom);
+    } else {
+        virBufferAddLit(&customModeAttrBuf, " supported='no'");
+    }
+
+    virXMLFormatElement(&childBuf, "mode", &customModeAttrBuf, &customModeChildBuf);
+
+    virXMLFormatElement(buf, "cpu", NULL, &childBuf);
+}
+
+static void
+virDomainCapsMemoryBackingFormat(virBuffer *buf,
+                                 const virDomainCapsMemoryBacking *memoryBacking)
+{
+    FORMAT_PROLOGUE(memoryBacking);
+
+    ENUM_PROCESS(memoryBacking, sourceType, virDomainMemorySourceTypeToString);
+
+    FORMAT_EPILOGUE(memoryBacking);
+}
+
+
+static void
+virDomainCapsDeviceDiskFormat(virBuffer *buf,
+                              const virDomainCapsDeviceDisk *disk)
+{
+    FORMAT_PROLOGUE(disk);
+
+    ENUM_PROCESS(disk, diskDevice, virDomainDiskDeviceTypeToString);
+    ENUM_PROCESS(disk, bus, virDomainDiskBusTypeToString);
+    ENUM_PROCESS(disk, model, virDomainDiskModelTypeToString);
+
+    FORMAT_EPILOGUE(disk);
+}
+
+
+static void
+virDomainCapsDeviceGraphicsFormat(virBuffer *buf,
+                                  const virDomainCapsDeviceGraphics *graphics)
+{
+    FORMAT_PROLOGUE(graphics);
+
+    ENUM_PROCESS(graphics, type, virDomainGraphicsTypeToString);
+
+    FORMAT_EPILOGUE(graphics);
+}
+
+
+static void
+virDomainCapsDeviceVideoFormat(virBuffer *buf,
+                               const virDomainCapsDeviceVideo *video)
+{
+    FORMAT_PROLOGUE(video);
+
+    ENUM_PROCESS(video, modelType, virDomainVideoTypeToString);
+
+    FORMAT_EPILOGUE(video);
+}
+
+
+static void
+virDomainCapsDeviceHostdevFormat(virBuffer *buf,
+                                 const virDomainCapsDeviceHostdev *hostdev)
+{
+    FORMAT_PROLOGUE(hostdev);
+
+    ENUM_PROCESS(hostdev, mode, virDomainHostdevModeTypeToString);
+    ENUM_PROCESS(hostdev, startupPolicy, virDomainStartupPolicyTypeToString);
+    ENUM_PROCESS(hostdev, subsysType, virDomainHostdevSubsysTypeToString);
+    ENUM_PROCESS(hostdev, capsType, virDomainHostdevCapsTypeToString);
+    ENUM_PROCESS(hostdev, pciBackend, virDeviceHostdevPCIDriverNameTypeToString);
+    ENUM_PROCESS(hostdev, iommufd, virTristateBoolTypeToString);
+
+    FORMAT_EPILOGUE(hostdev);
+}
+
+
+static void
+virDomainCapsDeviceRNGFormat(virBuffer *buf,
+                             const virDomainCapsDeviceRNG *rng)
+{
+    FORMAT_PROLOGUE(rng);
+
+    ENUM_PROCESS(rng, model, virDomainRNGModelTypeToString);
+    ENUM_PROCESS(rng, backendModel, virDomainRNGBackendTypeToString);
+
+    FORMAT_EPILOGUE(rng);
+}
+
+
+static void
+virDomainCapsDeviceTPMFormat(virBuffer *buf,
+                             const virDomainCapsDeviceTPM *tpm)
+{
+    FORMAT_PROLOGUE(tpm);
+
+    ENUM_PROCESS(tpm, model, virDomainTPMModelTypeToString);
+    ENUM_PROCESS(tpm, backendModel, virDomainTPMBackendTypeToString);
+    ENUM_PROCESS(tpm, backendVersion, virDomainTPMVersionTypeToString);
+
+    FORMAT_EPILOGUE(tpm);
+}
+
+
+static void
+virDomainCapsDeviceFilesystemFormat(virBuffer *buf,
+                                    const virDomainCapsDeviceFilesystem *filesystem)
+{
+    FORMAT_PROLOGUE(filesystem);
+
+    ENUM_PROCESS(filesystem, driverType, virDomainFSDriverTypeToString);
+
+    FORMAT_EPILOGUE(filesystem);
+}
+
+
+static void
+virDomainCapsDeviceRedirdevFormat(virBuffer *buf,
+                                  const virDomainCapsDeviceRedirdev *redirdev)
+{
+    FORMAT_PROLOGUE(redirdev);
+
+    ENUM_PROCESS(redirdev, bus, virDomainRedirdevBusTypeToString);
+
+    FORMAT_EPILOGUE(redirdev);
+}
+
+
+static void
+virDomainCapsDeviceChannelFormat(virBuffer *buf,
+                                 const virDomainCapsDeviceChannel *channel)
+{
+    FORMAT_PROLOGUE(channel);
+
+    ENUM_PROCESS(channel, type, virDomainChrTypeToString);
+
+    FORMAT_EPILOGUE(channel);
+}
+
+
+static void
+virDomainCapsDeviceCryptoFormat(virBuffer *buf,
+                                const virDomainCapsDeviceCrypto *crypto)
+{
+    FORMAT_PROLOGUE(crypto);
+
+    ENUM_PROCESS(crypto, model, virDomainCryptoModelTypeToString);
+    ENUM_PROCESS(crypto, type, virDomainCryptoTypeTypeToString);
+    ENUM_PROCESS(crypto, backendModel, virDomainCryptoBackendTypeToString);
+
+    FORMAT_EPILOGUE(crypto);
+}
+
+
+static void
+virDomainCapsDeviceNetFormat(virBuffer *buf,
+                             const virDomainCapsDeviceNet *interface)
+{
+    FORMAT_PROLOGUE(interface);
+
+    ENUM_PROCESS(interface, backendType, virDomainNetBackendTypeToString);
+
+    FORMAT_EPILOGUE(interface);
+}
+
+
+static void
+virDomainCapsDevicePanicFormat(virBuffer *buf,
+                               const virDomainCapsDevicePanic *panic)
+{
+    FORMAT_PROLOGUE(panic);
+
+    ENUM_PROCESS(panic, model, virDomainPanicModelTypeToString);
+
+    FORMAT_EPILOGUE(panic);
+}
+
+
+static void
+virDomainCapsDeviceConsoleFormat(virBuffer *buf,
+                                 const virDomainCapsDeviceConsole *console)
+{
+    FORMAT_PROLOGUE(console);
+
+    ENUM_PROCESS(console, type, virDomainChrTypeToString);
+
+    FORMAT_EPILOGUE(console);
+}
+
+/**
+ * virDomainCapsFeatureGICFormat:
+ * @buf: target buffer
+ * @gic: GIC features
+ *
+ * Format GIC features for inclusion in the domcapabilities XML.
+ *
+ * The resulting XML will look like
+ *
+ *   <gic supported='yes'>
+ *     <enum name='version>
+ *       <value>2</value>
+ *       <value>3</value>
+ *     </enum>
+ *   </gic>
+ */
+static void
+virDomainCapsFeatureGICFormat(virBuffer *buf,
+                              const virDomainCapsFeatureGIC *gic)
+{
+    FORMAT_PROLOGUE(gic);
+
+    ENUM_PROCESS(gic, version, virGICVersionTypeToString);
+
+    FORMAT_EPILOGUE(gic);
+}
+
+static void
+virDomainCapsFeatureSEVFormat(virBuffer *buf,
+                              const virSEVCapability *sev)
+{
+    if (!sev) {
+        virBufferAddLit(buf, "<sev supported='no'/>\n");
+        return;
+    }
+
+    virBufferAddLit(buf, "<sev supported='yes'>\n");
+    virBufferAdjustIndent(buf, 2);
+    virBufferAsprintf(buf, "<cbitpos>%d</cbitpos>\n", sev->cbitpos);
+    virBufferAsprintf(buf, "<reducedPhysBits>%d</reducedPhysBits>\n",
+                      sev->reduced_phys_bits);
+    virBufferAsprintf(buf, "<maxGuests>%d</maxGuests>\n", sev->max_guests);
+    virBufferAsprintf(buf, "<maxESGuests>%d</maxESGuests>\n", sev->max_es_guests);
+
+    if (sev->cpu0_id != NULL)
+        virBufferAsprintf(buf, "<cpu0Id>%s</cpu0Id>\n", sev->cpu0_id);
+
+    virBufferAdjustIndent(buf, -2);
+    virBufferAddLit(buf, "</sev>\n");
+}
+
+static void
+virDomainCapsFeatureSGXFormat(virBuffer *buf,
+                              const virSGXCapability *sgx)
+{
+    if (!sgx) {
+        virBufferAddLit(buf, "<sgx supported='no'/>\n");
+        return;
+    }
+
+    virBufferAddLit(buf, "<sgx supported='yes'>\n");
+    virBufferAdjustIndent(buf, 2);
+    virBufferAsprintf(buf, "<flc>%s</flc>\n", sgx->flc ? "yes" : "no");
+    virBufferAsprintf(buf, "<sgx1>%s</sgx1>\n", sgx->sgx1 ? "yes" : "no");
+    virBufferAsprintf(buf, "<sgx2>%s</sgx2>\n", sgx->sgx2 ? "yes" : "no");
+    virBufferAsprintf(buf, "<section_size unit='KiB'>%llu</section_size>\n", sgx->section_size);
+
+    if (sgx->nSgxSections > 0) {
+        size_t i;
+
+        virBufferAddLit(buf, "<sections>\n");
+
+        for (i = 0; i < sgx->nSgxSections; i++) {
+            virBufferAdjustIndent(buf, 2);
+            virBufferAsprintf(buf, "<section node='%d' ", sgx->sgxSections[i].node);
+            virBufferAsprintf(buf, "size='%llu' ", sgx->sgxSections[i].size);
+            virBufferAddLit(buf, "unit='KiB'/>\n");
+            virBufferAdjustIndent(buf, -2);
+        }
+        virBufferAddLit(buf, "</sections>\n");
+    }
+
+    virBufferAdjustIndent(buf, -2);
+    virBufferAddLit(buf, "</sgx>\n");
+}
+
+static void
+virDomainCapsFeatureHypervFormat(virBuffer *buf,
+                                 const virDomainCapsFeatureHyperv *hyperv)
+{
+    virBuffer defaults = VIR_BUFFER_INIT_CHILD(buf);
+
+    FORMAT_PROLOGUE(hyperv);
+
+    ENUM_PROCESS(hyperv, features, virDomainHypervTypeToString);
+
+    virBufferAdjustIndent(&defaults, 2);
+
+    if (VIR_DOMAIN_CAPS_ENUM_IS_SET(hyperv->features, VIR_DOMAIN_HYPERV_SPINLOCKS) &&
+        hyperv->spinlocks != 0) {
+        virBufferAsprintf(&defaults, "<spinlocks>%u</spinlocks>\n", hyperv->spinlocks);
+    }
+
+    if (VIR_DOMAIN_CAPS_ENUM_IS_SET(hyperv->features, VIR_DOMAIN_HYPERV_STIMER) &&
+        hyperv->stimer_direct != VIR_TRISTATE_SWITCH_ABSENT) {
+        virBufferAsprintf(&defaults, "<stimer_direct>%s</stimer_direct>\n",
+                          virTristateSwitchTypeToString(hyperv->stimer_direct));
+    }
+
+    if (VIR_DOMAIN_CAPS_ENUM_IS_SET(hyperv->features, VIR_DOMAIN_HYPERV_TLBFLUSH)) {
+        if (hyperv->tlbflush_direct != VIR_TRISTATE_SWITCH_ABSENT) {
+            virBufferAsprintf(&defaults, "<tlbflush_direct>%s</tlbflush_direct>\n",
+                              virTristateSwitchTypeToString(hyperv->tlbflush_direct));
+        }
+
+        if (hyperv->tlbflush_extended != VIR_TRISTATE_SWITCH_ABSENT) {
+            virBufferAsprintf(&defaults, "<tlbflush_extended>%s</tlbflush_extended>\n",
+                              virTristateSwitchTypeToString(hyperv->tlbflush_extended));
+        }
+    }
+
+    if (VIR_DOMAIN_CAPS_ENUM_IS_SET(hyperv->features, VIR_DOMAIN_HYPERV_VENDOR_ID)) {
+        virBufferEscapeString(&defaults, "<vendor_id>%s</vendor_id>\n", hyperv->vendor_id);
+    }
+
+    virXMLFormatElement(&childBuf, "defaults", NULL, &defaults);
+
+    FORMAT_EPILOGUE(hyperv);
+}
+
+
+static void
+virDomainCapsLaunchSecurityFormat(virBuffer *buf,
+                                  const virDomainCapsLaunchSecurity *launchSecurity)
+{
+    FORMAT_PROLOGUE(launchSecurity);
+
+    ENUM_PROCESS(launchSecurity, sectype, virDomainLaunchSecurityTypeToString);
+
+    FORMAT_EPILOGUE(launchSecurity);
+}
+
+
+static void
+virDomainCapsFormatFeatures(const virDomainCaps *caps,
+                            virBuffer *buf)
+{
+    g_auto(virBuffer) childBuf = VIR_BUFFER_INIT_CHILD(buf);
+    size_t i;
+
+    virDomainCapsFeatureGICFormat(&childBuf, &caps->gic);
+
+    for (i = 0; i < VIR_DOMAIN_CAPS_FEATURE_LAST; i++) {
+        if (i == VIR_DOMAIN_CAPS_FEATURE_IOTHREADS)
+            continue;
+
+        virDomainCapsFeatureFormatSimple(&childBuf,
+                                         virDomainCapsFeatureTypeToString(i),
+                                         caps->features[i]);
+    }
+
+    virDomainCapsFeatureSEVFormat(&childBuf, caps->sev);
+    virDomainCapsFeatureSGXFormat(&childBuf, caps->sgx);
+    virDomainCapsFeatureHypervFormat(&childBuf, caps->hyperv);
+    virDomainCapsLaunchSecurityFormat(&childBuf, &caps->launchSecurity);
+
+    virXMLFormatElement(buf, "features", NULL, &childBuf);
+}
+
+
+char *
+virDomainCapsFormat(const virDomainCaps *caps)
+{
+    g_auto(virBuffer) buf = VIR_BUFFER_INITIALIZER;
+    const char *virttype_str = virDomainVirtTypeToString(caps->virttype);
+    const char *arch_str = virArchToString(caps->arch);
+
+    virBufferAddLit(&buf, "<domainCapabilities>\n");
+    virBufferAdjustIndent(&buf, 2);
+
+    virBufferEscapeString(&buf, "<path>%s</path>\n", caps->path);
+    virBufferAsprintf(&buf, "<domain>%s</domain>\n", virttype_str);
+    if (caps->machine)
+        virBufferAsprintf(&buf, "<machine>%s</machine>\n", caps->machine);
+    virBufferAsprintf(&buf, "<arch>%s</arch>\n", arch_str);
+
+    if (caps->maxvcpus)
+        virBufferAsprintf(&buf, "<vcpu max='%d'/>\n", caps->maxvcpus);
+
+    virDomainCapsFeatureFormatSimple(&buf, "iothreads",
+                                     caps->features[VIR_DOMAIN_CAPS_FEATURE_IOTHREADS]);
+
+    virDomainCapsOSFormat(&buf, &caps->os);
+    virDomainCapsCPUFormat(&buf, &caps->cpu);
+
+    virDomainCapsMemoryBackingFormat(&buf, &caps->memoryBacking);
+
+    virBufferAddLit(&buf, "<devices>\n");
+    virBufferAdjustIndent(&buf, 2);
+
+    virDomainCapsDeviceDiskFormat(&buf, &caps->disk);
+    virDomainCapsDeviceGraphicsFormat(&buf, &caps->graphics);
+    virDomainCapsDeviceVideoFormat(&buf, &caps->video);
+    virDomainCapsDeviceHostdevFormat(&buf, &caps->hostdev);
+    virDomainCapsDeviceRNGFormat(&buf, &caps->rng);
+    virDomainCapsDeviceFilesystemFormat(&buf, &caps->filesystem);
+    virDomainCapsDeviceTPMFormat(&buf, &caps->tpm);
+    virDomainCapsDeviceRedirdevFormat(&buf, &caps->redirdev);
+    virDomainCapsDeviceChannelFormat(&buf, &caps->channel);
+    virDomainCapsDeviceCryptoFormat(&buf, &caps->crypto);
+    virDomainCapsDeviceNetFormat(&buf, &caps->net);
+    virDomainCapsDevicePanicFormat(&buf, &caps->panic);
+    virDomainCapsDeviceConsoleFormat(&buf, &caps->console);
+
+    virBufferAdjustIndent(&buf, -2);
+    virBufferAddLit(&buf, "</devices>\n");
+
+    virDomainCapsFormatFeatures(caps, &buf);
+
+    virBufferAdjustIndent(&buf, -2);
+    virBufferAddLit(&buf, "</domainCapabilities>\n");
+
+    return virBufferContentAndReset(&buf);
+}

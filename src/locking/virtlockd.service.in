@@ -1,0 +1,20 @@
+[Unit]
+Description=libvirt locking daemon
+Documentation=man:virtlockd(8)
+Documentation=https://libvirt.org/
+BindsTo=virtlockd.socket
+Wants=virtlockd-admin.socket
+After=virtlockd.socket
+After=virtlockd-admin.socket
+
+[Service]
+Type=notify
+Environment=VIRTLOCKD_ARGS=
+EnvironmentFile=-@initconfdir@/virtlockd
+ExecStart=@sbindir@/virtlockd $VIRTLOCKD_ARGS
+ExecReload=/bin/kill -USR1 $MAINPID
+
+[Install]
+WantedBy=multi-user.target
+Also=virtlockd.socket
+Also=virtlockd-admin.socket

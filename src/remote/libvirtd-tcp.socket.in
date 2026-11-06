@@ -1,0 +1,11 @@
+[Unit]
+Description=libvirt legacy monolithic daemon non-TLS IP socket
+BindsTo=libvirtd.socket
+After=libvirtd.socket
+
+[Socket]
+ListenStream=16509
+Service=libvirtd.service
+
+[Install]
+WantedBy=sockets.target

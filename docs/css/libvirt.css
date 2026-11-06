@@ -1,0 +1,139 @@
+main#the-virtualization-api,
+#the-virtualization-api.document,
+main#documentation,
+#documentation.document,
+main#knowledge-base,
+#knowledge-base.document
+{
+    width: inherit;
+}
+
+span.since {
+    color: #3c857c;
+    font-style: italic;
+    font-weight: bold;
+}
+
+span.removed {
+    color: darkred;
+    font-style: italic;
+    font-weight: bold;
+}
+
+img.diagram {
+    background: rgb(230,230,230);
+    border: 2px dotted rgb(178,178,178);
+    padding: 1em;
+    display: block;
+    margin-left: auto;
+    margin-right: auto;
+}
+
+#the-virtualization-api section,
+#the-virtualization-api .section,
+#documentation section,
+#documentation .section,
+#knowledge-base section,
+#knowledge-base .section
+{
+    width: 24%;
+    margin-left: 7%;
+    margin-bottom: 2em;
+    float: left;
+    background: rgb(230, 230, 230);
+}
+
+#the-virtualization-api section h2,
+#the-virtualization-api .section h1,
+#documentation section h2,
+#documentation .section h1,
+#knowledge-base section h2,
+#knowledge-base .section h1 {
+    margin-top: 0px;
+    padding: 0.5em;
+    padding-left: 1em;
+    padding-right: 1em;
+    background: rgb(0, 95, 97);
+    color: rgb(255, 255, 255);
+    text-align: center;
+    font-size: 1.6em;
+}
+
+#the-virtualization-api > h1 {
+    border: 0px;
+    text-indent: 100%; white-space: nowrap; overflow: hidden;
+    background: url(../logos/logo-banner-dark-800.png) no-repeat center center;
+    height: 300px;
+}
+
+#documentation > h1,
+#knowledge-base > h1 {
+    text-align: center;
+    padding: 1em;
+}
+
+#the-virtualization-api dd,
+#documentation dd,
+#knowledge-base dd {
+    font-size: smaller;
+}
+
+#the-virtualization-api a,
+#documentation a,
+#knowledge-base a {
+    text-decoration: none;
+}
+
+#the-virtualization-api ul,
+#the-virtualization-api p,
+#the-virtualization-api dl,
+#documentation ul,
+#documentation p,
+#documentation dl,
+#knowledge-base ul,
+#knowledge-base p,
+#knowledge-base dl {
+    padding: 0.5em;
+    margin: 0px;
+}
+
+#the-virtualization-api li p
+{
+    padding-left: 0.5em;
+    padding-top: 0px;
+    padding-bottom: 0px;
+}
+
+#the-virtualization-api ul,
+#documentation ul,
+#knowledge-base ul {
+    margin-left: 1em;
+}
+
+#the-virtualization-api dt,
+#documentation dt,
+#knowledge-base dt {
+    margin: 0px;
+}
+
+#the-virtualization-api dd,
+#documentation dd,
+#knowledge-base dd {
+    margin: 0px;
+    margin-bottom: 1em;
+}
+
+#documentation #application-development ul li p {
+    padding-bottom: 0px;
+    padding-top: 0px;
+}
+
+#documentation #application-development ul {
+    margin-left: 2em;
+    padding-top: 0px;
+    padding-bottom: 0px;
+}
+
+.removedhv {
+    color: darkred;
+}

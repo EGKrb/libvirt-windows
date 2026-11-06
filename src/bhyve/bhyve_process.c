@@ -1,0 +1,1057 @@
+/*
+ * bhyve_process.c: bhyve process management
+ *
+ * Copyright (C) 2006-2016 Red Hat, Inc.
+ * Copyright (C) 2014 Roman Bogorodskiy
+ * Copyright (C) 2025 The FreeBSD Foundation
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library.  If not, see
+ * <http://www.gnu.org/licenses/>.
+ *
+ */
+
+#include <config.h>
+
+#include <fcntl.h>
+#include <kvm.h>
+#include <sys/param.h>
+#include <sys/types.h>
+#include <sys/sysctl.h>
+#include <sys/user.h>
+#include <net/if.h>
+#include <net/if_tap.h>
+
+#include "bhyve_conf.h"
+#include "bhyve_device.h"
+#include "bhyve_driver.h"
+#include "bhyve_capabilities.h"
+#include "bhyve_command.h"
+#include "bhyve_firmware.h"
+#include "bhyve_monitor.h"
+#include "bhyve_process.h"
+#include "bhyve_rctl.h"
+#include "datatypes.h"
+#include "virerror.h"
+#include "virhook.h"
+#include "virlog.h"
+#include "virfile.h"
+#include "viralloc.h"
+#include "virstring.h"
+#include "virpidfile.h"
+#include "virprocess.h"
+#include "virnetdev.h"
+#include "virnetdevbridge.h"
+#include "virnetdevtap.h"
+#include "virtime.h"
+#include "virutil.h"
+
+#define VIR_FROM_THIS   VIR_FROM_BHYVE
+
+VIR_LOG_INIT("bhyve.bhyve_process");
+
+static void
+bhyveProcessAutoDestroy(virDomainObj *vm,
+                        virConnectPtr conn G_GNUC_UNUSED)
+{
+    bhyveDomainObjPrivate *priv = vm->privateData;
+    struct _bhyveConn *driver = priv->driver;
+
+    virBhyveProcessStop(driver, vm, VIR_DOMAIN_SHUTOFF_DESTROYED, false);
+
+    if (!vm->persistent)
+        virDomainObjListRemove(driver->domains, vm);
+}
+
+static void
+bhyveNetCleanup(virDomainObj *vm)
+{
+    size_t i;
+    g_autoptr(virConnect) conn = NULL;
+
+    for (i = 0; i < vm->def->nnets; i++) {
+        virDomainNetDef *net = vm->def->nets[i];
+        virDomainNetType actualType = virDomainNetGetActualType(net);
+
+        if (net->ifname) {
+            ignore_value(virNetDevBridgeRemovePort(
+                             virDomainNetGetActualBridgeName(net),
+                             net->ifname));
+            ignore_value(virNetDevTapDelete(net->ifname, NULL));
+        }
+        if (actualType == VIR_DOMAIN_NET_TYPE_NETWORK) {
+            if (conn || (conn = virGetConnectNetwork()))
+                virDomainNetReleaseActualDevice(conn, net);
+            else
+                VIR_WARN("Unable to release network device '%s'", NULLSTR(net->ifname));
+        }
+    }
+}
+
+static void
+virBhyveFormatDevMapFile(virBhyveDriverConfig *cfg,
+                         const char *vm_name,
+                         char **fn_out)
+{
+    *fn_out = g_strdup_printf("%s/grub_bhyve-%s-device.map",
+                              cfg->stateDir, vm_name);
+}
+
+static int
+bhyveProcessStartHook(struct _bhyveConn *driver,
+                      virDomainObj *vm,
+                      virHookBhyveOpType op)
+{
+    g_autofree char *xml = NULL;
+
+    if (!virHookPresent(VIR_HOOK_DRIVER_BHYVE))
+        return 0;
+
+    xml = virDomainDefFormat(vm->def, driver->xmlopt, 0);
+
+    return virHookCall(VIR_HOOK_DRIVER_BHYVE, vm->def->name, op,
+                       VIR_HOOK_SUBOP_BEGIN, NULL, xml, NULL);
+}
+
+static void
+bhyveProcessStopHook(struct _bhyveConn *driver,
+                     virDomainObj *vm,
+                     virHookBhyveOpType op)
+{
+    g_autofree char *xml = NULL;
+    if (!virHookPresent(VIR_HOOK_DRIVER_BHYVE))
+        return;
+
+    xml = virDomainDefFormat(vm->def, driver->xmlopt, 0);
+
+    virHookCall(VIR_HOOK_DRIVER_BHYVE, vm->def->name, op,
+                VIR_HOOK_SUBOP_END, NULL, xml, NULL);
+}
+
+static pid_t
+bhyveProcessQueryVMPid(virDomainObj *vm)
+{
+    bhyveDomainObjPrivate *priv = vm->privateData;
+    g_autoptr(virCommand) cmd = NULL;
+    g_autofree char *output = NULL;
+    const char *pidstr;
+    char *end = NULL;
+    pid_t pid;
+
+    cmd = virBhyveProcessBuildGetVMPidCmd(priv->driver, vm->def);
+    virCommandSetOutputBuffer(cmd, &output);
+
+    if (virCommandRun(cmd, NULL) < 0)
+        return -1;
+
+    virStringTrimOptionalNewline(output);
+    if (!STRPREFIX(output, "vm pid:\t"))
+        goto malformed;
+
+    pidstr = output + strlen("vm pid:\t");
+    if (virStrToLong_i(pidstr, &end, 10, &pid) < 0 ||
+        pid <= 0 || *end != '\0')
+        goto malformed;
+
+    return pid;
+
+ malformed:
+    virReportError(VIR_ERR_INTERNAL_ERROR,
+                   _("Unable to parse bhyvectl output: %1$s"), output);
+    return -1;
+}
+
+
+static int
+bhyveProcessWaitForVMPid(virDomainObj *vm)
+{
+    virTimeBackOffVar timebackoff;
+
+    if (virTimeBackOffStart(&timebackoff, 1, 5000) < 0)
+        return -1;
+
+    while (virTimeBackOffWait(&timebackoff)) {
+        if (bhyveProcessQueryVMPid(vm) > 0)
+            return 0;
+
+        virResetLastError();
+    }
+
+    return bhyveProcessQueryVMPid(vm) < 0 ? -1 : 0;
+}
+
+
+pid_t
+virBhyveProcessGetBhyvePid(virDomainObj *vm)
+{
+    bhyveDomainObjPrivate *priv = vm->privateData;
+
+    if (vm->pid == 0) {
+        virReportError(VIR_ERR_INTERNAL_ERROR,
+                       _("Invalid PID %1$d for VM"),
+                       (int)vm->pid);
+        return -1;
+    }
+
+    if (priv->driver->privileged)
+        return vm->pid;
+
+    return bhyveProcessQueryVMPid(vm);
+}
+
+
+static int
+bhyveSetResourceLimits(struct _bhyveConn *driver, virDomainObj *vm)
+{
+    virBlkioDevice *device;
+
+    if ((vm->def->blkio.ndevices != 1) &&
+        !virMemoryLimitIsSet(vm->def->mem.hard_limit))
+        return 0;
+
+    if (!driver->privileged) {
+        virReportError(VIR_ERR_CONFIG_UNSUPPORTED, "%s",
+                       _("resource limits are not supported in unprivileged mode"));
+        return -1;
+    }
+
+    if (!virBhyveCapsGet(bhyveDriverGetBhyveCaps(driver), BHYVE_CAP_RCTL)) {
+        virReportError(VIR_ERR_CONFIG_UNSUPPORTED, "%s",
+                       _("Cannot set resource limits: RACCT/RCTL is either not supported or not enabled"));
+        return -1;
+    }
+
+    if (vm->def->blkio.ndevices == 1) {
+        device = &vm->def->blkio.devices[0];
+
+        if (bhyveRctlSetIoLimits(vm->pid, device) < 0)
+            return -1;
+    }
+
+    /* rctl(8) uses bytes for these values and def->mem.* uses kibibytes */
+    if (virMemoryLimitIsSet(vm->def->mem.hard_limit))
+        if (bhyveRctlSetMemoryHardLimit(vm->pid, vm->def->mem.hard_limit) < 0)
+            return -1;
+
+    return 0;
+}
+
+virDomainChrDef *
+bhyveFindAgentConfig(virDomainDef *def)
+{
+    size_t i;
+
+    for (i = 0; i < def->nchannels; i++) {
+        virDomainChrDef *channel = def->channels[i];
+
+        if (channel->targetType != VIR_DOMAIN_CHR_CHANNEL_TARGET_TYPE_VIRTIO)
+            continue;
+
+
+        if (STREQ_NULLABLE(channel->target.name, "org.qemu.guest_agent.0")) {
+            return channel;
+        }
+    }
+
+    return NULL;
+}
+
+static void
+bhyveProcessHandleAgentEOF(qemuAgent *agent,
+                           virDomainObj *vm)
+{
+    bhyveDomainObjPrivate *priv;
+
+    virObjectLock(vm);
+    VIR_INFO("Received EOF from agent on %p '%s'", vm, vm->def->name);
+
+    priv = vm->privateData;
+
+    if (!priv->agent) {
+        VIR_DEBUG("Agent freed already");
+        goto unlock;
+    }
+
+    qemuAgentClose(agent);
+    priv->agent = NULL;
+    priv->agentError = false;
+
+    virObjectUnlock(vm);
+    return;
+
+ unlock:
+    virObjectUnlock(vm);
+    return;
+}
+
+/*
+ * This is invoked when there is some kind of error
+ * parsing data to/from the agent. The VM can continue
+ * to run, but no further agent commands will be
+ * allowed
+ */
+static void
+bhyveProcessHandleAgentError(qemuAgent *agent G_GNUC_UNUSED,
+                             virDomainObj *vm)
+{
+    bhyveDomainObjPrivate *priv;
+
+    virObjectLock(vm);
+    VIR_INFO("Received error from agent on %p '%s'", vm, vm->def->name);
+
+    priv = vm->privateData;
+
+    priv->agentError = true;
+
+    virObjectUnlock(vm);
+}
+
+static qemuAgentCallbacks agentCallbacks = {
+    .eofNotify = bhyveProcessHandleAgentEOF,
+    .errorNotify = bhyveProcessHandleAgentError,
+};
+
+/**
+ * bhyveConnectAgent:
+ * @driver: driver object
+ * @vm: domain object
+ *
+ * Connect to the guest agent via the UNIX socket specified in the domain
+ * definition. On success, bhyveDomainObjPrivate's agent field should
+ * point to the agent instance.
+ *
+ * Returns: 0 on success,
+ *          -1 on error
+ */
+int
+bhyveConnectAgent(struct _bhyveConn *driver G_GNUC_UNUSED, virDomainObj *vm)
+{
+    bhyveDomainObjPrivate *priv = vm->privateData;
+    qemuAgent *agent = NULL;
+    virDomainChrDef *config = NULL;
+
+    if (priv->agent)
+        return 0;
+
+    if (!(config = bhyveFindAgentConfig(vm->def))) {
+        virReportError(VIR_ERR_ARGUMENT_UNSUPPORTED, "%s",
+                       _("QEMU guest agent is not configured"));
+        return -1;
+    }
+
+    agent = qemuAgentOpen(vm,
+                          config->source,
+                          virEventThreadGetContext(priv->eventThread),
+                          &agentCallbacks,
+                          BHYVE_DOMAIN_PRIVATE(vm)->agentTimeout);
+
+    if (!virDomainObjIsActive(vm)) {
+        qemuAgentClose(agent);
+        virReportError(VIR_ERR_INTERNAL_ERROR, "%s",
+                       _("guest crashed while connecting to the guest agent"));
+        return -1;
+    }
+
+    priv->agent = agent;
+    if (!priv->agent) {
+        virReportError(VIR_ERR_INTERNAL_ERROR,
+                       _("Cannot connect to QEMU guest agent for %1$s"),
+                       vm->def->name);
+        return -1;
+    }
+
+    return 0;
+}
+
+
+static int
+virBhyveProcessStartImpl(struct _bhyveConn *driver,
+                         virDomainObj *vm,
+                         virDomainRunningReason reason)
+{
+    g_autofree char *devmap_file = NULL;
+    g_autofree char *devicemap = NULL;
+    g_autofree char *logfile = NULL;
+    VIR_AUTOCLOSE logfd = -1;
+    g_autoptr(virCommand) cmd = NULL;
+    g_autoptr(virCommand) load_cmd = NULL;
+    bhyveDomainObjPrivate *priv = vm->privateData;
+    g_autofree char *domain_vmm_path = NULL;
+    virTimeBackOffVar timebackoff;
+    int ret = -1, rc;
+    bool vmm_appeared = false;
+    g_autoptr(virBhyveDriverConfig) cfg = virBhyveDriverGetConfig(driver);
+
+    logfile = g_strdup_printf("%s/%s.log", cfg->logDir, vm->def->name);
+    if ((logfd = open(logfile, O_WRONLY | O_APPEND | O_CREAT,
+                      S_IRUSR | S_IWUSR)) < 0) {
+        virReportSystemError(errno,
+                             _("Failed to open '%1$s'"),
+                             logfile);
+        goto cleanup;
+    }
+
+    VIR_FREE(driver->pidfile);
+    if (!(driver->pidfile = virPidFileBuildPath(cfg->stateDir,
+                                                vm->def->name))) {
+        virReportSystemError(errno,
+                             "%s", _("Failed to build pidfile path"));
+        goto cleanup;
+    }
+
+    if (unlink(driver->pidfile) < 0 &&
+        errno != ENOENT) {
+        virReportSystemError(errno,
+                             _("Cannot remove stale PID file %1$s"),
+                             driver->pidfile);
+        goto cleanup;
+    }
+
+    if (bhyveDomainAssignAddresses(vm->def, NULL) < 0)
+        goto cleanup;
+
+    /* Call bhyve to start the VM */
+    if (!(cmd = virBhyveProcessBuildBhyveCmd(driver, vm->def, false)))
+        goto cleanup;
+
+    virCommandSetOutputFD(cmd, &logfd);
+    virCommandSetErrorFD(cmd, &logfd);
+    virCommandWriteArgLog(cmd, logfd);
+    virCommandSetPidFile(cmd, driver->pidfile);
+    virCommandDaemonize(cmd);
+
+    if (vm->def->os.loader == NULL) {
+        /* Now bhyve command is constructed, meaning the
+         * domain is ready to be started, so we can build
+         * and execute bhyveload command */
+
+        virBhyveFormatDevMapFile(cfg, vm->def->name, &devmap_file);
+
+        if (!(load_cmd = virBhyveProcessBuildLoadCmd(driver, vm->def,
+                                                     devmap_file, &devicemap)))
+            goto cleanup;
+        virCommandSetOutputFD(load_cmd, &logfd);
+        virCommandSetErrorFD(load_cmd, &logfd);
+
+        if (devicemap != NULL) {
+            rc = virFileWriteStr(devmap_file, devicemap, 0644);
+            if (rc) {
+                virReportSystemError(errno,
+                                     _("Cannot write device.map '%1$s'"),
+                                     devmap_file);
+                goto cleanup;
+            }
+        }
+
+        /* Log generated command line */
+        virCommandWriteArgLog(load_cmd, logfd);
+
+        VIR_DEBUG("Loading domain '%s'", vm->def->name);
+        if (virCommandRun(load_cmd, NULL) < 0)
+            goto cleanup;
+    }
+
+    if (bhyveProcessStartHook(driver, vm, VIR_HOOK_BHYVE_OP_START) < 0)
+        goto cleanup;
+
+    /* Now we can start the domain */
+    VIR_DEBUG("Starting domain '%s'", vm->def->name);
+    if (virCommandRun(cmd, NULL) < 0)
+        goto cleanup;
+
+    if (virPidFileReadPath(driver->pidfile, &vm->pid) < 0) {
+        virReportError(VIR_ERR_INTERNAL_ERROR,
+                       _("Domain %1$s didn't show up"), vm->def->name);
+        goto cleanup;
+    }
+
+    domain_vmm_path = g_strdup_printf("/dev/vmm/%s", vm->def->name);
+
+    if (virTimeBackOffStart(&timebackoff, 1, 5000) < 0)
+        goto cleanup;
+    while (virTimeBackOffWait(&timebackoff)) {
+        if (virFileExists(domain_vmm_path)) {
+            vmm_appeared = true;
+            break;
+        }
+    }
+
+    if (!vmm_appeared) {
+        virReportError(VIR_ERR_INTERNAL_ERROR,
+                       _("Domain %1$s didn't show up in /dev/vmm"),
+                       vm->def->name);
+        goto cleanup;
+    }
+
+    /* /dev/vmm can appear before the monitor mode IPC socket is ready. */
+    if (!driver->privileged && bhyveProcessWaitForVMPid(vm) < 0)
+        goto cleanup;
+
+    vm->def->id = vm->pid;
+    virDomainObjSetState(vm, VIR_DOMAIN_RUNNING, reason);
+    if ((priv->mon = bhyveMonitorOpen(vm, driver)) == NULL)
+        goto cleanup;
+
+    if (virBhyveDomainObjStartWorker(vm) < 0)
+        goto cleanup;
+
+    if (virDomainObjSave(vm, driver->xmlopt, cfg->stateDir) < 0)
+        goto cleanup;
+
+    if (bhyveSetResourceLimits(driver, vm) < 0)
+        goto cleanup;
+
+    if (bhyveProcessStartHook(driver, vm, VIR_HOOK_BHYVE_OP_STARTED) < 0)
+        goto cleanup;
+
+    ret = 0;
+
+ cleanup:
+    if (devicemap != NULL) {
+        rc = unlink(devmap_file);
+        if (rc < 0 && errno != ENOENT)
+            VIR_WARN("cannot unlink file '%s': %s",
+                     devmap_file, g_strerror(errno));
+    }
+
+    if (ret < 0)
+        ignore_value(virBhyveProcessStop(driver, vm,
+                                         VIR_DOMAIN_SHUTOFF_FAILED, true));
+
+    return ret;
+}
+
+int
+bhyveProcessPrepareDomain(bhyveConn *driver,
+                          virDomainObj *vm,
+                          unsigned int flags)
+{
+    virCheckFlags(0, -1);
+
+    if (bhyveFirmwareFillDomain(driver, vm->def, false) < 0)
+        return -1;
+
+    return 0;
+}
+
+
+struct bhyvePrepareNVRAMHelperData {
+    int srcFD;
+    const char *srcPath;
+};
+
+
+static int
+bhyvePrepareNVRAMHelper(int dstFD,
+                        const char *dstPath,
+                        const void *opaque)
+{
+    const struct bhyvePrepareNVRAMHelperData *data = opaque;
+    ssize_t r;
+
+    do {
+        char buf[1024];
+
+        if ((r = saferead(data->srcFD, buf, sizeof(buf))) < 0) {
+            virReportSystemError(errno,
+                                 _("Unable to read from file '%1$s'"),
+                                 data->srcPath);
+            return -2;
+        }
+
+        if (safewrite(dstFD, buf, r) < 0) {
+            virReportSystemError(errno,
+                                 _("Unable to write to file '%1$s'"),
+                                 dstPath);
+            return -1;
+        }
+    } while (r);
+
+    return 0;
+}
+
+
+static int
+bhyvePrepareNVRAMFile(bhyveConn *driver G_GNUC_UNUSED,
+                      virDomainLoaderDef *loader)
+{
+    VIR_AUTOCLOSE srcFD = -1;
+    struct bhyvePrepareNVRAMHelperData data;
+
+    if (virFileExists(loader->nvram->path))
+        return 0;
+
+    if (!loader->nvramTemplate) {
+        virReportError(VIR_ERR_OPERATION_FAILED,
+                       _("unable to find any master var store for loader: %1$s"),
+                       loader->path);
+        return -1;
+    }
+
+    /* If 'nvramTemplateFormat' is empty it means that it's a user-provided
+     * template which we couldn't verify. Assume the user knows what they're doing */
+    if (loader->nvramTemplateFormat != VIR_STORAGE_FILE_NONE &&
+        loader->nvram->format != loader->nvramTemplateFormat) {
+        virReportError(VIR_ERR_OPERATION_UNSUPPORTED, "%s",
+                       _("conversion of the nvram template to another target format is not supported"));
+        return -1;
+    }
+
+    if ((srcFD = virFileOpenAs(loader->nvramTemplate, O_RDONLY,
+                               0, -1, -1, 0)) < 0) {
+        virReportSystemError(-srcFD,
+                             _("Failed to open file '%1$s'"),
+                             loader->nvramTemplate);
+        return -1;
+    }
+
+    data.srcFD = srcFD;
+    data.srcPath = loader->nvramTemplate;
+
+    if (virFileRewrite(loader->nvram->path,
+                       S_IRUSR | S_IWUSR,
+                       -1, -1,
+                       bhyvePrepareNVRAMHelper,
+                       &data) < 0) {
+        return -1;
+    }
+
+    return 0;
+}
+
+
+int
+bhyvePrepareNVRAM(bhyveConn *driver,
+                  virDomainDef *def)
+{
+    virDomainLoaderDef *loader = def->os.loader;
+
+    if (!loader || !loader->nvram)
+        return 0;
+
+    VIR_DEBUG("nvram='%s'", NULLSTR(loader->nvram->path));
+
+    switch (virStorageSourceGetActualType(loader->nvram)) {
+    case VIR_STORAGE_TYPE_FILE:
+        return bhyvePrepareNVRAMFile(driver, loader);
+    case VIR_STORAGE_TYPE_BLOCK:
+    case VIR_STORAGE_TYPE_DIR:
+    case VIR_STORAGE_TYPE_NETWORK:
+    case VIR_STORAGE_TYPE_VOLUME:
+    case VIR_STORAGE_TYPE_NVME:
+    case VIR_STORAGE_TYPE_VHOST_USER:
+    case VIR_STORAGE_TYPE_VHOST_VDPA:
+    case VIR_STORAGE_TYPE_CTL:
+    case VIR_STORAGE_TYPE_LAST:
+    case VIR_STORAGE_TYPE_NONE:
+        break;
+    }
+
+    return 0;
+}
+
+int
+bhyveProcessPrepareHost(bhyveConn *driver,
+                        virDomainDef *def,
+                        unsigned int flags)
+{
+    virCheckFlags(0, -1);
+
+    if (bhyvePrepareNVRAM(driver, def) < 0)
+        return -1;
+
+    return 0;
+}
+
+int
+virBhyveProcessStart(bhyveConn *driver,
+                     virConnectPtr conn,
+                     virDomainObj *vm,
+                     virDomainRunningReason reason,
+                     unsigned int flags)
+{
+    virErrorPtr save_err = NULL;
+
+    if (virDomainObjSetDefTransient(driver->xmlopt, vm, NULL) < 0)
+        return -1;
+
+    /* Run an early hook to setup missing devices. */
+    if (bhyveProcessStartHook(driver, vm, VIR_HOOK_BHYVE_OP_PREPARE) < 0)
+        goto cleanup;
+
+    if (flags & VIR_BHYVE_PROCESS_START_AUTODESTROY)
+        virCloseCallbacksDomainAdd(vm, conn, bhyveProcessAutoDestroy);
+
+    if (bhyveProcessPrepareDomain(driver, vm, flags) < 0)
+        goto cleanup;
+
+    if (bhyveProcessPrepareHost(driver, vm->def, flags) < 0)
+        goto cleanup;
+
+    return virBhyveProcessStartImpl(driver, vm, reason);
+
+ cleanup:
+    virErrorPreserveLast(&save_err);
+    bhyveProcessStopHook(driver, vm, VIR_HOOK_BHYVE_OP_STOPPED);
+    bhyveProcessStopHook(driver, vm, VIR_HOOK_BHYVE_OP_RELEASE);
+    virDomainObjRemoveTransientDef(vm);
+    virErrorRestore(&save_err);
+
+    return -1;
+}
+
+static void
+bhyveProcessRemoveDomainStatus(const char *statusDir,
+                               const char *name)
+{
+    g_autofree char *file = virDomainConfigFile(statusDir, name);
+
+    if (unlink(file) < 0 && errno != ENOENT && errno != ENOTDIR) {
+        VIR_WARN("Failed to remove domain XML for %s: %s",
+                 name, g_strerror(errno));
+    }
+}
+
+static void
+bhyveProcessRemoveIPCSocket(struct _bhyveConn *driver,
+                            const char *name)
+{
+    g_autofree char *path = g_strdup_printf("%s/%s",
+                                            driver->config->bhyveRunDir,
+                                            name);
+
+    if (unlink(path) < 0 && errno != ENOENT) {
+        VIR_WARN("Failed to remove bhyve IPC socket for %s: %s",
+                 name, g_strerror(errno));
+    }
+}
+
+/**
+ * @driver: bhyve driver
+ * @vm: domain object
+ * @reason: shutoff reason
+ * @forceCleanup: boolean controlling cleanup
+ * @restoreDef: whether to restore the persistent definition after cleanup
+ *
+ * Stops the domain and cleans up its resources.
+ * It could be used whether as a direct call or as a cleanup routine.
+ * In the latter case, @forceCleanup should be set to `true`, so it
+ * tries to clean up all resources instead of exiting early if the domain
+ * is not active for example.
+ *
+ * Does not run the shutdown hooks if the domain PID was not obtained.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+static int
+virBhyveProcessStopImpl(struct _bhyveConn *driver,
+                        virDomainObj *vm,
+                        virDomainShutoffReason reason,
+                        bool forceCleanup,
+                        bool restoreDef)
+{
+    int ret = 0;
+    size_t i = 0;
+    g_autoptr(virCommand) cmd = NULL;
+    bhyveDomainObjPrivate *priv = vm->privateData;
+    bool vm_started = false;
+    virErrorPtr save_err = NULL;
+
+    virErrorPreserveLast(&save_err);
+
+    if (vm->pid != 0)
+        vm_started = true;
+
+    if (!forceCleanup) {
+        if (!virDomainObjIsActive(vm)) {
+            VIR_DEBUG("VM '%s' not active", vm->def->name);
+            goto cleanup;
+        }
+
+        if (!vm_started) {
+            virReportError(VIR_ERR_INTERNAL_ERROR,
+                           _("Invalid PID %1$d for VM"),
+                           (int)vm->pid);
+            ret = -1;
+            goto cleanup;
+        }
+    }
+
+    /* Destroy monitor before running the actual destroy command to prevent
+     * it from detecting VM shutdown and entering this cleanup routine again */
+    if ((priv != NULL) && (priv->mon != NULL))
+         g_clear_pointer(&priv->mon, bhyveMonitorClose);
+
+    virBhyveDomainObjStopWorker(vm);
+
+    cmd = virBhyveProcessBuildDestroyCmd(driver, vm->def);
+    if (virCommandRun(cmd, NULL) < 0) {
+        /* Only failure of the actual destroy command warrants unsuccessful return code,
+         * other failures are not considered critical */
+        ret = -1;
+        VIR_WARN("Failed to run the domain destroy command");
+    }
+
+    if (vm_started)
+        bhyveProcessStopHook(driver, vm, VIR_HOOK_BHYVE_OP_STOPPED);
+
+    /* Cleanup network interfaces */
+    bhyveNetCleanup(vm);
+
+    /* VNC autoport cleanup */
+    if ((vm->def->ngraphics == 1) &&
+        vm->def->graphics[0]->type == VIR_DOMAIN_GRAPHICS_TYPE_VNC) {
+        if (virPortAllocatorRelease(vm->def->graphics[0]->data.vnc.port) < 0) {
+            VIR_WARN("Failed to release VNC port for '%s'",
+                     vm->def->name);
+        }
+    }
+
+    /* UNIX sockets cleanup */
+    for (i = 0; i < vm->def->nchannels; i++) {
+        virDomainChrDef *channel = vm->def->channels[i];
+
+        if (channel->source->type != VIR_DOMAIN_CHR_TYPE_UNIX)
+            continue;
+        if (channel->targetType != VIR_DOMAIN_CHR_CHANNEL_TARGET_TYPE_VIRTIO)
+            continue;
+
+        if (virFileExists(channel->source->data.nix.path))
+            virFileRemove(channel->source->data.nix.path, 0, 0);
+    }
+
+    virCloseCallbacksDomainRemove(vm, NULL, bhyveProcessAutoDestroy);
+
+    virDomainObjSetState(vm, VIR_DOMAIN_SHUTOFF, reason);
+    vm->pid = 0;
+    vm->def->id = -1;
+
+    if (vm_started)
+        bhyveProcessStopHook(driver, vm, VIR_HOOK_BHYVE_OP_RELEASE);
+    virPidFileDelete(driver->config->stateDir, vm->def->name);
+    bhyveProcessRemoveDomainStatus(driver->config->stateDir, vm->def->name);
+    bhyveProcessRemoveIPCSocket(driver, vm->def->name);
+
+    if (restoreDef)
+        virDomainObjRemoveTransientDef(vm);
+
+ cleanup:
+    virErrorRestore(&save_err);
+    return ret;
+}
+
+int
+virBhyveProcessStop(struct _bhyveConn *driver,
+                    virDomainObj *vm,
+                    virDomainShutoffReason reason,
+                    bool forceCleanup)
+{
+    return virBhyveProcessStopImpl(driver, vm, reason, forceCleanup, true);
+}
+
+int
+virBhyveProcessShutdown(virDomainObj *vm)
+{
+    pid_t pid;
+
+    if ((pid = virBhyveProcessGetBhyvePid(vm)) < 0)
+        return -1;
+
+    /* Bhyve tries to perform ACPI shutdown when it receives
+     * SIGTERM signal. So we just issue SIGTERM here and rely
+     * on the bhyve monitor to clean things up if process disappears.
+     */
+    if (virProcessKill(pid, SIGTERM) != 0) {
+        VIR_WARN("Failed to terminate bhyve process for VM '%s' (pid: %d): %s",
+                 vm->def->name, (int)pid, virGetLastErrorMessage());
+        return -1;
+    }
+
+    return 0;
+}
+
+int
+virBhyveProcessRestart(struct _bhyveConn *driver,
+                       virDomainObj *vm)
+{
+    if (virBhyveProcessStopImpl(driver, vm, VIR_DOMAIN_SHUTOFF_SHUTDOWN,
+                                false, false) < 0)
+        return -1;
+
+    if (virBhyveProcessStartImpl(driver, vm, VIR_DOMAIN_RUNNING_BOOTED) < 0)
+        return -1;
+
+    return 0;
+}
+
+int
+virBhyveProcessReset(struct _bhyveConn *driver, virDomainObj *vm)
+{
+    g_autoptr(virCommand) cmd = virBhyveProcessBuildResetCmd(driver, vm->def);
+
+    if (virCommandRun(cmd, NULL) < 0)
+        return -1;
+
+    return 0;
+}
+
+int
+virBhyveGetDomainTotalCpuStats(virDomainObj *vm,
+                               unsigned long long *cpustats)
+{
+    struct kinfo_proc *kp;
+    kvm_t *kd;
+    g_autofree char *errbuf = g_new0(char, _POSIX2_LINE_MAX);
+    int nprocs;
+    int ret = -1;
+    pid_t pid;
+
+    if ((pid = virBhyveProcessGetBhyvePid(vm)) < 0)
+        return -1;
+
+    if ((kd = kvm_openfiles(NULL, NULL, NULL, O_RDONLY, errbuf)) == NULL) {
+        virReportError(VIR_ERR_SYSTEM_ERROR,
+                       _("Unable to get kvm descriptor: %1$s"),
+                       errbuf);
+        return -1;
+
+    }
+
+    kp = kvm_getprocs(kd, KERN_PROC_PID, pid, &nprocs);
+    if (kp == NULL || nprocs != 1) {
+        virReportError(VIR_ERR_SYSTEM_ERROR,
+                       _("Unable to obtain information about pid: %1$d"),
+                       (int)pid);
+        goto cleanup;
+    }
+
+    *cpustats = kp->ki_runtime * 1000ull;
+
+    ret = 0;
+
+ cleanup:
+    kvm_close(kd);
+
+    return ret;
+}
+
+struct bhyveProcessReconnectData {
+    struct _bhyveConn *driver;
+    kvm_t *kd;
+};
+
+static int
+virBhyveProcessReconnect(virDomainObj *vm,
+                         void *opaque)
+{
+    struct bhyveProcessReconnectData *data = opaque;
+    struct kinfo_proc *kp;
+    int nprocs;
+    char **proc_argv;
+    g_autofree char *expected_proctitle = NULL;
+    pid_t bhyvePid;
+    bhyveDomainObjPrivate *priv = vm->privateData;
+    g_autoptr(virConnect) conn = NULL;
+    size_t i;
+    int ret = -1;
+
+    if (!virDomainObjIsActive(vm))
+        return 0;
+
+    if (vm->pid == 0)
+        return 0;
+
+    virObjectLock(vm);
+
+    kp = kvm_getprocs(data->kd, KERN_PROC_PID, vm->pid, &nprocs);
+    if (kp == NULL || nprocs != 1)
+        goto cleanup;
+
+    if (data->driver->privileged) {
+        expected_proctitle = g_strdup_printf("bhyve: %s", vm->def->name);
+        proc_argv = kvm_getargv(data->kd, kp, 0);
+        if (!proc_argv || !proc_argv[0] ||
+            STRNEQ(expected_proctitle, proc_argv[0]))
+            goto cleanup;
+    } else {
+        if ((bhyvePid = bhyveProcessQueryVMPid(vm)) < 0)
+            goto cleanup;
+
+        kp = kvm_getprocs(data->kd, KERN_PROC_PID, bhyvePid, &nprocs);
+        if (kp == NULL || nprocs != 1 || (pid_t)kp->ki_ppid != vm->pid)
+            goto cleanup;
+    }
+
+    ret = 0;
+    priv->mon = bhyveMonitorOpen(vm, data->driver);
+    if (vm->def->ngraphics == 1 &&
+        vm->def->graphics[0]->type == VIR_DOMAIN_GRAPHICS_TYPE_VNC) {
+        int vnc_port = vm->def->graphics[0]->data.vnc.port;
+        if (virPortAllocatorSetUsed(vnc_port) < 0) {
+            VIR_WARN("Failed to mark VNC port '%d' as used by '%s'",
+                     vnc_port, vm->def->name);
+        }
+    }
+
+    for (i = 0; i < vm->def->nnets; i++) {
+        virDomainNetDef *net = vm->def->nets[i];
+        if (net->type == VIR_DOMAIN_NET_TYPE_NETWORK && !conn)
+            conn = virGetConnectNetwork();
+
+        virDomainNetNotifyActualDevice(conn, vm->def, net);
+    }
+
+    if (virBhyveDomainObjStartWorker(vm) < 0)
+        goto cleanup;
+
+ cleanup:
+    if (ret < 0) {
+        /* If VM is reported to be in active state, but we cannot find
+         * its PID, then we clear information about the PID and
+         * set state to 'shutdown' */
+        vm->pid = 0;
+        vm->def->id = -1;
+        virDomainObjSetState(vm, VIR_DOMAIN_SHUTOFF,
+                             VIR_DOMAIN_SHUTOFF_UNKNOWN);
+        virDomainObjRemoveTransientDef(vm);
+        ignore_value(virDomainObjSave(vm, data->driver->xmlopt,
+                                      data->driver->config->stateDir));
+    }
+
+    virObjectUnlock(vm);
+
+    return ret;
+}
+
+void
+virBhyveProcessReconnectAll(struct _bhyveConn *driver)
+{
+    kvm_t *kd;
+    struct bhyveProcessReconnectData data;
+    g_autofree char *errbuf = g_new0(char, _POSIX2_LINE_MAX);
+
+    if ((kd = kvm_openfiles(NULL, NULL, NULL, O_RDONLY, errbuf)) == NULL) {
+        virReportError(VIR_ERR_SYSTEM_ERROR,
+                       _("Unable to get kvm descriptor: %1$s"),
+                       errbuf);
+        return;
+
+    }
+
+    data.driver = driver;
+    data.kd = kd;
+
+    virDomainObjListForEach(driver->domains, false, virBhyveProcessReconnect, &data);
+
+    kvm_close(kd);
+}

@@ -1,0 +1,40 @@
+<domain type='vmware'>
+  <name>wild14</name>
+  <uuid>501b831e-75d8-15f8-36fa-b9e225f395aa</uuid>
+  <hwuuid>421b223a-f2c1-c7c9-a399-34d2d9fde26d</hwuuid>
+  <description>execution env sandbox automation platform</description>
+  <memory unit='KiB'>33554432</memory>
+  <currentMemory unit='KiB'>33554432</currentMemory>
+  <vcpu placement='static'>12</vcpu>
+  <os>
+    <type arch='x86_64'>hvm</type>
+    <nvram>[datastore] directory/wild14.nvram</nvram>
+  </os>
+  <clock offset='utc'/>
+  <on_poweroff>destroy</on_poweroff>
+  <on_reboot>restart</on_reboot>
+  <on_crash>destroy</on_crash>
+  <devices>
+    <disk type='file' device='disk'>
+      <source file='[datastore] directory/wild1.vmdk'/>
+      <target dev='sda' bus='scsi'/>
+      <address type='drive' controller='0' bus='0' target='0' unit='0'/>
+    </disk>
+    <disk type='file' device='disk'>
+      <source file='[datastore] directory/wild2.vmdk'/>
+      <target dev='sdb' bus='scsi'/>
+      <address type='drive' controller='0' bus='0' target='0' unit='1'/>
+    </disk>
+    <controller type='scsi' index='0' model='vmpvscsi'>
+      <address type='pci' domain='0x0000' bus='0x05' slot='0x00' function='0x0'/>
+    </controller>
+    <interface type='null'>
+      <mac address='00:00:00:00:00:00' type='static'/>
+      <model type='vmxnet3'/>
+      <address type='pci' domain='0x0000' bus='0x06' slot='0x00' function='0x0'/>
+    </interface>
+    <video>
+      <model type='vmvga' vram='8192' primary='yes'/>
+    </video>
+  </devices>
+</domain>

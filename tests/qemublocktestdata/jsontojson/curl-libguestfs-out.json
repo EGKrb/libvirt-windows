@@ -1,0 +1,8 @@
+{
+  "driver": "https",
+  "url": "https://test.host:443/whatever.img",
+  "sslverify": false,
+  "cookie": "some_cookie=\"some_value_or_whatever\"",
+  "timeout": 2000,
+  "readahead": 65536
+}

@@ -1,0 +1,10 @@
+<test>
+  <migParams>
+    <param name='cpu-throttle-initial' value='20'/>
+    <param name='cpu-throttle-increment' value='10'/>
+    <param name='tls-creds' value='objlibvirt_migrate_tls0'/>
+    <param name='tls-hostname' value=''/>
+    <param name='max-bandwidth' value='33554432'/>
+    <param name='downtime-limit' value='300'/>
+  </migParams>
+</test>

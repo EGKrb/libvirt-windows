@@ -1,0 +1,104 @@
+tc \
+qdisc \
+show \
+dev \
+virbr0 \
+handle \
+1:
+tc \
+qdisc \
+add \
+dev \
+virbr0 \
+root \
+handle \
+1: \
+htb \
+default \
+2
+tc \
+filter \
+add \
+dev \
+virbr0 \
+prio \
+2 \
+protocol \
+ip \
+parent \
+1: \
+u32 \
+match \
+ip \
+dport \
+68 \
+ffff \
+action \
+csum \
+ip \
+and \
+udp
+nft \
+-ae insert \
+rule \
+ip \
+libvirt_network \
+guest_output \
+iif \
+virbr0 \
+counter \
+reject
+nft \
+-ae insert \
+rule \
+ip \
+libvirt_network \
+guest_input \
+oif \
+virbr0 \
+counter \
+reject
+nft \
+-ae insert \
+rule \
+ip \
+libvirt_network \
+guest_cross \
+iif \
+virbr0 \
+oif \
+virbr0 \
+counter \
+accept
+nft \
+-ae insert \
+rule \
+ip6 \
+libvirt_network \
+guest_output \
+iif \
+virbr0 \
+counter \
+reject
+nft \
+-ae insert \
+rule \
+ip6 \
+libvirt_network \
+guest_input \
+oif \
+virbr0 \
+counter \
+reject
+nft \
+-ae insert \
+rule \
+ip6 \
+libvirt_network \
+guest_cross \
+iif \
+virbr0 \
+oif \
+virbr0 \
+counter \
+accept

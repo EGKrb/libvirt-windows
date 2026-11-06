@@ -1,0 +1,30 @@
+<cpu>
+  <arch>x86_64</arch>
+  <model>EPYC-Rome-v5</model>
+  <vendor>AMD</vendor>
+  <signature family='23' model='49' stepping='0'/>
+  <feature name='monitor'/>
+  <feature name='osxsave'/>
+  <feature name='ht'/>
+  <feature name='cmt'/>
+  <feature name='xsaves'/>
+  <feature name='mbm_total'/>
+  <feature name='mbm_local'/>
+  <feature name='cmp_legacy'/>
+  <feature name='extapic'/>
+  <feature name='ibs'/>
+  <feature name='skinit'/>
+  <feature name='wdt'/>
+  <feature name='tce'/>
+  <feature name='topoext'/>
+  <feature name='perfctr_nb'/>
+  <feature name='invtsc'/>
+  <feature name='svm-lock'/>
+  <feature name='decodeassists'/>
+  <feature name='avic'/>
+  <feature name='gmet'/>
+  <feature name='rdctl-no'/>
+  <feature name='skip-l1dfl-vmentry'/>
+  <feature name='mds-no'/>
+  <feature name='pschange-mc-no'/>
+</cpu>

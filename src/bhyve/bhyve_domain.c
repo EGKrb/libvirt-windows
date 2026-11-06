@@ -1,0 +1,887 @@
+/*
+ * bhyve_domain.c: bhyve domain private state
+ *
+ * Copyright (C) 2014 Roman Bogorodskiy
+ * Copyright (C) 2025 The FreeBSD Foundation
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library.  If not, see
+ * <http://www.gnu.org/licenses/>.
+ */
+
+#include <config.h>
+
+#include "bhyve_firmware.h"
+#include "bhyve_driver.h"
+#include "bhyve_conf.h"
+#include "bhyve_device.h"
+#include "bhyve_domain.h"
+#include "bhyve_capabilities.h"
+#include "viralloc.h"
+#include "virfile.h"
+#include "virlog.h"
+#include "virstring.h"
+#include "virutil.h"
+
+#define VIR_FROM_THIS VIR_FROM_BHYVE
+
+VIR_LOG_INIT("bhyve.bhyve_domain");
+
+static void *
+bhyveDomainObjPrivateAlloc(void *opaque)
+{
+    bhyveDomainObjPrivate *priv = g_new0(bhyveDomainObjPrivate, 1);
+
+    priv->agentTimeout = 30;
+    priv->driver = opaque;
+
+    return priv;
+}
+
+static void
+bhyveDomainObjPrivateFree(void *data)
+{
+    bhyveDomainObjPrivate *priv = data;
+
+    virDomainPCIAddressSetFree(priv->pciaddrs);
+
+    if (priv->eventThread) {
+        VIR_ERROR(_("Unexpected event thread still active during domain deletion"));
+        g_object_unref(priv->eventThread);
+    }
+
+    g_free(priv);
+}
+
+static int
+bhyveDomainObjPrivateXMLParse(xmlXPathContextPtr ctxt,
+                              virDomainObj *vm,
+                              virDomainDefParserConfig *config G_GNUC_UNUSED)
+{
+    bhyveDomainObjPrivate *priv = vm->privateData;
+
+    if (virXPathInt("string(./agentTimeout)", ctxt, &priv->agentTimeout) == -2) {
+        virReportError(VIR_ERR_INTERNAL_ERROR, "%s",
+                       _("failed to parse agent timeout"));
+        return -1;
+    }
+
+    return 0;
+}
+
+static int
+bhyveDomainObjPrivateXMLFormat(virBuffer *buf,
+                               virDomainObj *vm)
+{
+    bhyveDomainObjPrivate *priv = vm->privateData;
+
+    virBufferAsprintf(buf, "<agentTimeout>%i</agentTimeout>\n", priv->agentTimeout);
+
+    return 0;
+}
+
+virDomainXMLPrivateDataCallbacks virBhyveDriverPrivateDataCallbacks = {
+    .alloc = bhyveDomainObjPrivateAlloc,
+    .free = bhyveDomainObjPrivateFree,
+    .parse = bhyveDomainObjPrivateXMLParse,
+    .format = bhyveDomainObjPrivateXMLFormat,
+};
+
+static bool
+bhyveDomainDefNeedsISAController(virDomainDef *def)
+{
+    if (!ARCH_IS_X86(def->os.arch))
+        return false;
+
+    if (def->os.bootloader == NULL && def->os.loader)
+        return true;
+
+    if (def->os.firmware == VIR_DOMAIN_OS_DEF_FIRMWARE_EFI)
+        return true;
+
+    if (def->nserials || def->nconsoles)
+        return true;
+
+    if (def->ngraphics && def->nvideos)
+        return true;
+
+    if (def->ntpms)
+        return true;
+
+    return false;
+}
+
+static int
+bhyveDomainDefPostParse(virDomainDef *def,
+                        unsigned int parseFlags,
+                        void *opaque,
+                        void *parseOpaque G_GNUC_UNUSED)
+{
+    struct _bhyveConn *driver = opaque;
+    g_autoptr(virCaps) caps = bhyveDriverGetCapabilities(driver);
+    size_t i;
+    size_t virtio_channels = 0;
+    size_t virtio_serial_controllers = 0;
+    size_t virtio_serial_existing_controllers = 0;
+    size_t virtio_serial_controllers_to_create = 0;
+    bool abiUpdate = !!(parseFlags & VIR_DOMAIN_DEF_PARSE_ABI_UPDATE);
+
+    if (!caps)
+        return -1;
+
+    if (!virCapabilitiesDomainSupported(caps, def->os.type,
+                                        def->os.arch,
+                                        def->virtType,
+                                        true))
+        return -1;
+
+    /* Add an implicit PCI root controller */
+    virDomainDefMaybeAddController(def, VIR_DOMAIN_CONTROLLER_TYPE_PCI, 0,
+                                   VIR_DOMAIN_CONTROLLER_MODEL_PCI_ROOT);
+
+    if (bhyveDomainDefNeedsISAController(def)) {
+        virDomainDefMaybeAddController(def, VIR_DOMAIN_CONTROLLER_TYPE_ISA, 0,
+                                       VIR_DOMAIN_CONTROLLER_MODEL_ISA_DEFAULT);
+    }
+
+    /* When not specified in the domain XML, clock.offset defaults to UTC which is
+     * not supported by bhyve on ARM64. So force it to LOCALTIME. */
+    if ((def->clock.offset == VIR_DOMAIN_CLOCK_OFFSET_UTC) &&
+        !virBhyveCapsGet(bhyveDriverGetBhyveCaps(driver), BHYVE_CAP_RTC_UTC))
+        def->clock.offset = VIR_DOMAIN_CLOCK_OFFSET_LOCALTIME;
+
+    /* bhyve/arm64 does not provide the bhyveload(8) tool,
+     * so if the loader is not specified and we cannot fall back to the
+     * default one, then this results in an unusable configuration. */
+    if (ARCH_IS_ARM(def->os.arch)) {
+        if (def->os.loader == NULL) {
+            g_autoptr(virBhyveDriverConfig) cfg = virBhyveDriverGetConfig(driver);
+            char *uboot_path = cfg->ubootPath;
+
+            if (virFileExists(uboot_path)) {
+                def->os.loader = virDomainLoaderDefNew();
+                def->os.loader->path = g_strdup(uboot_path);
+                def->os.loader->readonly = true;
+                def->os.loader->type = VIR_DOMAIN_LOADER_TYPE_PFLASH;
+            } else {
+                virReportError(VIR_ERR_CONFIG_UNSUPPORTED,
+                               _("loader is not specified and the default loader (%1$s) not found"),
+                               uboot_path);
+                return -1;
+            }
+        }
+    }
+
+    if (def->os.loader &&
+        def->os.loader->path &&
+        !def->os.loader->type) {
+        def->os.loader->type = VIR_DOMAIN_LOADER_TYPE_ROM;
+    }
+
+    for (i = 0; i < def->nchannels; i++)
+        if (def->channels[i]->targetType == VIR_DOMAIN_CHR_CHANNEL_TARGET_TYPE_VIRTIO)
+            virtio_channels++;
+
+    for (i = 0; i < def->ncontrollers; i++)
+        if (def->controllers[i]->type == VIR_DOMAIN_CONTROLLER_TYPE_VIRTIO_SERIAL)
+            virtio_serial_existing_controllers++;
+
+    /* bhyve supports 16 ports per virtio-console device */
+    virtio_serial_controllers = (virtio_channels / 16) + (virtio_channels % 16 != 0);
+    if (virtio_serial_controllers > virtio_serial_existing_controllers) {
+        virtio_serial_controllers_to_create = virtio_serial_controllers - virtio_serial_existing_controllers;
+
+        for (i = 0; i < virtio_serial_controllers_to_create; i++) {
+            virDomainControllerDef *cont;
+
+            cont = virDomainDefAddController(def, VIR_DOMAIN_CONTROLLER_TYPE_VIRTIO_SERIAL, -1, -1);
+            cont->opts.vioserial.ports = 16;
+        }
+    }
+
+    if (bhyveFirmwareFillDomain(driver, def, abiUpdate) < 0) {
+        if (abiUpdate)
+            return -1;
+        virResetLastError();
+    }
+
+    return 0;
+}
+
+static int
+bhyveDomainDiskDefAssignAddress(struct _bhyveConn *driver,
+                                virDomainDiskDef *def,
+                                const virDomainDef *vmdef G_GNUC_UNUSED)
+{
+    int idx = -1;
+    int nvme_ctrl = 0;
+
+    if (virDiskNameParse(def->dst, &nvme_ctrl, &idx, NULL) < 0) {
+        virReportError(VIR_ERR_XML_ERROR,
+                       _("Unknown disk name '%1$s' and no address specified"),
+                       def->dst);
+        return -1;
+    }
+
+    switch (def->bus) {
+    case VIR_DOMAIN_DISK_BUS_SATA:
+        def->info.type = VIR_DOMAIN_DEVICE_ADDRESS_TYPE_DRIVE;
+
+        if (virBhyveCapsGet(driver->bhyvecaps, BHYVE_CAP_AHCI32SLOT)) {
+            def->info.addr.drive.controller = idx / 32;
+            def->info.addr.drive.unit = idx % 32;
+        } else {
+            def->info.addr.drive.controller = idx;
+            def->info.addr.drive.unit = 0;
+        }
+
+        def->info.addr.drive.bus = 0;
+        break;
+
+    case VIR_DOMAIN_DISK_BUS_NVME:
+        def->info.type = VIR_DOMAIN_DEVICE_ADDRESS_TYPE_DRIVE;
+
+        def->info.addr.drive.controller = nvme_ctrl;
+        def->info.addr.drive.unit = 0;
+        def->info.addr.drive.bus = idx;
+        break;
+
+    case VIR_DOMAIN_DISK_BUS_SCSI:
+    case VIR_DOMAIN_DISK_BUS_IDE:
+    case VIR_DOMAIN_DISK_BUS_FDC:
+    case VIR_DOMAIN_DISK_BUS_NONE:
+    case VIR_DOMAIN_DISK_BUS_VIRTIO:
+    case VIR_DOMAIN_DISK_BUS_XEN:
+    case VIR_DOMAIN_DISK_BUS_USB:
+    case VIR_DOMAIN_DISK_BUS_UML:
+    case VIR_DOMAIN_DISK_BUS_SD:
+    case VIR_DOMAIN_DISK_BUS_LAST:
+    default:
+        break;
+    }
+    return 0;
+}
+
+static int
+bhyveDomainDeviceDefPostParse(virDomainDeviceDef *dev,
+                              const virDomainDef *def,
+                              unsigned int parseFlags G_GNUC_UNUSED,
+                              void *opaque,
+                              void *parseOpaque G_GNUC_UNUSED)
+{
+    struct _bhyveConn *driver = opaque;
+
+    if (dev->type == VIR_DOMAIN_DEVICE_DISK) {
+        virDomainDiskDef *disk = dev->data.disk;
+
+        if (disk->info.type == VIR_DOMAIN_DEVICE_ADDRESS_TYPE_NONE &&
+            bhyveDomainDiskDefAssignAddress(driver, disk, def) < 0)
+            return -1;
+    }
+
+    if (dev->type == VIR_DOMAIN_DEVICE_CONTROLLER) {
+        virDomainControllerDef *cont = dev->data.controller;
+
+        if (cont->type == VIR_DOMAIN_CONTROLLER_TYPE_PCI &&
+            (cont->model == VIR_DOMAIN_CONTROLLER_MODEL_PCI_ROOT ||
+             cont->model == VIR_DOMAIN_CONTROLLER_MODEL_PCIE_ROOT) &&
+            cont->idx != 0) {
+            virReportError(VIR_ERR_XML_ERROR, "%s",
+                           _("pci-root and pcie-root controllers should have index 0"));
+            return -1;
+        } else if (cont->type == VIR_DOMAIN_CONTROLLER_TYPE_VIRTIO_SERIAL) {
+            /* bhyve supports 16 ports per controller */
+            if (cont->opts.vioserial.ports == -1)
+                cont->opts.vioserial.ports = 16;
+        }
+    }
+
+    if (dev->type == VIR_DOMAIN_DEVICE_VIDEO &&
+        dev->data.video->type == VIR_DOMAIN_VIDEO_TYPE_DEFAULT) {
+        dev->data.video->type = VIR_DOMAIN_VIDEO_TYPE_GOP;
+    }
+
+    if (dev->type == VIR_DOMAIN_DEVICE_TPM &&
+        dev->data.tpm->model == VIR_DOMAIN_TPM_MODEL_DEFAULT) {
+        dev->data.tpm->model = VIR_DOMAIN_TPM_MODEL_CRB;
+    }
+
+    if (dev->type == VIR_DOMAIN_DEVICE_CHR &&
+        dev->data.chr->source->type == VIR_DOMAIN_CHR_TYPE_NMDM) {
+        virDomainChrDef *chr = dev->data.chr;
+
+        if (!chr->source->data.nmdm.master) {
+            char uuidstr[VIR_UUID_STRING_BUFLEN];
+
+            virUUIDFormat(def->uuid, uuidstr);
+
+            chr->source->data.nmdm.master = g_strdup_printf("/dev/nmdm%sA", uuidstr);
+            chr->source->data.nmdm.slave = g_strdup_printf("/dev/nmdm%sB", uuidstr);
+        }
+    }
+
+    return 0;
+}
+
+static int
+bhyveDomainDefAssignAddresses(virDomainDef *def,
+                              unsigned int parseFlags G_GNUC_UNUSED,
+                              void *opaque G_GNUC_UNUSED,
+                              void *parseOpaque G_GNUC_UNUSED)
+{
+    if (bhyveDomainAssignAddresses(def, NULL) < 0)
+        return -1;
+
+    return 0;
+}
+
+virDomainXMLOption *
+virBhyveDriverCreateXMLConf(struct _bhyveConn *driver)
+{
+    virDomainXMLOption *ret = NULL;
+
+    virBhyveDriverDomainDefParserConfig.priv = driver;
+
+    ret = virDomainXMLOptionNew(&virBhyveDriverDomainDefParserConfig,
+                                &virBhyveDriverPrivateDataCallbacks,
+                                &virBhyveDriverDomainXMLNamespace,
+                                NULL, NULL, NULL);
+
+    virDomainXMLOptionSetCloseCallbackAlloc(ret, virCloseCallbacksDomainAlloc);
+
+    return ret;
+}
+
+
+static int
+bhyveDomainDeviceDefValidate(const virDomainDeviceDef *dev,
+                             const virDomainDef *def G_GNUC_UNUSED,
+                             void *opaque G_GNUC_UNUSED,
+                             void *parseOpaque G_GNUC_UNUSED)
+{
+    switch (dev->type) {
+    case VIR_DOMAIN_DEVICE_CONTROLLER: {
+        virDomainControllerDef *controller = dev->data.controller;
+
+        if (controller->type == VIR_DOMAIN_CONTROLLER_TYPE_ISA &&
+            controller->idx != 0) {
+            virReportError(VIR_ERR_CONFIG_UNSUPPORTED, "%s",
+                           _("Bhyve ISA controller can only have index '0'"));
+            return -1;
+        } else if (controller->type == VIR_DOMAIN_CONTROLLER_TYPE_VIRTIO_SERIAL) {
+            if (controller->opts.vioserial.ports > 16) {
+                virReportError(VIR_ERR_CONFIG_UNSUPPORTED, "%s",
+                               _("Bhyve virtio-serial controller supports up to 16 ports"));
+                return -1;
+            }
+        } else if (controller->type == VIR_DOMAIN_CONTROLLER_TYPE_NVME &&
+                   controller->opts.nvmeopts.serial) {
+            if (strchr(controller->opts.nvmeopts.serial, ',')) {
+                virReportError(VIR_ERR_CONFIG_UNSUPPORTED, "%s",
+                               _("Serial number may not contain ',' character"));
+                return -1;
+            }
+        }
+        break;
+    }
+    case VIR_DOMAIN_DEVICE_RNG:
+        if (dev->data.rng->model == VIR_DOMAIN_RNG_MODEL_VIRTIO) {
+            if (dev->data.rng->backend == VIR_DOMAIN_RNG_BACKEND_RANDOM) {
+                if (STRNEQ(dev->data.rng->source.file, "/dev/random")) {
+                    virReportError(VIR_ERR_CONFIG_UNSUPPORTED, "%s",
+                                   _("Only /dev/random source is supported"));
+                    return -1;
+                }
+            } else {
+                virReportError(VIR_ERR_CONFIG_UNSUPPORTED, "%s",
+                               _("Only 'random' backend model is supported"));
+                return -1;
+            }
+        } else {
+            virReportError(VIR_ERR_CONFIG_UNSUPPORTED, "%s",
+                           _("Only 'virio' RNG device model is supported"));
+            return -1;
+        }
+        break;
+
+    case VIR_DOMAIN_DEVICE_CHR: {
+        virDomainChrDef *chr = dev->data.chr;
+        if (chr->deviceType == VIR_DOMAIN_CHR_DEVICE_TYPE_SERIAL) {
+            if (chr->source->type != VIR_DOMAIN_CHR_TYPE_NMDM &&
+                chr->source->type != VIR_DOMAIN_CHR_TYPE_TCP) {
+                virReportError(VIR_ERR_CONFIG_UNSUPPORTED, "%s",
+                               _("Only 'nmdm' and 'tcp' console types are supported"));
+                return -1;
+            }
+            if (chr->target.port > 3) {
+                virReportError(VIR_ERR_CONFIG_UNSUPPORTED, "%s",
+                               _("Only four serial ports are supported"));
+                return -1;
+            }
+            if (chr->source->type == VIR_DOMAIN_CHR_TYPE_TCP) {
+                if (chr->source->data.tcp.listen == false) {
+                    virReportError(VIR_ERR_CONFIG_UNSUPPORTED, "%s",
+                                   _("Only listening TCP sockets are supported"));
+                    return -1;
+                }
+
+                if (chr->source->data.tcp.protocol != VIR_DOMAIN_CHR_TCP_PROTOCOL_RAW) {
+                    virReportError(VIR_ERR_CONFIG_UNSUPPORTED, "%s",
+                                   _("Only 'raw' protocol is supported for TCP sockets"));
+                    return -1;
+                }
+            }
+        } else if (chr->deviceType == VIR_DOMAIN_CHR_DEVICE_TYPE_CHANNEL &&
+                   chr->targetType == VIR_DOMAIN_CHR_CHANNEL_TARGET_TYPE_VIRTIO &&
+                   chr->source->type == VIR_DOMAIN_CHR_TYPE_UNIX) {
+            if (virStringHasChars(chr->target.name, ",")) {
+                    virReportError(VIR_ERR_CONFIG_UNSUPPORTED, "%s",
+                                   _("Commas (',') are not allowed in channel names"));
+                    return -1;
+            }
+            if (chr->source->data.nix.path) {
+                if (virStringHasChars(chr->source->data.nix.path, ",")) {
+                    virReportError(VIR_ERR_CONFIG_UNSUPPORTED, "%s",
+                                   _("Commas (',') are not allowed in UNIX socket paths"));
+                    return -1;
+                }
+            }
+        }
+        break;
+    }
+    case VIR_DOMAIN_DEVICE_DISK: {
+        virDomainDiskDef *disk = dev->data.disk;
+
+        if ((disk->bus == VIR_DOMAIN_DISK_BUS_SATA ||
+             disk->bus == VIR_DOMAIN_DISK_BUS_VIRTIO) &&
+            disk->info.bootIndex > INT_MAX) {
+            virReportError(VIR_ERR_CONFIG_UNSUPPORTED,
+                           _("boot order '%1$u' is greater than bhyve's maximum of %2$d"),
+                           disk->info.bootIndex, INT_MAX);
+            return -1;
+        }
+
+        if (disk->rotation_rate &&
+            disk->bus != VIR_DOMAIN_DISK_BUS_SATA) {
+            virReportError(VIR_ERR_CONFIG_UNSUPPORTED, "%s",
+                           _("rotation rate is only valid for SATA bus"));
+            return -1;
+        }
+
+        if ((disk->queues || disk->queue_size) &&
+            disk->bus != VIR_DOMAIN_DISK_BUS_NVME) {
+            virReportError(VIR_ERR_CONFIG_UNSUPPORTED, "%s",
+                           _("queue configuration is only valid for NVMe bus"));
+            return -1;
+        }
+
+        if (disk->bus == VIR_DOMAIN_DISK_BUS_SATA && disk->serial) {
+            if (strchr(disk->serial, ',')) {
+                virReportError(VIR_ERR_CONFIG_UNSUPPORTED, "%s",
+                               _("Serial number may not contain ',' character"));
+                return -1;
+            }
+        }
+
+        break;
+    }
+    case VIR_DOMAIN_DEVICE_NET: {
+        virDomainNetDef *net = dev->data.net;
+
+        if (net->type == VIR_DOMAIN_NET_TYPE_USER) {
+            if (net->guestIP.nips) {
+                virReportError(VIR_ERR_CONFIG_UNSUPPORTED, "%s",
+                               _("setting IP addresses for SLIRP networking is not supported"));
+                return -1;
+            }
+        }
+    }
+    case VIR_DOMAIN_DEVICE_AUDIO:
+    case VIR_DOMAIN_DEVICE_CRYPTO:
+    case VIR_DOMAIN_DEVICE_FS:
+    case VIR_DOMAIN_DEVICE_GRAPHICS:
+    case VIR_DOMAIN_DEVICE_HOSTDEV:
+    case VIR_DOMAIN_DEVICE_HUB:
+    case VIR_DOMAIN_DEVICE_INPUT:
+    case VIR_DOMAIN_DEVICE_IOMMU:
+    case VIR_DOMAIN_DEVICE_LAST:
+    case VIR_DOMAIN_DEVICE_LEASE:
+    case VIR_DOMAIN_DEVICE_MEMBALLOON:
+    case VIR_DOMAIN_DEVICE_MEMORY:
+    case VIR_DOMAIN_DEVICE_NONE:
+    case VIR_DOMAIN_DEVICE_NVRAM:
+    case VIR_DOMAIN_DEVICE_PANIC:
+    case VIR_DOMAIN_DEVICE_PSTORE:
+    case VIR_DOMAIN_DEVICE_REDIRDEV:
+    case VIR_DOMAIN_DEVICE_SHMEM:
+    case VIR_DOMAIN_DEVICE_SMARTCARD:
+    case VIR_DOMAIN_DEVICE_SOUND:
+    case VIR_DOMAIN_DEVICE_VIDEO:
+    case VIR_DOMAIN_DEVICE_VSOCK:
+    case VIR_DOMAIN_DEVICE_WATCHDOG:
+        break;
+
+    case VIR_DOMAIN_DEVICE_TPM:
+        if (dev->data.tpm->type != VIR_DOMAIN_TPM_TYPE_EXTERNAL) {
+            virReportError(VIR_ERR_CONFIG_UNSUPPORTED, "%s",
+                           _("Only 'external' TPM device backend is supported"));
+            return -1;
+        }
+
+        if (dev->data.tpm->model != VIR_DOMAIN_TPM_MODEL_DEFAULT &&
+            dev->data.tpm->model != VIR_DOMAIN_TPM_MODEL_CRB) {
+            virReportError(VIR_ERR_CONFIG_UNSUPPORTED,
+                           _("TPM model '%1$s' is not supported by bhyve"),
+                           virDomainTPMModelTypeToString(dev->data.tpm->model));
+            return -1;
+        }
+
+        if (virStringHasChars(dev->data.tpm->data.external.source->data.nix.path,
+                              ",")) {
+            virReportError(VIR_ERR_CONFIG_UNSUPPORTED, "%s",
+                           _("Commas (',') are not allowed in UNIX socket paths"));
+            return -1;
+        }
+        break;
+    }
+
+    return 0;
+}
+
+
+int
+bhyveValidateLifecycleAction(virDomainLifecycleAction onPoweroff,
+                             virDomainLifecycleAction onReboot,
+                             virDomainLifecycleAction onCrash)
+{
+    if ((onPoweroff != VIR_DOMAIN_LIFECYCLE_ACTION_DESTROY &&
+         onPoweroff != VIR_DOMAIN_LIFECYCLE_ACTION_RESTART) ||
+        (onReboot != VIR_DOMAIN_LIFECYCLE_ACTION_DESTROY &&
+         onReboot != VIR_DOMAIN_LIFECYCLE_ACTION_RESTART)) {
+        virReportError(VIR_ERR_CONFIG_UNSUPPORTED, "%s",
+                       _("bhyve driver supports only 'restart' and 'destroy' actions for 'on_reboot'/'on_poweroff'"));
+        return -1;
+    }
+
+    if (onCrash != VIR_DOMAIN_LIFECYCLE_ACTION_DESTROY) {
+        virReportError(VIR_ERR_CONFIG_UNSUPPORTED, "%s",
+                       _("bhyve driver does not support 'on_crash' actions other than 'destroy'"));
+        return -1;
+    }
+
+    return 0;
+}
+
+
+static int
+bhyveValidateDomainLifecycleAction(const virDomainDef *def)
+{
+    return bhyveValidateLifecycleAction(def->onPoweroff,
+                                        def->onReboot,
+                                        def->onCrash);
+}
+
+
+static int
+bhyveDomainDefValidate(const virDomainDef *def,
+                       void *opaque,
+                       void *parseOpaque G_GNUC_UNUSED)
+{
+    struct _bhyveConn *driver = opaque;
+    size_t i;
+    size_t ncells;
+    virStorageSource *src = NULL;
+    g_autoptr(GHashTable) nvme_controllers = g_hash_table_new(g_direct_hash,
+                                                              g_direct_equal);
+
+    for (i = 0; i < def->ndisks; i++) {
+        virDomainDiskDef *disk = def->disks[i];
+        int nvme_ctrl = 0;
+        int idx = -1;
+
+        if (disk->bus == VIR_DOMAIN_DISK_BUS_NVME) {
+            if (virDiskNameParse(disk->dst, &nvme_ctrl, &idx, NULL) < 0) {
+                virReportError(VIR_ERR_XML_ERROR,
+                               _("Unknown disk name '%1$s' and no address specified"),
+                               disk->dst);
+                return -1;
+            }
+
+            if (g_hash_table_contains(nvme_controllers, GINT_TO_POINTER(nvme_ctrl))) {
+                virReportError(VIR_ERR_CONFIG_UNSUPPORTED,
+                               "%s",
+                               _("Cannot have more than one disk per NVMe controller"));
+                return -1;
+            }
+
+            g_hash_table_add(nvme_controllers, GINT_TO_POINTER(nvme_ctrl));
+        }
+    }
+
+    if (def->ntpms > 1) {
+        virReportError(VIR_ERR_CONFIG_UNSUPPORTED, "%s",
+                       _("bhyve only supports a single TPM device"));
+        return -1;
+    }
+
+    if (def->nhostdevs && !def->mem.locked) {
+        virReportError(VIR_ERR_CONFIG_UNSUPPORTED, "%s",
+                       _("using passthrough devices requires locking guest memory"));
+        return -1;
+    }
+
+    ncells = virDomainNumaGetNodeCount(def->numa);
+    if (ncells) {
+        if (ncells > 8) {
+            virReportError(VIR_ERR_CONFIG_UNSUPPORTED, "%s",
+                           _("Only up to 8 NUMA domains are supported"));
+            return -1;
+        }
+
+        for (i = 0; i < ncells; i++) {
+            if (!virDomainNumaGetNodeCpumask(def->numa, i)) {
+                virReportError(VIR_ERR_CONFIG_UNSUPPORTED,
+                               _("NUMA domain id %1$zu: empty cpusets are not allowed"),
+                               i);
+                return -1;
+            }
+        }
+    }
+
+    if (def->blkio.ndevices > 1) {
+        virReportError(VIR_ERR_CONFIG_UNSUPPORTED, "%s",
+                       _("Per device I/O tuning is not supported"));
+        return -1;
+    } else if (def->blkio.ndevices == 1) {
+        virBlkioDevice *device = &def->blkio.devices[0];
+
+        if (STRNEQ(device->path, "*")) {
+            virReportError(VIR_ERR_CONFIG_UNSUPPORTED, "%s",
+                           _("Per device I/O tuning is not supported"));
+            return -1;
+        }
+
+        if (device->weight != 0) {
+            virReportError(VIR_ERR_CONFIG_UNSUPPORTED, "%s",
+                           _("The 'weight' I/O tuning setting does not make sense with '*'"));
+            return -1;
+        }
+    }
+
+    if (virMemoryLimitIsSet(def->mem.soft_limit) ||
+        virMemoryLimitIsSet(def->mem.swap_hard_limit) ||
+        def->mem.min_guarantee) {
+        virReportError(VIR_ERR_CONFIG_UNSUPPORTED, "%s",
+                       _("Only 'hard_limit' memory tuning parameter is supported by bhyve"));
+        return -1;
+    }
+
+    if (!driver->privileged &&
+        (def->blkio.ndevices > 0 ||
+         virMemoryLimitIsSet(def->mem.hard_limit))) {
+        virReportError(VIR_ERR_CONFIG_UNSUPPORTED, "%s",
+                       _("resource limits are not supported in unprivileged mode"));
+        return -1;
+    }
+
+    if (!driver->privileged && !def->os.loader) {
+        virReportError(VIR_ERR_CONFIG_UNSUPPORTED, "%s",
+                       _("only UEFI boot is supported in unprivileged mode"));
+        return -1;
+    }
+
+    if (bhyveValidateDomainLifecycleAction(def) < 0)
+        return -1;
+
+    if (!def->os.loader)
+        return 0;
+
+    if (!(src = def->os.loader->nvram))
+        return 0;
+
+    if (src->type != VIR_STORAGE_TYPE_FILE) {
+        virReportError(VIR_ERR_CONFIG_UNSUPPORTED,
+                       "%s",
+                       _("only 'file' type is supported with NVRAM"));
+        return -1;
+    }
+
+    if (src->sliceStorage) {
+        virReportError(VIR_ERR_CONFIG_UNSUPPORTED, "%s",
+                        _("slices are not supported with NVRAM"));
+        return -1;
+    }
+
+    if (src->pr) {
+        virReportError(VIR_ERR_CONFIG_UNSUPPORTED, "%s",
+                        _("persistent reservations are not supported with NVRAM"));
+        return -1;
+    }
+
+    if (src->backingStore) {
+        virReportError(VIR_ERR_CONFIG_UNSUPPORTED, "%s",
+                        _("backingStore is not supported with NVRAM"));
+        return -1;
+    }
+
+    return 0;
+}
+
+virDomainDefParserConfig virBhyveDriverDomainDefParserConfig = {
+    .devicesPostParseCallback = bhyveDomainDeviceDefPostParse,
+    .domainPostParseCallback = bhyveDomainDefPostParse,
+    .assignAddressesCallback = bhyveDomainDefAssignAddresses,
+    .deviceValidateCallback = bhyveDomainDeviceDefValidate,
+    .domainValidateCallback = bhyveDomainDefValidate,
+
+    .features = VIR_DOMAIN_DEF_FEATURE_FW_AUTOSELECT,
+};
+
+static void
+bhyveDomainDefNamespaceFree(void *nsdata)
+{
+    bhyveDomainCmdlineDef *cmd = nsdata;
+
+    bhyveDomainCmdlineDefFree(cmd);
+}
+
+static int
+bhyveDomainDefNamespaceParse(xmlXPathContextPtr ctxt,
+                             void **data)
+{
+    bhyveDomainCmdlineDef *cmd = NULL;
+    xmlNodePtr *nodes = NULL;
+    int n;
+    size_t i;
+    int ret = -1;
+
+    cmd = g_new0(bhyveDomainCmdlineDef, 1);
+
+    n = virXPathNodeSet("./bhyve:commandline/bhyve:arg", ctxt, &nodes);
+    if (n == 0)
+        ret = 0;
+    if (n <= 0)
+        goto cleanup;
+
+    cmd->args = g_new0(char *, n);
+
+    for (i = 0; i < n; i++) {
+        cmd->args[cmd->num_args] = virXMLPropString(nodes[i], "value");
+        if (cmd->args[cmd->num_args] == NULL) {
+            virReportError(VIR_ERR_INTERNAL_ERROR,
+                           "%s", _("No bhyve command-line argument specified"));
+            goto cleanup;
+        }
+        cmd->num_args++;
+    }
+
+    *data = g_steal_pointer(&cmd);
+    ret = 0;
+
+ cleanup:
+    VIR_FREE(nodes);
+    bhyveDomainDefNamespaceFree(cmd);
+
+    return ret;
+}
+
+static int
+bhyveDomainDefNamespaceFormatXML(virBuffer *buf,
+                                 void *nsdata)
+{
+    bhyveDomainCmdlineDef *cmd = nsdata;
+    size_t i;
+
+    if (!cmd->num_args)
+        return 0;
+
+    virBufferAddLit(buf, "<bhyve:commandline>\n");
+    virBufferAdjustIndent(buf, 2);
+
+    for (i = 0; i < cmd->num_args; i++)
+        virBufferEscapeString(buf, "<bhyve:arg value='%s'/>\n",
+                              cmd->args[i]);
+
+    virBufferAdjustIndent(buf, -2);
+    virBufferAddLit(buf, "</bhyve:commandline>\n");
+
+    return 0;
+}
+
+virXMLNamespace virBhyveDriverDomainXMLNamespace = {
+    .parse = bhyveDomainDefNamespaceParse,
+    .free = bhyveDomainDefNamespaceFree,
+    .format = bhyveDomainDefNamespaceFormatXML,
+    .prefix = "bhyve",
+    .uri = "http://libvirt.org/schemas/domain/bhyve/1.0",
+
+};
+
+
+int
+virBhyveDomainObjStartWorker(virDomainObj *dom)
+{
+    bhyveDomainObjPrivate *priv = dom->privateData;
+
+    if (!priv->eventThread) {
+        g_autofree char *threadName = g_strdup_printf("vm-%s", dom->def->name);
+        if (!(priv->eventThread = virEventThreadNew(threadName)))
+            return -1;
+    }
+
+    return 0;
+}
+
+
+void
+virBhyveDomainObjStopWorker(virDomainObj *dom)
+{
+    bhyveDomainObjPrivate *priv = dom->privateData;
+    virEventThread *eventThread;
+
+    if (!priv->eventThread)
+        return;
+
+    eventThread = g_steal_pointer(&priv->eventThread);
+    virObjectUnlock(dom);
+    g_object_unref(eventThread);
+    virObjectLock(dom);
+}
+
+int
+bhyveDomainNamePathsCleanup(virBhyveDriverConfig *cfg,
+                            const char *name,
+                            bool bestEffort)
+{
+    g_autofree char *cfg_file = NULL;
+    g_autofree char *autostart_link = NULL;
+
+    cfg_file = virDomainConfigFile(cfg->configDir, name);
+    autostart_link = virDomainConfigFile(cfg->autostartDir, name);
+
+    if (virFileExists(cfg_file) &&
+        unlink(cfg_file) < 0) {
+        virReportSystemError(errno, _("Failed to unlink '%1$s'"), cfg_file);
+        if (!bestEffort)
+            return -1;
+    }
+
+    if (virFileIsLink(autostart_link) == 1 &&
+        unlink(autostart_link) < 0) {
+        virReportSystemError(errno, _("Failed to unlink '%1$s'"), autostart_link);
+        if (!bestEffort)
+            return -1;
+    }
+
+    return 0;
+}

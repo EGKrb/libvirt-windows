@@ -1,0 +1,8 @@
+<test>
+  <migParams>
+    <param name='cpu-throttle-initial' value='20'/>
+    <param name='cpu-throttle-increment' value='10'/>
+    <param name='max-bandwidth' value='33554432'/>
+    <param name='downtime-limit' value='300'/>
+  </migParams>
+</test>
