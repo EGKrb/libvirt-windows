@@ -1,0 +1,4 @@
+# Checked out with LF on Windows too: libvirt's generators (gendispatch.pl,
+# rpcgen, the shell and Python scripts) read the files as they are, and a CR
+# breaks them (core.autocrlf is on by default in Git for Windows)
+* text=auto eol=lf
