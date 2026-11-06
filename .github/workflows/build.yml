@@ -40,6 +40,17 @@ jobs:
           install/sbin/virtnetworkd.exe --daemon
           install/sbin/virtqemud.exe --daemon
           sleep 5
+          python3 - <<'EOF'
+          import os
+          d = 'install/etc/libvirt/qemu/networks'
+          link = d + '/autostart/default.xml'
+          print('islink', os.path.islink(link), 'lexists', os.path.lexists(link))
+          if os.path.islink(link):
+              print('target', repr(os.readlink(link)))
+          elif os.path.exists(link):
+              print('content', open(link, 'rb').read()[:60])
+          print('samefile', os.path.exists(link) and os.path.samefile(link, d + '/default.xml'))
+          EOF
           virsh -c qemu:///system net-list --all
           virsh -c qemu:///system net-info default
           virsh -c qemu:///system net-list | grep -q 'default.*act'
