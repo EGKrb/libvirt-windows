@@ -24,6 +24,8 @@ PACKAGES="
   mingw-w64-ucrt-x86_64-pkgconf
   mingw-w64-ucrt-x86_64-python
   mingw-w64-ucrt-x86_64-python-docutils
+  mingw-w64-ucrt-x86_64-dlfcn
+  mingw-w64-ucrt-x86_64-gettext-runtime
   mingw-w64-ucrt-x86_64-glib2
   mingw-w64-ucrt-x86_64-gnutls
   mingw-w64-ucrt-x86_64-libxml2
