@@ -2,8 +2,13 @@ name: build
 
 on:
   push:
+    branches: ['**']
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
+
+permissions:
+  contents: write     # the release of a v* tag
 
 jobs:
   build:
@@ -40,17 +45,6 @@ jobs:
           install/sbin/virtnetworkd.exe --daemon
           install/sbin/virtqemud.exe --daemon
           sleep 5
-          python3 - <<'EOF'
-          import os
-          d = 'install/etc/libvirt/qemu/networks'
-          link = d + '/autostart/default.xml'
-          print('islink', os.path.islink(link), 'lexists', os.path.lexists(link))
-          if os.path.islink(link):
-              print('target', repr(os.readlink(link)))
-          elif os.path.exists(link):
-              print('content', open(link, 'rb').read()[:60])
-          print('samefile', os.path.exists(link) and os.path.samefile(link, d + '/default.xml'))
-          EOF
           virsh -c qemu:///system net-list --all
           virsh -c qemu:///system net-info default
           virsh -c qemu:///system net-list | grep -q 'default.*act'
@@ -61,21 +55,59 @@ jobs:
       - name: Stop the daemons
         if: always()
         shell: pwsh
+        run: windows/stop-daemons.ps1 install
+
+      - name: Version
+        id: version
         run: |
-          foreach ($d in 'virtqemud', 'virtnetworkd') {
-            $f = "install\var\run\$d.pid"
-            if (Test-Path $f) {
-              $p = (Get-Content $f).Trim()
-              try { [System.Threading.EventWaitHandle]::OpenExisting("Local\libvirt-signal-$p-15").Set() | Out-Null } catch {}
-            }
-          }
-          Get-ChildItem install\var\run\libvirt\network -Filter *.pid -ErrorAction SilentlyContinue | ForEach-Object {
-            $p = (Get-Content $_.FullName).Trim()
-            try { [System.Threading.EventWaitHandle]::OpenExisting("Local\libvirt-signal-$p-15").Set() | Out-Null } catch {}
-          }
+          if [ "${GITHUB_REF_TYPE}" = tag ]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=dev-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Self-contained package
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = tag ]; then
+            windows/package.sh "${{ steps.version.outputs.version }}" --sources
+          else
+            windows/package.sh "${{ steps.version.outputs.version }}"
+          fi
+
+      - name: The package without MSYS2
+        shell: pwsh
+        run: |
+          $name = "libvirt-windows-${{ steps.version.outputs.version }}"
+          Expand-Archive "dist\$name.zip" pkgtest
+          $r = "pkgtest\$name"
+          $env:PATH = "C:\Windows\System32;C:\Windows"
+          & "$r\bin\virsh.exe" --version
+          & "$r\bin\virsh.exe" -c test:///default list --all
+          & "$r\sbin\virtnetworkd.exe" --daemon
+          & "$r\sbin\virtqemud.exe" --daemon
+          Start-Sleep 5
+          & "$r\bin\virsh.exe" -c qemu:///system net-list --all
+          $state = & "$r\bin\virsh.exe" -c qemu:///system net-list | Out-String
+          windows\stop-daemons.ps1 $r
+          if ($state -notmatch 'default\s+active') { throw "default network not active" }
 
       - uses: actions/upload-artifact@v4
         with:
-          name: libvirt-windows-install
-          path: install/
+          name: libvirt-windows-${{ steps.version.outputs.version }}
+          path: dist/libvirt-windows-${{ steps.version.outputs.version }}.zip
           retention-days: 14
+
+      - name: Release
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $v = "${{ steps.version.outputs.version }}"
+          Set-Location dist
+          $files = Get-ChildItem "libvirt-windows-$v*.zip" | Select-Object -Expand Name
+          $files | ForEach-Object { "{0}  {1}" -f (Get-FileHash $_ -Algorithm SHA256).Hash.ToLower(), $_ } |
+            Set-Content -Encoding ascii SHA256SUMS.txt
+          gh release create "v$v" @files SHA256SUMS.txt `
+            --title "libvirt for Windows $v (libvirt 12.9.0)" `
+            --notes-file ..\windows\release-notes.md

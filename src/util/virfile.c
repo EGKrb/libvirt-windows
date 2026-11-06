@@ -632,6 +632,9 @@ int virFileUnlock(int fd, off_t start, off_t len)
 #else /* WIN32 */
 
 /* The prefix of the installation: the parent of the directory of this DLL */
+/* the prefix length beyond which its 8.3 name is preferred */
+# define VIR_INSTALL_PREFIX_SHORT_MIN 48
+
 static gpointer
 virInstallFindPrefix(gpointer opaque G_GNUC_UNUSED)
 {
@@ -651,6 +654,30 @@ virInstallFindPrefix(gpointer opaque G_GNUC_UNUSED)
 
     bindir = g_path_get_dirname(path);
     prefix = g_path_get_dirname(bindir);
+
+    /* UNIX socket paths have 108 bytes at most, and libvirt puts its
+     * sockets (daemons, QEMU monitors, network switches) under the
+     * prefix: when it is long, as a folder extracted in Downloads, its
+     * 8.3 name is used, if the volume makes them */
+    if (strlen(prefix) > VIR_INSTALL_PREFIX_SHORT_MIN) {
+        g_autofree gunichar2 *wprefix = g_utf8_to_utf16(prefix, -1, NULL, NULL, NULL);
+        WCHAR shortname[MAX_PATH];
+        DWORD n;
+
+        if (wprefix &&
+            (n = GetShortPathNameW(wprefix, shortname, G_N_ELEMENTS(shortname))) > 0 &&
+            n < G_N_ELEMENTS(shortname)) {
+            char *s = g_utf16_to_utf8(shortname, -1, NULL, NULL, NULL);
+
+            if (s && strlen(s) < strlen(prefix)) {
+                g_free(prefix);
+                prefix = s;
+            } else {
+                g_free(s);
+            }
+        }
+    }
+
     for (p = prefix; *p; p++) {
         if (*p == '\\')
             *p = '/';
@@ -1950,9 +1977,12 @@ virFileWin32WidePath(const char *path)
  * Without the privilege a symbolic link takes, a link is emulated the way
  * Cygwin and MSYS2 do (winsymlinks:sys): a file with the SYSTEM attribute
  * holding "!<symlink>", a UTF-16 byte order mark and the target.  The
- * autostart links of libvirt are such links on a stock Windows.
+ * autostart links of libvirt are such links on a stock Windows.  The
+ * attribute is not required to read one: a zip archive (the release of
+ * the port) keeps neither links nor attributes.
  */
 static const char virFileWin32SysLinkMagic[] = "!<symlink>\xff\xfe";
+#define VIR_FILE_WIN32_SYSLINK_MAX 4096
 
 
 /* The target of the emulated link @path, NULL if it is not one */
@@ -1962,14 +1992,17 @@ virFileWin32ReadSysLink(const char *path)
     g_autofree gunichar2 *wpath = virFileWin32WidePath(path);
     size_t magiclen = sizeof(virFileWin32SysLinkMagic) - 1;
     g_autofree char *buf = NULL;
-    DWORD attrs;
+    WIN32_FILE_ATTRIBUTE_DATA data;
     size_t len;
 
+    /* the size first: a disk image is not read to know it is no link */
     if (!wpath ||
-        (attrs = GetFileAttributesW(wpath)) == INVALID_FILE_ATTRIBUTES ||
-        !(attrs & FILE_ATTRIBUTE_SYSTEM) || (attrs & FILE_ATTRIBUTE_DIRECTORY))
+        !GetFileAttributesExW(wpath, GetFileExInfoStandard, &data) ||
+        (data.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) ||
+        data.nFileSizeHigh || data.nFileSizeLow > VIR_FILE_WIN32_SYSLINK_MAX ||
+        data.nFileSizeLow < magiclen)
         return NULL;
-    if (!g_file_get_contents(path, &buf, &len, NULL) || len > 65536 ||
+    if (!g_file_get_contents(path, &buf, &len, NULL) ||
         len < magiclen || memcmp(buf, virFileWin32SysLinkMagic, magiclen) != 0)
         return NULL;
 

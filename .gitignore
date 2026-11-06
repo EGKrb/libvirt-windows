@@ -4,3 +4,5 @@ __pycache__/
 *.busy-*
 subprojects/.wraplock
 /install/
+/dist/
+/pkgtest/
