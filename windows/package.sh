@@ -41,8 +41,9 @@ mkdir -p "$OUT"
 
 # Runtime files only: no headers, import libraries, pkg-config files, run
 # state, nor the files a running install renamed
-cp -a "$PREFIX/bin" "$PREFIX/sbin" "$PREFIX/libexec" "$PREFIX/lib" \
-      "$PREFIX/etc" "$PREFIX/share" "$OUT/"
+# (links followed: they are written as emulated links below)
+cp -rL --preserve=timestamps "$PREFIX/bin" "$PREFIX/sbin" "$PREFIX/libexec" \
+      "$PREFIX/lib" "$PREFIX/etc" "$PREFIX/share" "$OUT/"
 rm -rf "$OUT/lib/pkgconfig" "$OUT/share/doc"
 # the directories of logs, state and sockets, as the install makes them,
 # empty: the daemons expect them (a zip keeps empty directories)
