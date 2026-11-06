@@ -23,7 +23,7 @@ The source of libvirt itself is the repository at this tag (*Source code* below)
 
 3. Guests use `<domain type='whpx'>` and need QEMU for Windows with the patch in [windows/qemu](https://github.com/EGKrb/libvirt-windows/tree/main/windows/qemu); see the [README](https://github.com/EGKrb/libvirt-windows#run) for a complete example.
 
-`windows\stop-daemons.ps1` of the repository stops the daemons and network switches of a folder.
+`.\stop-daemons.ps1 .` stops the daemons and network switches of the folder.
 
 ## What works
 

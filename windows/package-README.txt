@@ -36,7 +36,11 @@ complete example.
 
 Stop
 ----
-A daemon is stopped by its SIGTERM event:
+The daemons and network switches of this folder:
+
+    .\stop-daemons.ps1 .
+
+A daemon alone is stopped by its SIGTERM event:
 
     $p = (Get-Content var\run\virtqemud.pid).Trim()
     [System.Threading.EventWaitHandle]::OpenExisting("Local\libvirt-signal-$p-15").Set()
