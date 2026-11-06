@@ -65,6 +65,7 @@ if [ ! -f "$BUILD/build.ninja" ]; then
         -Ddocs=disabled \
         -Dtests=disabled \
         -Dwerror=false \
+        -Dgit_werror=disabled \
         -Ddriver_libvirtd=enabled \
         -Ddriver_qemu=enabled \
         -Ddriver_network=enabled \

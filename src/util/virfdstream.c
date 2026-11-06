@@ -1446,6 +1446,10 @@ int virFDStreamOpenPTY(virStreamPtr st,
                        int oflags)
 {
 #ifdef WIN32
+    (void)st;
+    (void)offset;
+    (void)length;
+    (void)oflags;
     virReportSystemError(ENOSYS,
                          _("Opening the terminal %1$s is not supported on Windows"),
                          path);

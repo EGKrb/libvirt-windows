@@ -1973,8 +1973,15 @@ virFileWin32ReadSysLink(const char *path)
         len < magiclen || memcmp(buf, virFileWin32SysLinkMagic, magiclen) != 0)
         return NULL;
 
-    return g_utf16_to_utf8((const gunichar2 *)(buf + magiclen),
-                           (len - magiclen) / 2, NULL, NULL, NULL);
+    {
+        /* the target follows the 12 byte magic: copied to be aligned */
+        size_t n = (len - magiclen) / 2;
+        g_autofree gunichar2 *target = g_new(gunichar2, n + 1);
+
+        memcpy(target, buf + magiclen, n * sizeof(gunichar2));
+        target[n] = 0;
+        return g_utf16_to_utf8(target, n, NULL, NULL, NULL);
+    }
 }
 
 
