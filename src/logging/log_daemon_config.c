@@ -37,7 +37,7 @@ void
 virLogDaemonConfigFilePath(bool privileged, char **configfile)
 {
     if (privileged) {
-        *configfile = g_strdup(SYSCONFDIR "/libvirt/virtlogd.conf");
+        *configfile = g_strdup(VIR_INSTALL_PATH(SYSCONFDIR "/libvirt/virtlogd.conf"));
     } else {
         g_autofree char *configdir = NULL;
 
@@ -100,7 +100,7 @@ virLogDaemonConfigLoadOptions(virLogDaemonConfig *data,
     if (virConfGetValueString(conf, "log_root", &data->log_root) < 0)
         return -1;
     if (!data->log_root)
-        data->log_root = g_strdup(DEFAULT_LOG_ROOT);
+        data->log_root = g_strdup(VIR_INSTALL_PATH(DEFAULT_LOG_ROOT));
 
     return 0;
 }

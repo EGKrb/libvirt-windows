@@ -117,13 +117,39 @@ struct virEventGLibSocketSource {
 };
 
 
+/*
+ * A socket has a single WSAEventSelect() association, yet it can have
+ * several watches: one for reading and one for writing when it is both
+ * stdin and stdout, or an old watch being finalized after its replacement
+ * was created.  So all the watches of a socket share one event, each
+ * waiting on its own duplicate of the handle (GLib cannot wait twice on
+ * the same handle), and the association lasts as long as one of them.
+ */
+typedef struct {
+    HANDLE event;
+    unsigned int refs;
+} virEventGLibSocketEvent;
+
+static GHashTable *socketEvents;
+static GMutex socketEventsLock;
+
+
+static gboolean virEventGLibSocketSourceCheck(GSource *source);
+
+
+/*
+ * WSAEventSelect() events are edge triggered: FD_WRITE for instance is only
+ * signaled once after connecting, so a watch created on a socket that is
+ * already ready would never wake up.  Check the actual state of the socket
+ * first, as poll() would.
+ */
 static gboolean
-virEventGLibSocketSourcePrepare(GSource *source G_GNUC_UNUSED,
+virEventGLibSocketSourcePrepare(GSource *source,
                                 gint *timeout)
 {
     *timeout = -1;
 
-    return FALSE;
+    return virEventGLibSocketSourceCheck(source);
 }
 
 
@@ -184,13 +210,46 @@ virEventGLibSocketSourceDispatch(GSource *source,
 }
 
 
+static gboolean
+virEventGLibSocketCloseHandle(gpointer handle)
+{
+    CloseHandle(handle);
+    return G_SOURCE_REMOVE;
+}
+
+
 static void
 virEventGLibSocketSourceFinalize(GSource *source)
 {
     virEventGLibSocketSource *ssource = (virEventGLibSocketSource *)source;
+    gpointer key = GSIZE_TO_POINTER(ssource->socket);
+    virEventGLibSocketEvent *shared;
+    GMainContext *context = g_source_get_context(source);
 
-    WSAEventSelect(ssource->socket, NULL, 0);
-    CloseHandle(ssource->event);
+    /*
+     * A watch replaced from another thread is finalized while the thread
+     * of its context may be waiting on its handle: close the handle at the
+     * next iteration of that context, which no longer waits on it.
+     */
+    if (context) {
+        GSource *idle = g_idle_source_new();
+
+        g_source_set_callback(idle, virEventGLibSocketCloseHandle,
+                              ssource->event, NULL);
+        g_source_attach(idle, context);
+        g_source_unref(idle);
+    } else {
+        CloseHandle(ssource->event);
+    }
+
+    g_mutex_lock(&socketEventsLock);
+    shared = g_hash_table_lookup(socketEvents, key);
+    if (shared && --shared->refs == 0) {
+        WSAEventSelect(ssource->socket, NULL, 0);
+        CloseHandle(shared->event);
+        g_hash_table_remove(socketEvents, key);
+    }
+    g_mutex_unlock(&socketEventsLock);
 }
 
 
@@ -207,6 +266,7 @@ GSource *virEventGLibCreateSocketWatch(int fd,
 {
     GSource *source;
     virEventGLibSocketSource *ssource;
+    virEventGLibSocketEvent *shared;
 
     source = g_source_new(&virEventGLibSocketSourceFuncs,
                           sizeof(virEventGLibSocketSource));
@@ -215,15 +275,31 @@ GSource *virEventGLibCreateSocketWatch(int fd,
     ssource->condition = condition;
     ssource->fd = fd;
     ssource->socket = _get_osfhandle(fd);
-    ssource->event = CreateEvent(NULL, FALSE, FALSE, NULL);
     ssource->revents = 0;
+
+    g_mutex_lock(&socketEventsLock);
+    if (!socketEvents)
+        socketEvents = g_hash_table_new_full(g_direct_hash, g_direct_equal,
+                                             NULL, g_free);
+    shared = g_hash_table_lookup(socketEvents, GSIZE_TO_POINTER(ssource->socket));
+    if (!shared) {
+        shared = g_new0(virEventGLibSocketEvent, 1);
+        shared->event = CreateEvent(NULL, FALSE, FALSE, NULL);
+        g_hash_table_insert(socketEvents, GSIZE_TO_POINTER(ssource->socket),
+                            shared);
+    }
+    shared->refs++;
+    /* again for every watch, in case the handle value of a closed socket
+     * was reused */
+    WSAEventSelect(ssource->socket, shared->event,
+                   FD_READ | FD_ACCEPT | FD_CLOSE |
+                   FD_CONNECT | FD_WRITE | FD_OOB);
+    DuplicateHandle(GetCurrentProcess(), shared->event, GetCurrentProcess(),
+                    &ssource->event, 0, FALSE, DUPLICATE_SAME_ACCESS);
+    g_mutex_unlock(&socketEventsLock);
 
     ssource->pollfd.fd = (gintptr)ssource->event;
     ssource->pollfd.events = G_IO_IN;
-
-    WSAEventSelect(ssource->socket, ssource->event,
-                   FD_READ | FD_ACCEPT | FD_CLOSE |
-                   FD_CONNECT | FD_WRITE | FD_OOB);
 
     g_source_add_poll(source, &ssource->pollfd);
 

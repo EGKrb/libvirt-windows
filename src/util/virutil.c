@@ -58,6 +58,7 @@
 #include "virstring.h"
 #include "virutil.h"
 #include "virsocket.h"
+#include "virutsname.h"
 
 G_STATIC_ASSERT(sizeof(gid_t) <= sizeof(unsigned int) &&
        sizeof(uid_t) <= sizeof(unsigned int));
@@ -1173,6 +1174,178 @@ virGetUserShell(uid_t uid G_GNUC_UNUSED)
 }
 # endif /* ! WITH_GETPWUID_R && ! WIN32 */
 
+# ifdef WIN32
+/*
+ * Windows has no uid/gid.  As getuid() is 0, the current user and its
+ * primary group are 0; any other account is the relative identifier (RID)
+ * of its SID, in the domain of the current user.
+ */
+
+/* SID of the current user (@group: its primary group), to g_free */
+static PSID
+virWin32TokenSid(bool group)
+{
+    HANDLE token = NULL;
+    DWORD len = 0;
+    g_autofree void *info = NULL;
+    PSID src;
+    PSID sid = NULL;
+
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
+        return NULL;
+    GetTokenInformation(token, group ? TokenPrimaryGroup : TokenUser,
+                        NULL, 0, &len);
+    info = g_malloc0(len);
+    if (GetTokenInformation(token, group ? TokenPrimaryGroup : TokenUser,
+                            info, len, &len)) {
+        src = group ? ((TOKEN_PRIMARY_GROUP *) info)->PrimaryGroup
+                    : ((TOKEN_USER *) info)->User.Sid;
+        len = GetLengthSid(src);
+        sid = g_malloc0(len);
+        CopySid(len, sid, src);
+    }
+    CloseHandle(token);
+    return sid;
+}
+
+
+/* The SID of @id in the domain of the current user, to g_free */
+static PSID
+virWin32IdSid(unsigned int id, bool group)
+{
+    g_autofree void *self = virWin32TokenSid(false);
+    PSID_IDENTIFIER_AUTHORITY auth;
+    DWORD sub[8] = { 0 };
+    UCHAR n, i;
+    PSID sid = NULL;
+    PSID tmp = NULL;
+    DWORD len;
+
+    if (id == 0)
+        return virWin32TokenSid(group);
+    if (!self)
+        return NULL;
+
+    auth = GetSidIdentifierAuthority(self);
+    n = *GetSidSubAuthorityCount(self);
+    if (n == 0 || n > G_N_ELEMENTS(sub))
+        return NULL;
+    for (i = 0; i < n - 1; i++)
+        sub[i] = *GetSidSubAuthority(self, i);
+    sub[n - 1] = id;
+    if (!AllocateAndInitializeSid(auth, n, sub[0], sub[1], sub[2], sub[3],
+                                  sub[4], sub[5], sub[6], sub[7], &tmp))
+        return NULL;
+    len = GetLengthSid(tmp);
+    sid = g_malloc0(len);
+    CopySid(len, sid, tmp);
+    FreeSid(tmp);
+    return sid;
+}
+
+
+static char *
+virWin32IdName(unsigned int id, bool group)
+{
+    g_autofree void *sid = virWin32IdSid(id, group);
+    WCHAR name[256];
+    WCHAR domain[256];
+    DWORD namelen = G_N_ELEMENTS(name);
+    DWORD domainlen = G_N_ELEMENTS(domain);
+    SID_NAME_USE use;
+
+    if (!sid || !LookupAccountSidW(NULL, sid, name, &namelen,
+                                   domain, &domainlen, &use)) {
+        virReportError(VIR_ERR_INTERNAL_ERROR,
+                       group ? _("Failed to find group record for gid '%1$u'")
+                             : _("Failed to find user record for uid '%1$u'"),
+                       id);
+        return NULL;
+    }
+    return g_utf16_to_utf8(name, -1, NULL, NULL, NULL);
+}
+
+
+static int
+virWin32NameId(const char *name, bool group, unsigned int *id)
+{
+    g_autofree gunichar2 *wname = NULL;
+    g_autofree void *self = virWin32TokenSid(group);
+    BYTE sid[SECURITY_MAX_SID_SIZE];
+    WCHAR domain[256];
+    DWORD sidlen = sizeof(sid);
+    DWORD domainlen = G_N_ELEMENTS(domain);
+    SID_NAME_USE use;
+    PUCHAR count;
+
+    /* a leading '+' or a number is an id, as on POSIX */
+    if (virStrToLong_ui(name + (*name == '+'), NULL, 10, id) == 0)
+        return 0;
+
+    wname = g_utf8_to_utf16(name, -1, NULL, NULL, NULL);
+    if (!wname || !LookupAccountNameW(NULL, wname, sid, &sidlen,
+                                      domain, &domainlen, &use)) {
+        virReportError(VIR_ERR_INVALID_ARG,
+                       group ? _("Failed to parse group '%1$s'")
+                             : _("Failed to parse user '%1$s'"),
+                       name);
+        return -1;
+    }
+    if (self && EqualSid(sid, self)) {
+        *id = 0;
+        return 0;
+    }
+    count = GetSidSubAuthorityCount(sid);
+    *id = *GetSidSubAuthority(sid, *count - 1);
+    return 0;
+}
+
+
+char *
+virGetUserName(uid_t uid)
+{
+    return virWin32IdName(uid, false);
+}
+
+
+int virGetUserID(const char *name, uid_t *uid)
+{
+    unsigned int id;
+
+    if (virWin32NameId(name, false, &id) < 0)
+        return -1;
+    *uid = id;
+    return 0;
+}
+
+
+int virGetGroupID(const char *name, gid_t *gid)
+{
+    unsigned int id;
+
+    if (virWin32NameId(name, true, &id) < 0)
+        return -1;
+    *gid = id;
+    return 0;
+}
+
+int
+virSetUIDGID(uid_t uid G_GNUC_UNUSED,
+             gid_t gid G_GNUC_UNUSED,
+             gid_t *groups G_GNUC_UNUSED,
+             int ngroups G_GNUC_UNUSED)
+{
+    virReportError(VIR_ERR_INTERNAL_ERROR,
+                   "%s", _("virSetUIDGID is not available"));
+    return -1;
+}
+
+char *
+virGetGroupName(gid_t gid)
+{
+    return virWin32IdName(gid, true);
+}
+# else /* !WIN32 */
 char *
 virGetUserName(uid_t uid G_GNUC_UNUSED)
 {
@@ -1220,6 +1393,7 @@ virGetGroupName(gid_t gid G_GNUC_UNUSED)
 
     return NULL;
 }
+# endif /* !WIN32 */
 #endif /* WITH_GETPWUID_R */
 
 void
@@ -1558,10 +1732,10 @@ void virUpdateSelfLastChanged(const char *path)
     if (stat(path, &sb) < 0)
         return;
 
-    if (sb.st_ctime > selfLastChanged) {
+    if (VIR_STAT_CHANGE_TIME(sb) > selfLastChanged) {
         VIR_DEBUG("Setting self last changed to %lld for '%s'",
-                  (long long)sb.st_ctime, path);
-        selfLastChanged = sb.st_ctime;
+                  (long long)VIR_STAT_CHANGE_TIME(sb), path);
+        selfLastChanged = VIR_STAT_CHANGE_TIME(sb);
     }
 }
 
@@ -1979,3 +2153,51 @@ virPipeNonBlock(int fds[2])
 {
     return virPipeImpl(fds, true, true);
 }
+
+
+#ifdef WIN32
+typedef LONG (WINAPI *virRtlGetVersion)(PRTL_OSVERSIONINFOW info);
+
+int
+virWin32Uname(struct utsname *buf)
+{
+    RTL_OSVERSIONINFOW os = { .dwOSVersionInfoSize = sizeof(os) };
+    virRtlGetVersion getVersion;
+    SYSTEM_INFO info;
+    const char *machine;
+
+    memset(buf, 0, sizeof(*buf));
+    g_strlcpy(buf->sysname, "Windows", sizeof(buf->sysname));
+    g_strlcpy(buf->nodename, g_get_host_name(), sizeof(buf->nodename));
+
+    /* GetVersionEx() reports 6.2 to applications without a manifest */
+    getVersion = (virRtlGetVersion) GetProcAddress(GetModuleHandleW(L"ntdll.dll"),
+                                                   "RtlGetVersion");
+    if (getVersion && getVersion(&os) == 0) {
+        g_snprintf(buf->release, sizeof(buf->release), "%lu.%lu.%lu",
+                   os.dwMajorVersion, os.dwMinorVersion, os.dwBuildNumber);
+        g_snprintf(buf->version, sizeof(buf->version), "build %lu",
+                   os.dwBuildNumber);
+    }
+
+    GetNativeSystemInfo(&info);
+    switch (info.wProcessorArchitecture) {
+    case PROCESSOR_ARCHITECTURE_AMD64:
+        machine = "x86_64";
+        break;
+    case PROCESSOR_ARCHITECTURE_ARM64:
+        machine = "aarch64";
+        break;
+    case PROCESSOR_ARCHITECTURE_ARM:
+        machine = "armv7l";
+        break;
+    case PROCESSOR_ARCHITECTURE_INTEL:
+        machine = "i686";
+        break;
+    default:
+        machine = "unknown";
+    }
+    g_strlcpy(buf->machine, machine, sizeof(buf->machine));
+    return 0;
+}
+#endif /* WIN32 */

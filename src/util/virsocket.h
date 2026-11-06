@@ -20,6 +20,34 @@
 
 #include "internal.h"
 
+int virSocketPair(int fds[2]);
+int virSocketGLibFD(int fd);
+void virSocketGLibFDFree(int gfd);
+
+/*
+ * I/O on a socket watched by a GSocket source (QEMU monitor, guest agent):
+ * on Windows GLib tells when such a socket is ready from the I/O done
+ * through the GSocket, so the I/O has to go through it.
+ */
+#ifdef WIN32
+struct _GSocket;
+ssize_t virSocketGLibRecv(struct _GSocket *sock, void *buf, size_t len);
+ssize_t virSocketGLibSend(struct _GSocket *sock, const void *buf, size_t len);
+# define virSocketRecvWatched(gsock, fd, buf, len) virSocketGLibRecv(gsock, buf, len)
+# define virSocketSendWatched(gsock, fd, buf, len) virSocketGLibSend(gsock, buf, len)
+#else
+# define virSocketRecvWatched(gsock, fd, buf, len) read(fd, buf, len)
+# define virSocketSendWatched(gsock, fd, buf, len) write(fd, buf, len) /* sc_avoid_write */
+#endif
+
+/* read() and write() on a socket: Windows needs recv() and send() */
+#ifdef WIN32
+# define virSocketRecv(fd, buf, len) vir_recv(fd, buf, len)
+# define virSocketSend(fd, buf, len) vir_send(fd, buf, len)
+#else
+# define virSocketRecv(fd, buf, len) read(fd, buf, len)
+# define virSocketSend(fd, buf, len) write(fd, buf, len) /* sc_avoid_write */
+#endif
 int virSocketSendFD(int sock, int fd);
 int virSocketRecvFD(int sock, int fdflags);
 int virSocketSendMsgWithFDs(int sock, const char *payload, size_t payload_len,
@@ -31,9 +59,17 @@ int virSocketSendMsgWithFDs(int sock, const char *payload, size_t payload_len,
 # include <errno.h>
 # include <winsock2.h>
 # include <ws2tcpip.h>
+# include <afunix.h>
 # include <io.h>
 
+/* AF_UNIX stream sockets exist since Windows 10 1803 */
+# ifndef PF_UNIX
+#  define PF_UNIX AF_UNIX
+# endif
+
 int vir_accept(int fd, struct sockaddr *addr, socklen_t *addrlen);
+ssize_t vir_recv(int fd, void *buf, size_t len);
+ssize_t vir_send(int fd, const void *buf, size_t len);
 int vir_bind(int fd, const struct sockaddr *addr, socklen_t addrlen);
 int vir_closesocket(int fd);
 int vir_connect(int fd, const struct sockaddr *addr, socklen_t addrlen);

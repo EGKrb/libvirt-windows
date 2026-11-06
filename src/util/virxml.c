@@ -1320,7 +1320,7 @@ virXMLParseHelper(int domcode,
     if (validate && schemafile != NULL) {
         g_autofree char *schema = virFileFindResource(schemafile,
                                                       abs_top_srcdir "/src/conf/schemas",
-                                                      PKGDATADIR "/schemas");
+                                                      VIR_INSTALL_PATH(PKGDATADIR "/schemas"));
         if (!schema ||
             (virXMLValidateAgainstSchema(schema, xml) < 0))
             return NULL;

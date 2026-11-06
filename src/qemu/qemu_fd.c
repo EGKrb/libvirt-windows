@@ -61,7 +61,11 @@ qemuFDPassLogFDInfo(const char *name,
     g_autofree char *selinux = NULL;
     g_autofree char *tmp = NULL;
 
+#ifdef WIN32
+    if (_get_osfhandle(fd) != -1) {
+#else
     if (fcntl(fd, F_GETFD) != -1) {
+#endif
         if (fstat(fd, &st) == 0) {
             switch (st.st_mode & S_IFMT) {
             case S_IFBLK:

@@ -14,3 +14,15 @@
 #mesondefine RUNSTATEDIR
 #mesondefine SBINDIR
 #mesondefine SYSCONFDIR
+
+/*
+ * VIR_INSTALL_PATH(path): @path, under one of the directories above, as
+ * installed.  On Windows an installation can be moved: the prefix is found
+ * at run time from the location of the libvirt DLL.
+ */
+#ifdef WIN32
+const char *virInstallPath(const char *path);
+# define VIR_INSTALL_PATH(path) virInstallPath(path)
+#else
+# define VIR_INSTALL_PATH(path) (path)
+#endif

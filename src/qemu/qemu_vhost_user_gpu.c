@@ -20,6 +20,7 @@
 
 #include <config.h>
 
+#include "virsocket.h"
 #include "qemu_vhost_user_gpu.h"
 #include "qemu_vhost_user.h"
 #include "qemu_extdevice.h"
@@ -123,7 +124,7 @@ int qemuExtVhostUserGPUStart(virQEMUDriver *driver,
     if (qemuSecuritySetSocketLabel(driver->securityManager, vm->def) < 0)
         goto error;
 
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair) < 0) {
+    if (virSocketPair(pair) < 0) {
         virReportSystemError(errno, "%s", _("failed to create socket"));
         goto error;
     }

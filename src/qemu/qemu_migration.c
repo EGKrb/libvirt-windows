@@ -23,9 +23,12 @@
 
 #include <sys/time.h>
 #include <fcntl.h>
-#include <poll.h>
+#ifndef WIN32
+# include <poll.h>
+#endif
 
 #include "qemu_migration.h"
+#include "virsocket.h"
 #include "qemu_migration_cookie.h"
 #include "qemu_migration_params.h"
 #include "qemu_monitor.h"
@@ -4391,6 +4394,25 @@ struct _qemuMigrationIOThread {
     int wakeupSendFD;
 };
 
+/*
+ * The tunnel waits on the migration socket of QEMU and on a wakeup channel.
+ * On Windows the wakeup channel is a socket pair too, as WSAPoll() only
+ * waits on sockets, and sockets are read and written with recv()/send().
+ */
+#ifdef WIN32
+# define qemuMigrationTunnelPollFD(fd) ((SOCKET) _get_osfhandle(fd))
+# define qemuMigrationTunnelPoll(fds, nfds, timeout) WSAPoll(fds, nfds, timeout)
+# define qemuMigrationTunnelRead(fd, buf, len) vir_recv(fd, buf, len)
+# define qemuMigrationTunnelWrite(fd, buf, len) vir_send(fd, buf, len)
+# define qemuMigrationTunnelWakeupPair(fds) virSocketPair(fds)
+#else
+# define qemuMigrationTunnelPollFD(fd) (fd)
+# define qemuMigrationTunnelPoll(fds, nfds, timeout) poll(fds, nfds, timeout)
+# define qemuMigrationTunnelRead(fd, buf, len) saferead(fd, buf, len)
+# define qemuMigrationTunnelWrite(fd, buf, len) safewrite(fd, buf, len)
+# define qemuMigrationTunnelWakeupPair(fds) virPipeQuiet(fds)
+#endif
+
 static void qemuMigrationSrcIOFunc(void *arg)
 {
     qemuMigrationIOThread *data = arg;
@@ -4404,8 +4426,8 @@ static void qemuMigrationSrcIOFunc(void *arg)
 
     buffer = g_new0(char, TUNNEL_SEND_BUF_SIZE);
 
-    fds[0].fd = data->sock;
-    fds[1].fd = data->wakeupRecvFD;
+    fds[0].fd = qemuMigrationTunnelPollFD(data->sock);
+    fds[1].fd = qemuMigrationTunnelPollFD(data->wakeupRecvFD);
 
     for (;;) {
         int ret;
@@ -4413,7 +4435,7 @@ static void qemuMigrationSrcIOFunc(void *arg)
         fds[0].events = fds[1].events = POLLIN;
         fds[0].revents = fds[1].revents = 0;
 
-        ret = poll(fds, G_N_ELEMENTS(fds), timeout);
+        ret = qemuMigrationTunnelPoll(fds, G_N_ELEMENTS(fds), timeout);
 
         if (ret < 0) {
             if (errno == EAGAIN || errno == EINTR)
@@ -4435,7 +4457,7 @@ static void qemuMigrationSrcIOFunc(void *arg)
         if (fds[1].revents & (POLLIN | POLLERR | POLLHUP)) {
             char stop = 0;
 
-            if (saferead(data->wakeupRecvFD, &stop, 1) != 1) {
+            if (qemuMigrationTunnelRead(data->wakeupRecvFD, &stop, 1) != 1) {
                 virReportSystemError(errno, "%s",
                                      _("failed to read from wakeup fd"));
                 goto abrt;
@@ -4453,7 +4475,7 @@ static void qemuMigrationSrcIOFunc(void *arg)
         if (fds[0].revents & (POLLIN | POLLERR | POLLHUP)) {
             int nbytes;
 
-            nbytes = saferead(data->sock, buffer, TUNNEL_SEND_BUF_SIZE);
+            nbytes = qemuMigrationTunnelRead(data->sock, buffer, TUNNEL_SEND_BUF_SIZE);
             if (nbytes > 0) {
                 if (virStreamSend(data->st, buffer, nbytes) < 0)
                     goto error;
@@ -4502,8 +4524,11 @@ qemuMigrationSrcStartTunnel(virStreamPtr st,
     qemuMigrationIOThread *io = NULL;
     int wakeupFD[2] = { -1, -1 };
 
-    if (virPipe(wakeupFD) < 0)
+    if (qemuMigrationTunnelWakeupPair(wakeupFD) < 0) {
+        virReportSystemError(errno, "%s",
+                             _("Unable to create the migration tunnel wakeup channel"));
         goto error;
+    }
 
     io = g_new0(qemuMigrationIOThread, 1);
 
@@ -4538,7 +4563,7 @@ qemuMigrationSrcStopTunnel(qemuMigrationIOThread *io, bool error)
     char stop = error ? 1 : 0;
 
     /* make sure the thread finishes its job and is joinable */
-    if (safewrite(io->wakeupSendFD, &stop, 1) != 1) {
+    if (qemuMigrationTunnelWrite(io->wakeupSendFD, &stop, 1) != 1) {
         virReportSystemError(errno, "%s",
                              _("failed to wakeup migration tunnel"));
         goto cleanup;

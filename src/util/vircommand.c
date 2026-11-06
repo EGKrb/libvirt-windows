@@ -29,6 +29,10 @@
 #include <sys/stat.h>
 #ifndef WIN32
 # include <sys/wait.h>
+#else
+# define WIN32_LEAN_AND_MEAN
+# include <windows.h>
+# include <io.h>
 #endif
 #include <fcntl.h>
 #include <unistd.h>
@@ -151,6 +155,11 @@ struct _virCommand {
 
     virCommandSendBuffer *sendBuffers;
     size_t numSendBuffers;
+
+#ifdef WIN32
+    void *win32Thread;  /* main thread of a child held for the handshake */
+    bool win32Detached; /* daemonized child, not ours to reap */
+#endif
 };
 
 /* See virCommandSetDryRun for description for this variable */
@@ -159,9 +168,7 @@ static bool dryRunBufferArgLinebreaks;
 static bool dryRunBufferCommandStripPath;
 static virCommandDryRunCallback dryRunCallback;
 static void *dryRunOpaque;
-#ifndef WIN32
 static int dryRunStatus;
-#endif /* !WIN32 */
 
 
 static bool
@@ -231,6 +238,29 @@ virCommandFDSet(virCommand *cmd,
 
     cmd->passfd[cmd->npassfd - 1].fd = fd;
     cmd->passfd[cmd->npassfd - 1].flags = flags;
+}
+
+/*
+ * Ensure that *null is an fd visiting /dev/null.  Return 0 on
+ * success, -1 on failure.  Allows for lazy opening of shared
+ * /dev/null fd only as required.
+ */
+static int
+getDevNull(int *null)
+{
+#ifdef WIN32
+    const char *devnull = "NUL";
+#else
+    const char *devnull = "/dev/null";
+#endif
+
+    if (*null == -1 && (*null = open(devnull, O_RDWR|O_CLOEXEC)) < 0) {
+        virReportSystemError(errno,
+                             _("cannot open %1$s"),
+                             devnull);
+        return -1;
+    }
+    return 0;
 }
 
 #ifndef WIN32
@@ -355,22 +385,6 @@ virFork(void)
     return pid;
 }
 
-/*
- * Ensure that *null is an fd visiting /dev/null.  Return 0 on
- * success, -1 on failure.  Allows for lazy opening of shared
- * /dev/null fd only as required.
- */
-static int
-getDevNull(int *null)
-{
-    if (*null == -1 && (*null = open("/dev/null", O_RDWR|O_CLOEXEC)) < 0) {
-        virReportSystemError(errno,
-                             _("cannot open %1$s"),
-                             "/dev/null");
-        return -1;
-    }
-    return 0;
-}
 
 /* Ensure that STD is an inheritable copy of FD.  Return 0 on success,
  * -1 on failure.  */
@@ -943,6 +957,345 @@ virExec(virCommand *cmd)
 
 #else /* WIN32 */
 
+/* Append @arg to @cmdline as the Microsoft C runtime parses it back */
+static void
+virCommandWin32AppendArg(GString *cmdline, const char *arg)
+{
+    const char *p;
+
+    if (cmdline->len)
+        g_string_append_c(cmdline, ' ');
+    if (*arg && !strpbrk(arg, " \t\n\v\"")) {
+        g_string_append(cmdline, arg);
+        return;
+    }
+
+    g_string_append_c(cmdline, '"');
+    for (p = arg; ; p++) {
+        size_t nbs = 0;
+
+        while (*p == '\\') {
+            nbs++;
+            p++;
+        }
+        /* backslashes are literal, except before a quote */
+        if (!*p)
+            nbs *= 2;
+        else if (*p == '"')
+            nbs = nbs * 2 + 1;
+        for (; nbs > 0; nbs--)
+            g_string_append_c(cmdline, '\\');
+        if (!*p)
+            break;
+        g_string_append_c(cmdline, *p);
+    }
+    g_string_append_c(cmdline, '"');
+}
+
+
+static int
+virCommandWin32CompareEnv(const void *a, const void *b)
+{
+    return g_ascii_strcasecmp(*(char *const *)a, *(char *const *)b);
+}
+
+
+/*
+ * Variables without which Windows processes cannot work (DLL loading,
+ * Winsock, temporary files...): unlike the rest of a clean environment
+ * they are always inherited.
+ */
+static const char *const virCommandWin32SystemEnv[] = {
+    "SystemRoot", "SystemDrive", "windir", "ComSpec", "PATHEXT",
+    "ProgramData", "ProgramFiles", "CommonProgramFiles",
+    "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE", "OS",
+};
+
+
+static bool
+virCommandWin32EnvHas(char **env, size_t nenv, const char *name)
+{
+    size_t len = strlen(name);
+    size_t i;
+
+    for (i = 0; i < nenv; i++) {
+        if (g_ascii_strncasecmp(env[i], name, len) == 0 && env[i][len] == '=')
+            return true;
+    }
+    return false;
+}
+
+
+/* Environment block of CreateProcessW: sorted, UTF-16, doubly terminated */
+static gunichar2 *
+virCommandWin32EnvBlock(char **env, size_t nenv)
+{
+    g_autofree char **sorted = g_new0(char *, nenv +
+                                      G_N_ELEMENTS(virCommandWin32SystemEnv));
+    g_auto(GStrv) system = g_new0(char *, G_N_ELEMENTS(virCommandWin32SystemEnv) + 1);
+    GArray *block = g_array_new(FALSE, FALSE, sizeof(gunichar2));
+    gunichar2 nul = 0;
+    size_t nsystem = 0;
+    void *data;
+    size_t i;
+
+    for (i = 0; i < G_N_ELEMENTS(virCommandWin32SystemEnv); i++) {
+        const char *name = virCommandWin32SystemEnv[i];
+        const char *value = g_getenv(name);
+
+        if (value && !virCommandWin32EnvHas(env, nenv, name))
+            system[nsystem++] = g_strdup_printf("%s=%s", name, value);
+    }
+    memcpy(sorted, env, nenv * sizeof(*sorted));
+    memcpy(sorted + nenv, system, nsystem * sizeof(*sorted));
+    nenv += nsystem;
+    qsort(sorted, nenv, sizeof(*sorted), virCommandWin32CompareEnv);
+    for (i = 0; i < nenv; i++) {
+        glong len;
+        g_autofree gunichar2 *var = g_utf8_to_utf16(sorted[i], -1, NULL,
+                                                    &len, NULL);
+
+        if (!var) {
+            g_array_free(block, TRUE);
+            return NULL;
+        }
+        g_array_append_vals(block, var, len + 1);
+    }
+    if (nenv == 0)
+        g_array_append_val(block, nul);
+    g_array_append_val(block, nul);
+    data = g_array_free(block, FALSE);
+    return data;
+}
+
+
+/* Make the handle of @fd inheritable and add it once to @handles */
+static int
+virCommandWin32Inherit(int fd, HANDLE *handles, size_t *nhandles, HANDLE *h)
+{
+    size_t i;
+
+    *h = (HANDLE)_get_osfhandle(fd);
+    if (*h == INVALID_HANDLE_VALUE) {
+        virReportSystemError(EBADF, _("failed to preserve fd %1$d"), fd);
+        return -1;
+    }
+    for (i = 0; i < *nhandles; i++) {
+        if (handles[i] == *h)
+            return 0;
+    }
+    if (!SetHandleInformation(*h, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT)) {
+        virReportSystemError(EBADF, _("failed to preserve fd %1$d"), fd);
+        return -1;
+    }
+    handles[(*nhandles)++] = *h;
+    return 0;
+}
+
+
+/*
+ * virExec:
+ * @cmd virCommand * containing all information about the program to
+ *      exec.
+ *
+ * There is no fork() on Windows: the child is created suspended, the pid
+ * file is written by the parent, and the handshake holds the child until it
+ * is resumed.  Pre-exec hooks run in the forked child on POSIX, where what
+ * they do (namespaces, security labels, freeing their copy of the data...)
+ * never affects the parent: they have no equivalent and are not run.
+ */
+static int
+virExec(virCommand *cmd)
+{
+    int null = -1;
+    int pipeout[2] = {-1, -1};
+    int pipeerr[2] = {-1, -1};
+    int childin = cmd->infd;
+    int childout = -1;
+    int childerr = -1;
+    const char *binary = NULL;
+    g_autoptr(GString) cmdline = g_string_new(NULL);
+    g_autofree gunichar2 *wbinary = NULL;
+    g_autofree gunichar2 *wcmdline = NULL;
+    g_autofree gunichar2 *wpwd = NULL;
+    g_autofree gunichar2 *wenv = NULL;
+    g_autofree HANDLE *inherit = NULL;
+    g_autofree char *attrbuf = NULL;
+    LPPROC_THREAD_ATTRIBUTE_LIST attrs = NULL;
+    SIZE_T attrsize = 0;
+    size_t ninherit = 0;
+    STARTUPINFOEXW si = { 0 };
+    PROCESS_INFORMATION pi = { 0 };
+    DWORD flags = CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED |
+                  CREATE_NEW_PROCESS_GROUP | EXTENDED_STARTUPINFO_PRESENT;
+    HANDLE unused;
+    size_t i;
+
+    if (!(binary = virCommandGetBinaryPath(cmd)))
+        return -1;
+
+    if (childin < 0) {
+        if (getDevNull(&null) < 0)
+            goto cleanup;
+        childin = null;
+    }
+
+    if (cmd->outfdptr != NULL) {
+        if (*cmd->outfdptr == -1) {
+            if (virPipe(pipeout) < 0)
+                goto cleanup;
+            childout = pipeout[1];
+        } else {
+            childout = *cmd->outfdptr;
+        }
+    } else {
+        if (getDevNull(&null) < 0)
+            goto cleanup;
+        childout = null;
+    }
+
+    if (cmd->errfdptr != NULL) {
+        if (cmd->errfdptr == cmd->outfdptr) {
+            childerr = childout;
+        } else if (*cmd->errfdptr == -1) {
+            if (virPipe(pipeerr) < 0)
+                goto cleanup;
+            childerr = pipeerr[1];
+        } else {
+            childerr = *cmd->errfdptr;
+        }
+    } else {
+        if (getDevNull(&null) < 0)
+            goto cleanup;
+        childerr = null;
+    }
+
+    for (i = 0; i < cmd->nargs; i++)
+        virCommandWin32AppendArg(cmdline, cmd->args[i]);
+
+    wbinary = g_utf8_to_utf16(binary, -1, NULL, NULL, NULL);
+    wcmdline = g_utf8_to_utf16(cmdline->str, -1, NULL, NULL, NULL);
+    if (cmd->pwd)
+        wpwd = g_utf8_to_utf16(cmd->pwd, -1, NULL, NULL, NULL);
+    if (cmd->env)
+        wenv = virCommandWin32EnvBlock(cmd->env, cmd->nenv);
+    if (!wbinary || !wcmdline || (cmd->pwd && !wpwd) || (cmd->env && !wenv)) {
+        virReportError(VIR_ERR_INTERNAL_ERROR,
+                       _("invalid UTF-8 in the command line of %1$s"),
+                       cmd->args[0]);
+        goto cleanup;
+    }
+
+    /*
+     * The child inherits its stdio and the passed fds, and nothing else:
+     * the equivalent of virCommandMassClose().
+     */
+    inherit = g_new0(HANDLE, 3 + cmd->npassfd);
+    si.StartupInfo.cb = sizeof(si);
+    si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    if (virCommandWin32Inherit(childin, inherit, &ninherit,
+                               &si.StartupInfo.hStdInput) < 0 ||
+        virCommandWin32Inherit(childout, inherit, &ninherit,
+                               &si.StartupInfo.hStdOutput) < 0 ||
+        virCommandWin32Inherit(childerr, inherit, &ninherit,
+                               &si.StartupInfo.hStdError) < 0)
+        goto cleanup;
+    for (i = 0; i < cmd->npassfd; i++) {
+        if (virCommandWin32Inherit(cmd->passfd[i].fd, inherit, &ninherit,
+                                   &unused) < 0)
+            goto cleanup;
+    }
+
+    InitializeProcThreadAttributeList(NULL, 1, 0, &attrsize);
+    attrbuf = g_new0(char, attrsize);
+    if (!InitializeProcThreadAttributeList((LPPROC_THREAD_ATTRIBUTE_LIST)attrbuf,
+                                           1, 0, &attrsize)) {
+        virReportSystemError(ENOMEM, "%s",
+                             _("cannot set the handles inherited by the child"));
+        goto cleanup;
+    }
+    attrs = (LPPROC_THREAD_ATTRIBUTE_LIST)attrbuf;
+    if (!UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                                   inherit, ninherit * sizeof(HANDLE),
+                                   NULL, NULL)) {
+        virReportSystemError(EINVAL, "%s",
+                             _("cannot set the handles inherited by the child"));
+        goto cleanup;
+    }
+    si.lpAttributeList = attrs;
+
+    /* A daemon has no console, like a POSIX one has no controlling tty */
+    if (cmd->flags & VIR_EXEC_DAEMON)
+        flags |= DETACHED_PROCESS;
+
+    if (!CreateProcessW(wbinary, wcmdline, NULL, NULL, TRUE, flags,
+                        wenv, wpwd, &si.StartupInfo, &pi)) {
+        DWORD err = GetLastError();
+
+        virReportSystemError(err == ERROR_FILE_NOT_FOUND ||
+                             err == ERROR_PATH_NOT_FOUND ? ENOENT : EACCES,
+                             _("cannot execute binary %1$s"),
+                             cmd->args[0]);
+        goto cleanup;
+    }
+
+    if (cmd->pidfile &&
+        virPidFileWritePath(cmd->pidfile, pi.dwProcessId) < 0)
+        goto abort;
+
+    if (cmd->setMaxMemLock || cmd->setMaxProcesses ||
+        cmd->setMaxFiles || cmd->setMaxCore)
+        VIR_DEBUG("Process resource limits are not supported on Windows");
+
+    if (cmd->hook)
+        VIR_DEBUG("Not running pre-exec hook %p %p: there is no child "
+                  "before exec() on Windows", cmd->hook, cmd->opaque);
+
+    /* With a handshake, the child is resumed by virCommandHandshakeNotify */
+    if (cmd->handshake) {
+        cmd->win32Thread = pi.hThread;
+    } else {
+        ResumeThread(pi.hThread);
+        CloseHandle(pi.hThread);
+    }
+
+    cmd->pid = pi.dwProcessId;
+    if (cmd->flags & VIR_EXEC_DAEMON) {
+        cmd->win32Detached = true;
+        CloseHandle(pi.hProcess);
+    } else {
+        virProcessWin32AddChild(cmd->pid, pi.hProcess);
+    }
+
+    DeleteProcThreadAttributeList(attrs);
+    VIR_FORCE_CLOSE(null);
+    if (cmd->outfdptr && *cmd->outfdptr == -1) {
+        VIR_FORCE_CLOSE(pipeout[1]);
+        *cmd->outfdptr = pipeout[0];
+    }
+    if (cmd->errfdptr && *cmd->errfdptr == -1) {
+        VIR_FORCE_CLOSE(pipeerr[1]);
+        *cmd->errfdptr = pipeerr[0];
+    }
+    return 0;
+
+ abort:
+    TerminateProcess(pi.hProcess, EXIT_CANCELED);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+
+ cleanup:
+    if (attrs)
+        DeleteProcThreadAttributeList(attrs);
+    VIR_FORCE_CLOSE(pipeerr[0]);
+    VIR_FORCE_CLOSE(pipeerr[1]);
+    VIR_FORCE_CLOSE(pipeout[0]);
+    VIR_FORCE_CLOSE(pipeout[1]);
+    VIR_FORCE_CLOSE(null);
+    return -1;
+}
+
+
 pid_t
 virFork(void)
 {
@@ -952,6 +1305,7 @@ virFork(void)
 }
 
 #endif /* WIN32 */
+
 
 
 /**
@@ -1454,6 +1808,15 @@ virCommandAddEnvPassCommon(virCommand *cmd)
     virCommandAddEnvPass(cmd, "USER");
     virCommandAddEnvPass(cmd, "LOGNAME");
     virCommandAddEnvPass(cmd, "TMPDIR");
+#ifdef WIN32
+    VIR_RESIZE_N(cmd->env, cmd->maxenv, cmd->nenv, 6);
+    virCommandAddEnvPass(cmd, "USERNAME");
+    virCommandAddEnvPass(cmd, "USERPROFILE");
+    virCommandAddEnvPass(cmd, "TEMP");
+    virCommandAddEnvPass(cmd, "TMP");
+    virCommandAddEnvPass(cmd, "APPDATA");
+    virCommandAddEnvPass(cmd, "LOCALAPPDATA");
+#endif
 }
 
 
@@ -2355,6 +2718,102 @@ virCommandProcessIO(virCommand *cmd)
     return ret;
 }
 
+#else /* WIN32 */
+typedef struct {
+    int fd;
+    char **buf;
+    size_t len;
+    int err;
+} virCommandWin32Output;
+
+
+static gpointer
+virCommandWin32ReadOutput(gpointer opaque)
+{
+    virCommandWin32Output *out = opaque;
+    char data[1024];
+    int done;
+
+    while ((done = read(out->fd, data, sizeof(data))) > 0) {
+        VIR_REALLOC_N(*out->buf, out->len + done + 1);
+        memcpy(*out->buf + out->len, data, done);
+        out->len += done;
+    }
+    if (done < 0)
+        out->err = errno;
+    (*out->buf)[out->len] = '\0';
+    return NULL;
+}
+
+
+/*
+ * Manage input and output to the child process.
+ *
+ * Pipes cannot be polled on Windows: a thread drains each captured output
+ * while the input buffer is written from here.
+ */
+static int
+virCommandProcessIO(virCommand *cmd)
+{
+    virCommandWin32Output out = { .fd = -1 };
+    virCommandWin32Output err = { .fd = -1 };
+    GThread *outthread = NULL;
+    GThread *errthread = NULL;
+    int ret = 0;
+
+    if (dryRunBuffer || dryRunCallback) {
+        VIR_DEBUG("Dry run requested, skipping I/O processing");
+        return 0;
+    }
+
+    if (cmd->outbuf) {
+        VIR_FREE(*cmd->outbuf);
+        *cmd->outbuf = g_new0(char, 1);
+        out.fd = cmd->outfd;
+        out.buf = cmd->outbuf;
+        outthread = g_thread_new("cmd-stdout", virCommandWin32ReadOutput, &out);
+    }
+    if (cmd->errbuf) {
+        VIR_FREE(*cmd->errbuf);
+        *cmd->errbuf = g_new0(char, 1);
+        err.fd = cmd->errfd;
+        err.buf = cmd->errbuf;
+        errthread = g_thread_new("cmd-stderr", virCommandWin32ReadOutput, &err);
+    }
+
+    if (cmd->inbuf && cmd->inpipe != -1) {
+        if (safewrite(cmd->inpipe, cmd->inbuf, strlen(cmd->inbuf)) < 0) {
+            /* a child closing its stdin early is not an error */
+            if (errno == EPIPE || errno == EINVAL) {
+                VIR_DEBUG("child closed stdin early, ignoring error "
+                          "on fd %d", cmd->inpipe);
+            } else {
+                virReportSystemError(errno, "%s",
+                                     _("unable to write to child input"));
+                ret = -1;
+            }
+        }
+        VIR_FORCE_CLOSE(cmd->inpipe);
+    }
+
+    if (outthread)
+        g_thread_join(outthread);
+    if (errthread)
+        g_thread_join(errthread);
+
+    if (out.err) {
+        virReportSystemError(out.err, "%s", _("unable to read child stdout"));
+        ret = -1;
+    }
+    if (err.err) {
+        virReportSystemError(err.err, "%s", _("unable to read child stderr"));
+        ret = -1;
+    }
+    return ret;
+}
+#endif /* WIN32 */
+
+
 /**
  * virCommandExec:
  * @cmd: command to run
@@ -2368,6 +2827,7 @@ virCommandProcessIO(virCommand *cmd)
  * Returns -1 on any error executing the command.
  * Will not return on success.
  */
+#ifndef WIN32
 int virCommandExec(virCommand *cmd, gid_t *groups, int ngroups)
 {
     if (virCommandHasError(cmd)) {
@@ -2385,6 +2845,17 @@ int virCommandExec(virCommand *cmd, gid_t *groups, int ngroups)
                          cmd->args[0]);
     return -1;
 }
+#else /* WIN32 */
+int
+virCommandExec(virCommand *cmd G_GNUC_UNUSED, gid_t *groups G_GNUC_UNUSED,
+               int ngroups G_GNUC_UNUSED)
+{
+    /* a process cannot replace its image on Windows */
+    virReportSystemError(ENOSYS, "%s",
+                         _("Executing new processes is not supported on Win32 platform"));
+    return -1;
+}
+#endif /* WIN32 */
 
 
 /**
@@ -2579,6 +3050,7 @@ virCommandRunAsync(virCommand *cmd, pid_t *pid)
         cmd->infd = infd[0];
         cmd->inpipe = infd[1];
 
+#ifndef WIN32
         if (fcntl(cmd->inpipe, F_SETFL, O_NONBLOCK) < 0) {
             virReportSystemError(errno, "%s",
                                  _("fcntl failed to set O_NONBLOCK"));
@@ -2586,6 +3058,7 @@ virCommandRunAsync(virCommand *cmd, pid_t *pid)
             ret = -1;
             goto cleanup;
         }
+#endif /* !WIN32 */
     } else if ((cmd->inbuf && cmd->infd == -1) ||
                (cmd->outbuf && cmd->outfdptr != &cmd->outfd) ||
                (cmd->errbuf && cmd->errfdptr != &cmd->errfd)) {
@@ -2735,6 +3208,17 @@ virCommandWait(virCommand *cmd, int *exitstatus)
      * message is not as detailed as what we can provide.  So, we
      * guarantee that virProcessWait only fails due to failure to wait,
      * and repeat the exitstatus check code ourselves.  */
+#ifdef WIN32
+    if (cmd->win32Detached) {
+        /* like the intermediate process of a POSIX daemon, which exits 0 */
+        cmd->win32Detached = false;
+        cmd->pid = -1;
+        cmd->reap = false;
+        if (exitstatus)
+            *exitstatus = 0;
+        return 0;
+    }
+#endif /* WIN32 */
     ret = virProcessWait(cmd->pid, &status, true);
     if (cmd->flags & VIR_EXEC_ASYNC_IO) {
         cmd->flags &= ~VIR_EXEC_ASYNC_IO;
@@ -2793,6 +3277,7 @@ virCommandAbort(virCommand *cmd)
 }
 
 
+#ifndef WIN32
 /**
  * virCommandRequireHandshake:
  * @cmd: command to modify
@@ -2951,74 +3436,64 @@ virCommandSetSendBuffer(virCommand *cmd,
 }
 
 
-int
-virCommandExec(virCommand *cmd G_GNUC_UNUSED, gid_t *groups G_GNUC_UNUSED,
-               int ngroups G_GNUC_UNUSED)
-{
-    virReportSystemError(ENOSYS, "%s",
-                         _("Executing new processes is not supported on Win32 platform"));
-    return -1;
-}
-
-
-int
-virCommandRun(virCommand *cmd G_GNUC_UNUSED, int *exitstatus G_GNUC_UNUSED)
-{
-    virReportSystemError(ENOSYS, "%s",
-                         _("Executing new processes is not supported on Win32 platform"));
-    return -1;
-}
-
-
-int
-virCommandRunAsync(virCommand *cmd G_GNUC_UNUSED, pid_t *pid G_GNUC_UNUSED)
-{
-    virReportSystemError(ENOSYS, "%s",
-                         _("Executing new processes is not supported on Win32 platform"));
-    return -1;
-}
-
-
-int
-virCommandWait(virCommand *cmd G_GNUC_UNUSED, int *exitstatus G_GNUC_UNUSED)
-{
-    virReportSystemError(ENOSYS, "%s",
-                         _("Executing new processes is not supported on Win32 platform"));
-    return -1;
-}
-
-
-void
-virCommandAbort(virCommand *cmd G_GNUC_UNUSED)
-{
-    /* Mingw lacks WNOHANG and kill().  But since we haven't ported
-     * virExec to mingw yet, there's no process to be killed,
-     * making this implementation trivially correct for now :)  */
-}
-
-
+/*
+ * On Windows the child is created suspended (see virExec()): the handshake
+ * holds it suspended until virCommandHandshakeNotify() resumes it.
+ */
 void virCommandRequireHandshake(virCommand *cmd)
 {
     if (virCommandHasError(cmd))
         return;
 
-    cmd->has_error = ENOSYS;
+    if (cmd->handshake) {
+        cmd->has_error = -1;
+        VIR_DEBUG("Cannot require handshake twice");
+        return;
+    }
+
+    cmd->handshake = true;
 }
 
 
-int virCommandHandshakeWait(virCommand *cmd G_GNUC_UNUSED)
+int virCommandHandshakeWait(virCommand *cmd)
 {
-    virReportSystemError(ENOSYS, "%s",
-                         _("Executing new processes is not supported on Win32 platform"));
-    return -1;
+    if (virCommandHasError(cmd)) {
+        virCommandRaiseError(cmd);
+        return -1;
+    }
+
+    if (!cmd->handshake || !cmd->win32Thread) {
+        virReportError(VIR_ERR_INTERNAL_ERROR, "%s",
+                       _("invalid use of command API"));
+        return -1;
+    }
+
+    /* nothing runs in the child before it is resumed */
+    return 0;
 }
 
 
-int virCommandHandshakeNotify(virCommand *cmd G_GNUC_UNUSED)
+int virCommandHandshakeNotify(virCommand *cmd)
 {
-    virReportSystemError(ENOSYS, "%s",
-                         _("Executing new processes is not supported on Win32 platform"));
-    return -1;
+    if (virCommandHasError(cmd)) {
+        virCommandRaiseError(cmd);
+        return -1;
+    }
+
+    if (!cmd->handshake || !cmd->win32Thread) {
+        virReportError(VIR_ERR_INTERNAL_ERROR, "%s",
+                       _("invalid use of command API"));
+        return -1;
+    }
+
+    VIR_DEBUG("Notify handshake by resuming pid %lld", (long long) cmd->pid);
+    if (ResumeThread(cmd->win32Thread) == (DWORD) -1) {
+        virReportSystemError(ESRCH, "%s", _("Unable to notify child process"));
+        return -1;
+    }
+    CloseHandle(cmd->win32Thread);
+    cmd->win32Thread = NULL;
+    return 0;
 }
 #endif /* WIN32 */
 
@@ -3037,6 +3512,11 @@ virCommandFree(virCommand *cmd)
     size_t i;
     if (!cmd)
         return;
+
+#ifdef WIN32
+    if (cmd->win32Thread)
+        CloseHandle(cmd->win32Thread);
+#endif
 
     for (i = 0; i < cmd->npassfd; i++) {
         if (cmd->passfd[i].flags & VIR_COMMAND_PASS_FD_CLOSE_PARENT)

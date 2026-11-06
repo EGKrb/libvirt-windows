@@ -37,6 +37,7 @@
 #include "virarch.h"
 #include "virerror.h"
 #include "virfile.h"
+#include "virnetdevbridge.h"
 #include "virqemu.h"
 #include "virstring.h"
 #include "virtime.h"
@@ -3910,6 +3911,32 @@ qemuBuildHostNetProps(virDomainObj *vm,
          */
     case VIR_DOMAIN_NET_TYPE_BRIDGE:
     case VIR_DOMAIN_NET_TYPE_NETWORK:
+#ifdef WIN32
+    {
+        /* no TAP device: the guest joins the switch of the bridge */
+        g_autofree char *path =
+            virNetDevBridgeSwitchSocketPath(virDomainNetGetActualBridgeName(net));
+        g_autoptr(virJSONValue) addrprops = NULL;
+        qemuDomainObjPrivate *priv = vm->privateData;
+
+        if (virJSONValueObjectAdd(&addrprops,
+                                  "s:type", "unix",
+                                  "s:path", path,
+                                  NULL) < 0 ||
+            virJSONValueObjectAdd(&netprops,
+                                  "s:type", "stream",
+                                  "a:addr", &addrprops,
+                                  "b:server", false,
+                                  NULL) < 0)
+            return NULL;
+
+        /* back on the network when its switch is restarted */
+        if (virQEMUCapsGet(priv->qemuCaps, QEMU_CAPS_NETDEV_STREAM_RECONNECT_MILISECONDS) &&
+            virJSONValueObjectAdd(&netprops, "u:reconnect-ms", 1000, NULL) < 0)
+            return NULL;
+        break;
+    }
+#endif
     case VIR_DOMAIN_NET_TYPE_DIRECT:
     case VIR_DOMAIN_NET_TYPE_ETHERNET: {
         g_auto(virBuffer) buf = VIR_BUFFER_INITIALIZER;
@@ -7438,6 +7465,10 @@ qemuBuildAccelCommandLine(virCommand *cmd,
         virBufferAddLit(&buf, "mshv");
         break;
 
+    case VIR_DOMAIN_VIRT_WHPX:
+        virBufferAddLit(&buf, "whpx");
+        break;
+
     case VIR_DOMAIN_VIRT_KQEMU:
     case VIR_DOMAIN_VIRT_XEN:
     case VIR_DOMAIN_VIRT_LXC:
@@ -8899,6 +8930,28 @@ qemuBuildInterfaceConnect(virDomainObj *vm,
     switch (actualType) {
     case VIR_DOMAIN_NET_TYPE_NETWORK:
     case VIR_DOMAIN_NET_TYPE_BRIDGE:
+#ifdef WIN32
+    {
+        /* no TAP device to add to the bridge: QEMU connects to its switch
+         * (qemuBuildHostNetProps), which must exist as a bridge must */
+        const char *brname = virDomainNetGetActualBridgeName(net);
+        g_autofree char *path = brname ? virNetDevBridgeSwitchSocketPath(brname) : NULL;
+
+        if (!path || !virFileExists(path)) {
+            virReportError(VIR_ERR_OPERATION_INVALID,
+                           _("bridge '%1$s' does not exist"), NULLSTR(brname));
+            return -1;
+        }
+        /* the port has the name a TAP device would have, for the QoS,
+         * domiftune and domifstat of the interface */
+        if (!net->ifname &&
+            virNetDevGenerateName(&net->ifname, VIR_NET_DEV_GEN_NAME_VNET) < 0)
+            return -1;
+        if (virNetDevBridgeSwitchPortAdd(brname, net->ifname, &net->mac) < 0)
+            return -1;
+        break;
+    }
+#endif
         vhostfd = true;
         if (virDomainInterfaceBridgeConnect(vm->def, net,
                                             tapfd, &tapfdSize,
@@ -9064,6 +9117,12 @@ qemuBuildInterfaceCommandLine(virQEMUDriver *driver,
         /* network and bridge use a tap device, and direct uses a
          * macvtap device
          */
+#ifdef WIN32
+        /* a port of a switch is no device of the host */
+        if (actualType == VIR_DOMAIN_NET_TYPE_NETWORK ||
+            actualType == VIR_DOMAIN_NET_TYPE_BRIDGE)
+            break;
+#endif
         if (driver->privileged && nicindexes && nnicindexes &&
             net->ifname) {
             if (virNetDevGetIndex(net->ifname, &nicindex) < 0)
@@ -9099,6 +9158,14 @@ qemuBuildInterfaceCommandLine(virQEMUDriver *driver,
         */
        break;
     }
+
+#ifdef WIN32
+    /* no host side device whose MTU would be set: the switch's is the
+     * network's, the guest's is given by host_mtu */
+    if (actualType == VIR_DOMAIN_NET_TYPE_NETWORK ||
+        actualType == VIR_DOMAIN_NET_TYPE_BRIDGE)
+        setBackendMTU = false;
+#endif
 
     qemuDomainInterfaceSetDefaultQDisc(driver, net);
 

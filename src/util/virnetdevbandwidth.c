@@ -30,6 +30,102 @@
 
 VIR_LOG_INIT("util.netdevbandwidth");
 
+#ifdef WIN32
+/*
+ * Windows has no tc: the QoS of a guest interface and the floors of a
+ * network are applied by the switch of the network (libvirt_netswitch),
+ * which reads them from the port file of the interface and from the floor
+ * files of the bridge, and is told when they change.  A network's own
+ * bandwidth is in the network definition the switch reads.
+ */
+# include "virnetdevbridge.h"
+# include "virfile.h"
+# include "configmake.h"
+
+static char *
+virNetDevBandwidthWin32FloorPath(const char *brname, unsigned int id)
+{
+    return g_strdup_printf("%s/%s.floor/%u",
+                           VIR_INSTALL_PATH(RUNSTATEDIR "/libvirt/network"),
+                           brname, id);
+}
+
+
+static void
+virNetDevBandwidthWin32SetRate(GKeyFile *kf,
+                               const char *group,
+                               const virNetDevBandwidthRate *rate)
+{
+    g_key_file_remove_group(kf, group, NULL);
+    if (!rate || !rate->average)
+        return;
+    g_key_file_set_uint64(kf, group, "average", rate->average);
+    if (rate->peak)
+        g_key_file_set_uint64(kf, group, "peak", rate->peak);
+    if (rate->burst)
+        g_key_file_set_uint64(kf, group, "burst", rate->burst);
+}
+
+
+/* Set (@bandwidth) or clear (NULL) the QoS of the switch port @ifname */
+static int
+virNetDevBandwidthWin32SetPort(const char *ifname,
+                               const virNetDevBandwidth *bandwidth)
+{
+    g_autofree char *path = virNetDevBridgeSwitchPortPath(ifname);
+    g_autofree char *brname = NULL;
+    g_autoptr(GKeyFile) kf = g_key_file_new();
+    g_autoptr(GError) err = NULL;
+    virMacAddr mac;
+
+    if (virNetDevBridgeSwitchPortGet(ifname, &brname, &mac) < 0 ||
+        !g_key_file_load_from_file(kf, path, G_KEY_FILE_KEEP_COMMENTS, NULL))
+        return -1;
+
+    /* the domain's view: inbound is what the guest receives */
+    virNetDevBandwidthWin32SetRate(kf, "inbound", bandwidth ? bandwidth->in : NULL);
+    virNetDevBandwidthWin32SetRate(kf, "outbound", bandwidth ? bandwidth->out : NULL);
+
+    if (!g_key_file_save_to_file(kf, path, &err)) {
+        virReportError(VIR_ERR_INTERNAL_ERROR,
+                       _("cannot write switch port file %1$s: %2$s"),
+                       path, err->message);
+        return -1;
+    }
+    virNetDevBridgeSwitchNotify(brname);
+    return 0;
+}
+
+
+static int
+virNetDevBandwidthWin32WriteFloor(const char *brname,
+                                  unsigned int id,
+                                  const virMacAddr *mac,
+                                  unsigned long long floor)
+{
+    g_autofree char *path = virNetDevBandwidthWin32FloorPath(brname, id);
+    g_autofree char *dir = g_path_get_dirname(path);
+    g_autoptr(GKeyFile) kf = g_key_file_new();
+    g_autoptr(GError) err = NULL;
+    char macstr[VIR_MAC_STRING_BUFLEN];
+
+    if (g_mkdir_with_parents(dir, 0777) < 0) {
+        virReportSystemError(errno, _("cannot create directory %1$s"), dir);
+        return -1;
+    }
+    g_key_file_set_string(kf, "floor", "mac", virMacAddrFormat(mac, macstr));
+    g_key_file_set_uint64(kf, "floor", "floor", floor);
+    if (!g_key_file_save_to_file(kf, path, &err)) {
+        virReportError(VIR_ERR_INTERNAL_ERROR,
+                       _("cannot write switch floor file %1$s: %2$s"),
+                       path, err->message);
+        return -1;
+    }
+    virNetDevBridgeSwitchNotify(brname);
+    return 0;
+}
+#endif /* WIN32 */
+
 void
 virNetDevBandwidthFree(virNetDevBandwidth *def)
 {
@@ -279,6 +375,23 @@ virNetDevBandwidthSet(const char *ifname,
         return -1;
     }
 
+#ifdef WIN32
+    {
+        g_autofree char *port = virNetDevBridgeSwitchPortPath(ifname);
+        g_autofree char *sock = virNetDevBridgeSwitchSocketPath(ifname);
+
+        if (virFileExists(port))
+            return virNetDevBandwidthWin32SetPort(ifname, bandwidth);
+        /* the bridge of a network: its switch reads the network XML */
+        if (virFileExists(sock))
+            return 0;
+        virReportError(VIR_ERR_OPERATION_UNSUPPORTED,
+                       _("Unable to set bandwidth for interface '%1$s', which is not a port of a network switch"),
+                       ifname);
+        return -1;
+    }
+#endif
+
     if (flags & VIR_NETDEV_BANDWIDTH_SET_DIR_SWAPPED) {
         rx = bandwidth->out;
         tx = bandwidth->in;
@@ -483,6 +596,14 @@ virNetDevBandwidthClear(const char *ifname)
     if (!ifname)
        return 0;
 
+#ifdef WIN32
+    {
+        g_autofree char *port = virNetDevBridgeSwitchPortPath(ifname);
+
+        return virFileExists(port) ? virNetDevBandwidthWin32SetPort(ifname, NULL) : 0;
+    }
+#endif
+
     if (virNetDevBandwidthClearRoot(ifname) < 0)
         return -1;
 
@@ -612,6 +733,11 @@ virNetDevBandwidthPlug(const char *brname,
         return -1;
     }
 
+#ifdef WIN32
+    return virNetDevBandwidthWin32WriteFloor(brname, id, ifmac_ptr,
+                                             bandwidth->in->floor);
+#endif
+
     class_id = g_strdup_printf("1:%x", id);
     qdisc_id = g_strdup_printf("%x:", id);
     floor = g_strdup_printf("%llukbps", bandwidth->in->floor);
@@ -667,6 +793,16 @@ virNetDevBandwidthUnplug(const char *brname,
         return -1;
     }
 
+#ifdef WIN32
+    {
+        g_autofree char *path = virNetDevBandwidthWin32FloorPath(brname, id);
+
+        unlink(path);
+        virNetDevBridgeSwitchNotify(brname);
+        return 0;
+    }
+#endif
+
     class_id = g_strdup_printf("1:%x", id);
     qdisc_id = g_strdup_printf("%x:", id);
 
@@ -718,6 +854,28 @@ virNetDevBandwidthUpdateRate(const char *ifname,
     g_autofree char *rate = NULL;
     g_autofree char *ceil = NULL;
 
+#ifdef WIN32
+    {
+        /* class 2 takes what the floors leave, which the switch works out
+         * itself; another class is the floor of an interface */
+        g_autofree char *path = virNetDevBandwidthWin32FloorPath(ifname, id);
+        g_autoptr(GKeyFile) kf = g_key_file_new();
+        g_autofree char *macstr = NULL;
+        virMacAddr mac;
+
+        if (id <= 2)
+            return 0;
+        if (!g_key_file_load_from_file(kf, path, G_KEY_FILE_NONE, NULL) ||
+            !(macstr = g_key_file_get_string(kf, "floor", "mac", NULL)) ||
+            virMacAddrParse(macstr, &mac) < 0) {
+            virReportError(VIR_ERR_INTERNAL_ERROR,
+                           _("no floor %1$u on bridge '%2$s'"), id, ifname);
+            return -1;
+        }
+        return virNetDevBandwidthWin32WriteFloor(ifname, id, &mac, new_rate);
+    }
+#endif
+
     class_id = g_strdup_printf("1:%x", id);
     rate = g_strdup_printf("%llukbps", new_rate);
     ceil = g_strdup_printf("%llukbps", bandwidth->in->peak ?
@@ -758,6 +916,19 @@ virNetDevBandwidthUpdateFilter(const char *ifname,
     int ret = -1;
     char *class_id = NULL;
 
+#ifdef WIN32
+    {
+        /* the floor of class @id follows the new MAC address */
+        g_autofree char *path = virNetDevBandwidthWin32FloorPath(ifname, id);
+        g_autoptr(GKeyFile) kf = g_key_file_new();
+
+        if (!g_key_file_load_from_file(kf, path, G_KEY_FILE_NONE, NULL))
+            return 0;
+        return virNetDevBandwidthWin32WriteFloor(ifname, id, ifmac_ptr,
+                                                 g_key_file_get_uint64(kf, "floor", "floor", NULL));
+    }
+#endif
+
     class_id = g_strdup_printf("1:%x", id);
 
     if (virNetDevBandwidthManipulateFilter(ifname, ifmac_ptr, id,
@@ -794,6 +965,11 @@ virNetDevBandwidthSetRootQDisc(const char *ifname,
     g_autofree char *outbuf = NULL;
     g_autofree char *errbuf = NULL;
     int status;
+
+#ifdef WIN32
+    /* a switch port queues as the switch does */
+    return 0;
+#endif
 
     /* Ideally, we would have a netlink implementation and just
      * call it here.  But honestly, I tried and failed miserably.

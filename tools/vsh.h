@@ -220,6 +220,10 @@ struct _vshControl {
 
 #ifndef WIN32
     struct termios termattr;    /* settings of the tty terminal */
+#else
+    unsigned long conInMode;    /* console modes (DWORD) before raw mode */
+    unsigned long conOutMode;
+    bool conModeSaved;
 #endif
     bool istty;                 /* is the terminal a tty */
 

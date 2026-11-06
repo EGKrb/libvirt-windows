@@ -22,6 +22,34 @@
 #include "virmacaddr.h"
 #include "virnetdevvlan.h"
 
+#ifdef WIN32
+/* Windows has no bridge device: a libvirt network's bridge is the switch
+ * of libvirt_netswitch, reached by its UNIX socket */
+char *virNetDevBridgeSwitchSocketPath(const char *brname)
+    ATTRIBUTE_NONNULL(1);
+
+/*
+ * A guest interface on a switch has the name a TAP device would have
+ * (vnetN): its port file (run/libvirt/network/ports/NAME) names its bridge
+ * and MAC address, and holds its QoS, which the switch applies.
+ */
+char *virNetDevBridgeSwitchPortPath(const char *ifname)
+    ATTRIBUTE_NONNULL(1);
+int virNetDevBridgeSwitchPortAdd(const char *brname,
+                                 const char *ifname,
+                                 const virMacAddr *mac)
+    ATTRIBUTE_NONNULL(1) ATTRIBUTE_NONNULL(2) ATTRIBUTE_NONNULL(3);
+void virNetDevBridgeSwitchPortRemove(const char *ifname)
+    ATTRIBUTE_NONNULL(1);
+int virNetDevBridgeSwitchPortGet(const char *ifname,
+                                 char **brname,
+                                 virMacAddr *mac)
+    ATTRIBUTE_NONNULL(1) ATTRIBUTE_NONNULL(2) ATTRIBUTE_NONNULL(3);
+/* Tell the switch of @brname that its ports or floors changed */
+void virNetDevBridgeSwitchNotify(const char *brname)
+    ATTRIBUTE_NONNULL(1);
+#endif
+
 int virNetDevBridgeCreate(const char *brname,
                           const virMacAddr *mac)
     ATTRIBUTE_NONNULL(1) G_GNUC_WARN_UNUSED_RESULT;

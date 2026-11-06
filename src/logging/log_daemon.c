@@ -22,7 +22,6 @@
 
 #include <unistd.h>
 #include <fcntl.h>
-#include <sys/wait.h>
 #include <sys/stat.h>
 #include <getopt.h>
 
@@ -390,7 +389,7 @@ virLogDaemonExecRestartStatePath(bool privileged,
                                  char **state_file)
 {
     if (privileged) {
-        *state_file = g_strdup(RUNSTATEDIR "/virtlogd-restart-exec.json");
+        *state_file = g_strdup(VIR_INSTALL_PATH(RUNSTATEDIR "/virtlogd-restart-exec.json"));
     } else {
         g_autofree char *rundir = NULL;
         mode_t old_umask;
@@ -567,9 +566,9 @@ virLogDaemonUsage(const char *argv0, bool privileged)
                   "    PID file (unless overridden by -p):\n"
                   "      %3$s/virtlogd.pid\n"
                   "\n"),
-                SYSCONFDIR,
-                RUNSTATEDIR,
-                RUNSTATEDIR);
+                VIR_INSTALL_PATH(SYSCONFDIR),
+                VIR_INSTALL_PATH(RUNSTATEDIR),
+                VIR_INSTALL_PATH(RUNSTATEDIR));
     } else {
         fprintf(stderr, "%s",
                 _("\n"
@@ -719,7 +718,7 @@ int main(int argc, char **argv) {
 
     if (!pid_file &&
         virPidFileConstructPath(privileged,
-                                RUNSTATEDIR,
+                                VIR_INSTALL_PATH(RUNSTATEDIR),
                                 "virtlogd",
                                 &pid_file) < 0) {
         VIR_ERROR(_("Can't determine pid file path."));
@@ -749,7 +748,7 @@ int main(int argc, char **argv) {
 
     /* Ensure the rundir exists (on tmpfs on some systems) */
     if (privileged) {
-        run_dir = g_strdup(RUNSTATEDIR "/libvirt");
+        run_dir = g_strdup(VIR_INSTALL_PATH(RUNSTATEDIR "/libvirt"));
     } else {
         run_dir = virGetUserRuntimeDirectory();
     }

@@ -22,16 +22,18 @@
 #include <config.h>
 
 #include <sys/types.h>
-#include <poll.h>
 #include <stdarg.h>
 #include <unistd.h>
-#include <sys/utsname.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <signal.h>
-#include <pwd.h>
-#include <sys/ioctl.h>
-#include <net/if.h>
+#ifndef WIN32
+# include <poll.h>
+# include <sys/utsname.h>
+# include <pwd.h>
+# include <sys/ioctl.h>
+# include <net/if.h>
+#endif
 #ifdef WITH_SYSCTLBYNAME
 # include <sys/sysctl.h>
 #endif
@@ -68,6 +70,8 @@
 #include "virutil.h"
 #include "virsystemd.h"
 #include "netdev_bandwidth_conf.h"
+#include "virprocess.h"
+#include "virsocket.h"
 
 #define VIR_FROM_THIS VIR_FROM_NETWORK
 #define MAX_BRIDGE_ID 256
@@ -394,6 +398,7 @@ networkRemoveInactive(virNetworkDriverState *driver,
 }
 
 
+#ifndef WIN32
 static char *
 networkBridgeDummyNicName(const char *brname)
 {
@@ -417,6 +422,7 @@ networkBridgeDummyNicName(const char *brname)
     }
     return nicname;
 }
+#endif /* !WIN32 */
 
 
 static int
@@ -452,6 +458,12 @@ networkSetMacMap(virNetworkDriverConfig *cfg,
     return 0;
 }
 
+#ifdef WIN32
+static bool
+networkSwitchAlive(virNetworkDriverConfig *cfg,
+                   virNetworkObj *obj);
+#endif
+
 static int
 networkUpdateState(virNetworkObj *obj,
                    void *opaque)
@@ -472,9 +484,15 @@ networkUpdateState(virNetworkObj *obj,
     case VIR_NETWORK_FORWARD_NAT:
     case VIR_NETWORK_FORWARD_ROUTE:
     case VIR_NETWORK_FORWARD_OPEN:
+#ifdef WIN32
+        /* the switch is the bridge: is it still there? */
+        if (!networkSwitchAlive(cfg, obj))
+            virNetworkObjSetActive(obj, false);
+#else
         /* If bridge doesn't exist, then mark it inactive */
         if (!(def->bridge && virNetDevExists(def->bridge) == 1))
             virNetworkObjSetActive(obj, false);
+#endif
 
         break;
 
@@ -512,6 +530,11 @@ networkUpdateState(virNetworkObj *obj,
 
     /* Try and read dnsmasq pids of both active and inactive networks, just in
      * case a network became inactive and we need to clean up. */
+#ifdef WIN32
+    /* no dnsmasq: the pid is that of the switch, read above */
+    if (def->ips && (def->nips > 0) && networkSetMacMap(cfg, obj) < 0)
+        return -1;
+#else
     if (def->ips && (def->nips > 0)) {
         const char *binpath = NULL;
         pid_t dnsmasqPid;
@@ -528,6 +551,7 @@ networkUpdateState(virNetworkObj *obj,
                                            binpath));
         virNetworkObjSetDnsmasqPid(obj, dnsmasqPid);
     }
+#endif
 
     /* Clean up after networks which were active but we have found out they are
      * actually down */
@@ -1531,6 +1555,7 @@ networkDnsmasqConfContents(virNetworkObj *obj,
 
 
 /* build the dnsmasq command line */
+#ifndef WIN32
 static int ATTRIBUTE_NONNULL(3)
 networkBuildDhcpDaemonCommandLine(virNetworkDriverState *driver,
                                   virNetworkObj *obj,
@@ -1570,7 +1595,7 @@ networkBuildDhcpDaemonCommandLine(virNetworkDriverState *driver,
     /* This helper is used to create custom leases file for libvirt */
     if (!(leaseshelper_path = virFileFindResource("libvirt_leaseshelper",
                                                   abs_top_builddir "/src",
-                                                  LIBEXECDIR)))
+                                                  VIR_INSTALL_PATH(LIBEXECDIR))))
         return -1;
 
     cmd = virCommandNew(dnsmasqCapsGetBinaryPath(dnsmasq_caps));
@@ -1583,6 +1608,7 @@ networkBuildDhcpDaemonCommandLine(virNetworkDriverState *driver,
     *cmdout = g_steal_pointer(&cmd);
     return 0;
 }
+#endif /* !WIN32 */
 
 
 bool
@@ -1611,6 +1637,7 @@ networkNeedsDnsmasq(const virNetworkDef* def)
 }
 
 
+#ifndef WIN32
 static int
 networkStartDhcpDaemon(virNetworkDriverState *driver,
                        virNetworkObj *obj)
@@ -1764,6 +1791,211 @@ networkRestartDhcpDaemon(virNetworkDriverState *driver,
     /* now start dnsmasq if it should be started */
     return networkStartDhcpDaemon(driver, obj);
 }
+#else /* WIN32 */
+/*
+ * Windows has no bridge device, dnsmasq nor firewall: one process,
+ * libvirt_netswitch (netswitch.c), is all three for a virtual network.  It
+ * is started, refreshed (SIGHUP) and restarted where dnsmasq is, and its
+ * pid is kept as dnsmasq's.
+ */
+static char *
+networkSwitchBinary(void)
+{
+    return virFileFindResource("libvirt_netswitch.exe",
+                               abs_top_builddir "/src",
+                               VIR_INSTALL_PATH(LIBEXECDIR));
+}
+
+
+static char *
+networkSwitchConfigFileName(virNetworkDriverConfig *cfg,
+                            const char *netname)
+{
+    return g_strdup_printf("%s/%s.netswitch.xml", cfg->dnsmasqStateDir, netname);
+}
+
+
+/* The switch reads the live definition of the network */
+static int
+networkSwitchWriteConfig(virNetworkDriverState *driver,
+                         virNetworkObj *obj)
+{
+    g_autoptr(virNetworkDriverConfig) cfg = virNetworkDriverGetConfig(driver);
+    virNetworkDef *def = virNetworkObjGetDef(obj);
+    g_autofree char *configfile = networkSwitchConfigFileName(cfg, def->name);
+    g_autofree char *xml = NULL;
+
+    if (g_mkdir_with_parents(cfg->dnsmasqStateDir, 0777) < 0) {
+        virReportSystemError(errno, _("cannot create directory %1$s"),
+                             cfg->dnsmasqStateDir);
+        return -1;
+    }
+    if (!(xml = virNetworkDefFormat(def, driver->xmlopt, 0)))
+        return -1;
+    if (virFileRewriteStr(configfile, 0600, xml) < 0) {
+        virReportSystemError(errno,
+                             _("couldn't write network switch config file '%1$s'"),
+                             configfile);
+        return -1;
+    }
+    return 0;
+}
+
+
+static bool
+networkSwitchListening(const char *path)
+{
+    struct sockaddr_un un = { .sun_family = AF_UNIX };
+    int fd;
+    bool ok;
+
+    if (virStrcpyStatic(un.sun_path, path) < 0)
+        return false;
+    if ((fd = socket(AF_UNIX, SOCK_STREAM, 0)) < 0)
+        return false;
+    ok = connect(fd, (struct sockaddr *)&un, sizeof(un)) == 0;
+    closesocket(fd);
+    return ok;
+}
+
+
+/* Is the switch of an active network still running?  Its pid is recorded */
+static bool
+networkSwitchAlive(virNetworkDriverConfig *cfg,
+                   virNetworkObj *obj)
+{
+    virNetworkDef *def = virNetworkObjGetDef(obj);
+    g_autofree char *binpath = networkSwitchBinary();
+    pid_t pid = -1;
+
+    /* a pid now run by another program is not ours */
+    if (virPidFileReadIfAlive(cfg->pidDir, def->name, &pid, binpath) < 0)
+        pid = -1;
+    virNetworkObjSetDnsmasqPid(obj, pid);
+    return pid > 0;
+}
+
+
+static int
+networkStartDhcpDaemon(virNetworkDriverState *driver,
+                       virNetworkObj *obj)
+{
+    g_autoptr(virNetworkDriverConfig) cfg = virNetworkDriverGetConfig(driver);
+    virNetworkDef *def = virNetworkObjGetDef(obj);
+    g_autoptr(virCommand) cmd = NULL;
+    g_autofree char *pidfile = NULL;
+    g_autofree char *binary = NULL;
+    g_autofree char *configfile = NULL;
+    g_autofree char *sockpath = NULL;
+    g_autofree char *leasefile = NULL;
+    g_autofree char *logdir = g_strdup(VIR_INSTALL_PATH(LOCALSTATEDIR "/log/libvirt/network"));
+    g_autofree char *logfile = NULL;
+    pid_t pid;
+    size_t i;
+
+    virNetworkObjSetDnsmasqPid(obj, -1);
+
+    if (g_mkdir_with_parents(cfg->pidDir, 0777) < 0) {
+        virReportSystemError(errno, _("cannot create directory %1$s"), cfg->pidDir);
+        return -1;
+    }
+    if (g_mkdir_with_parents(logdir, 0777) < 0) {
+        virReportSystemError(errno, _("cannot create directory %1$s"), logdir);
+        return -1;
+    }
+    if (networkSwitchWriteConfig(driver, obj) < 0)
+        return -1;
+
+    if (!(pidfile = virPidFileBuildPath(cfg->pidDir, def->name)) ||
+        !(binary = networkSwitchBinary()))
+        return -1;
+    configfile = networkSwitchConfigFileName(cfg, def->name);
+    sockpath = virNetDevBridgeSwitchSocketPath(def->bridge);
+    leasefile = networkDnsmasqLeaseFileNameCustom(cfg, def->bridge);
+    logfile = g_strdup_printf("%s/%s.log", logdir, def->name);
+
+    /* the switch appends to its log itself: see nsOpenLog() */
+    cmd = virCommandNewArgList(binary,
+                               "--config", configfile,
+                               "--socket", sockpath,
+                               "--leases", leasefile,
+                               "--log", logfile,
+                               NULL);
+    virCommandSetPidFile(cmd, pidfile);
+    virCommandDaemonize(cmd);
+
+    if (virCommandRun(cmd, NULL) < 0)
+        return -1;
+    if (virPidFileReadPath(pidfile, &pid) < 0)
+        return -1;
+
+    /* the network is up when its switch listens */
+    for (i = 0; i < 100; i++) {
+        if (virProcessKill(pid, 0) < 0) {
+            virReportError(VIR_ERR_INTERNAL_ERROR,
+                           _("network switch of '%1$s' exited, see %2$s"),
+                           def->name, logfile);
+            return -1;
+        }
+        if (networkSwitchListening(sockpath))
+            break;
+        g_usleep(50 * 1000);
+    }
+    if (i == 100) {
+        virReportError(VIR_ERR_INTERNAL_ERROR,
+                       _("network switch of '%1$s' does not listen on %2$s, see %3$s"),
+                       def->name, sockpath, logfile);
+        virProcessKillPainfully(pid, true);
+        return -1;
+    }
+
+    virNetworkObjSetDnsmasqPid(obj, pid);
+    return 0;
+}
+
+
+/* networkRefreshDhcpDaemon:
+ *  Rewrite the network the switch reads, then send it a SIGHUP so that it
+ *  reloads its DHCP hosts and DNS records, as dnsmasq does.
+ */
+static int
+networkRefreshDhcpDaemon(virNetworkDriverState *driver,
+                         virNetworkObj *obj)
+{
+    pid_t pid = virNetworkObjGetDnsmasqPid(obj);
+
+    /* if there's no running switch, just start it */
+    if (pid <= 0 || virProcessKill(pid, 0) < 0)
+        return networkStartDhcpDaemon(driver, obj);
+
+    VIR_INFO("Refreshing network switch for network %s", virNetworkObjGetDef(obj)->bridge);
+    if (networkSwitchWriteConfig(driver, obj) < 0)
+        return -1;
+
+    return virProcessKill(pid, SIGHUP);
+}
+
+
+/* networkRestartDhcpDaemon:
+ *
+ * kill and restart the switch; the guests reconnect to it by themselves
+ * (reconnect-ms of their stream netdev).
+ *
+ *  Returns 0 on success, -1 on failure.
+ */
+static int
+networkRestartDhcpDaemon(virNetworkDriverState *driver,
+                         virNetworkObj *obj)
+{
+    pid_t pid = virNetworkObjGetDnsmasqPid(obj);
+
+    if (pid > 0) {
+        virProcessKillPainfully(pid, true);
+        virNetworkObjSetDnsmasqPid(obj, -1);
+    }
+    return networkStartDhcpDaemon(driver, obj);
+}
+#endif /* WIN32 */
 
 
 static int
@@ -1892,6 +2124,7 @@ networkReloadFirewallRules(virNetworkDriverState *driver,
 
 
 /* Enable IP Forwarding. Return 0 for success, -1 for failure. */
+#ifndef WIN32
 static int
 networkEnableIPForwarding(bool enableIPv4,
                           bool enableIPv6)
@@ -2001,6 +2234,7 @@ networkAddAddrToBridge(virNetworkObj *obj,
 
     return 0;
 }
+#endif /* !WIN32 */
 
 
 static int
@@ -2019,6 +2253,7 @@ networkStartHandleMACTableManagerMode(virNetworkObj *obj)
 
 
 /* add an IP (static) route to a bridge */
+#ifndef WIN32
 static int
 networkAddRouteToBridge(virNetworkObj *obj,
                         virNetDevIPRoute *routedef)
@@ -2275,6 +2510,73 @@ networkShutdownNetworkVirtual(virNetworkObj *obj)
 
     return 0;
 }
+#else /* WIN32 */
+
+static int
+networkStartNetworkVirtual(virNetworkDriverState *driver,
+                           virNetworkObj *obj)
+{
+    g_autoptr(virNetworkDriverConfig) cfg = virNetworkDriverGetConfig(driver);
+    virNetworkDef *def = virNetworkObjGetDef(obj);
+
+    if (!def->bridge) {
+        /* see the POSIX version: only possible with hand edited files */
+        virReportError(VIR_ERR_INTERNAL_ERROR,
+                       _("network '%1$s' has no bridge name defined"),
+                       def->name);
+        return -1;
+    }
+
+    /* nat and none: the gateway is libslirp in the switch; route and open:
+     * the host routes, through a Wintun adapter (wintun.dll beside the
+     * switch, and administrator rights) that is the bridge's interface */
+    if (def->forward.type == VIR_NETWORK_FORWARD_ROUTE ||
+        def->forward.type == VIR_NETWORK_FORWARD_OPEN) {
+        g_autofree char *binary = networkSwitchBinary();
+        g_autofree char *dir = g_path_get_dirname(binary);
+        g_autofree char *wintun = g_build_filename(dir, "wintun.dll", NULL);
+
+        if (!virFileExists(wintun)) {
+            virReportError(VIR_ERR_CONFIG_UNSUPPORTED,
+                           _("forward mode '%1$s' needs Wintun on this platform: %2$s is missing (https://www.wintun.net)"),
+                           virNetworkForwardTypeToString(def->forward.type), wintun);
+            return -1;
+        }
+    }
+    /* def->bandwidth is applied by the switch, which reads the network */
+
+    if (networkSetMacMap(cfg, obj) < 0)
+        return -1;
+
+    /* the switch is needed even without addresses: it links the guests */
+    if (networkStartDhcpDaemon(driver, obj) < 0) {
+        virNetworkObjUnrefMacMap(obj);
+        return -1;
+    }
+
+    return 0;
+}
+
+
+static int
+networkShutdownNetworkVirtual(virNetworkObj *obj)
+{
+    virNetworkDef *def = virNetworkObjGetDef(obj);
+    pid_t pid = virNetworkObjGetDnsmasqPid(obj);
+    g_autofree char *sockpath = virNetDevBridgeSwitchSocketPath(def->bridge);
+
+    virNetworkObjUnrefMacMap(obj);
+
+    if (pid > 0)
+        virProcessKillPainfully(pid, true);
+    virNetworkObjSetDnsmasqPid(obj, -1);
+
+    /* the switch removes it, unless it was killed */
+    unlink(sockpath);
+
+    return 0;
+}
+#endif /* WIN32 */
 
 
 static int

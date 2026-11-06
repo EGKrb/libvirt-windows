@@ -120,7 +120,6 @@ static int virNetSocketOnceInit(void)
 VIR_ONCE_GLOBAL_INIT(virNetSocket);
 
 
-#ifndef WIN32
 static int virNetSocketForkDaemon(const char *binary)
 {
     g_autofree char *binarypath = virFindFileInPath(binary);
@@ -145,7 +144,6 @@ static int virNetSocketForkDaemon(const char *binary)
     virCommandDaemonize(cmd);
     return virCommandRun(cmd, NULL);
 }
-#endif
 
 
 static int G_GNUC_UNUSED
@@ -476,7 +474,6 @@ int virNetSocketNewListenTCP(const char *nodename,
 }
 
 
-#ifndef WIN32
 int virNetSocketNewListenUNIX(const char *path,
                               mode_t mask,
                               uid_t user,
@@ -521,12 +518,18 @@ int virNetSocketNewListenUNIX(const char *path,
     /* chown() doesn't work for abstract sockets but we use them only
      * if libvirtd runs unprivileged
      */
+#ifndef WIN32
     if (grp != 0 && chown(path, user, grp)) {
         virReportSystemError(errno,
                              _("Failed to change ownership of '%1$s' to %2$d:%3$d"),
                              path, (int)user, (int)grp);
         goto error;
     }
+#else
+    /* no Unix owners: access is controlled by the ACL of the directory */
+    (void) user;
+    (void) grp;
+#endif
 
     if (!(*retsock = virNetSocketNew(&addr, NULL, false, fd, -1, 0, true)))
         goto error;
@@ -540,18 +543,6 @@ int virNetSocketNewListenUNIX(const char *path,
         closesocket(fd);
     return -1;
 }
-#else
-int virNetSocketNewListenUNIX(const char *path G_GNUC_UNUSED,
-                              mode_t mask G_GNUC_UNUSED,
-                              uid_t user G_GNUC_UNUSED,
-                              gid_t grp G_GNUC_UNUSED,
-                              virNetSocket **retsock G_GNUC_UNUSED)
-{
-    virReportSystemError(ENOSYS, "%s",
-                         _("UNIX sockets are not supported on this platform"));
-    return -1;
-}
-#endif
 
 int virNetSocketNewListenFD(int fd,
                             bool unlinkUNIX,
@@ -655,7 +646,6 @@ int virNetSocketNewConnectTCP(const char *nodename,
 }
 
 
-#ifndef WIN32
 int virNetSocketNewConnectUNIX(const char *path,
                                const char *spawnDaemonPath,
                                virNetSocket **retsock)
@@ -759,16 +749,6 @@ int virNetSocketNewConnectUNIX(const char *path,
 
     return ret;
 }
-#else
-int virNetSocketNewConnectUNIX(const char *path G_GNUC_UNUSED,
-                               const char *spawnDaemonPath G_GNUC_UNUSED,
-                               virNetSocket **retsock G_GNUC_UNUSED)
-{
-    virReportSystemError(ENOSYS, "%s",
-                         _("UNIX sockets are not supported on this platform"));
-    return -1;
-}
-#endif
 
 
 #ifndef WIN32
@@ -820,15 +800,52 @@ int virNetSocketNewConnectCommand(virCommand *cmd,
 
     return -1;
 }
-#else
-int virNetSocketNewConnectCommand(virCommand *cmd G_GNUC_UNUSED,
-                                  virNetSocket **retsock G_GNUC_UNUSED)
+#else /* WIN32 */
+/* The child uses its end of the pair as a plain file for stdin and stdout */
+int virNetSocketNewConnectCommand(virCommand *cmd,
+                                  virNetSocket **retsock)
 {
-    virReportSystemError(errno, "%s",
-                         _("Tunnelling sockets not supported on this platform"));
+    pid_t pid = 0;
+    int sv[2] = { -1, -1 };
+    int errfd[2] = { -1, -1 };
+
+    *retsock = NULL;
+
+    if (virSocketPair(sv) < 0) {
+        virReportSystemError(errno, "%s",
+                             _("unable to create socket pair"));
+        goto error;
+    }
+
+    if (virPipe(errfd) < 0)
+        goto error;
+
+    virCommandSetInputFD(cmd, sv[1]);
+    virCommandSetOutputFD(cmd, &sv[1]);
+    virCommandSetErrorFD(cmd, &errfd[1]);
+
+    if (virCommandRunAsync(cmd, &pid) < 0)
+        goto error;
+
+    VIR_FORCE_CLOSE(sv[1]);
+    VIR_FORCE_CLOSE(errfd[1]);
+
+    if (!(*retsock = virNetSocketNew(NULL, NULL, true, sv[0], errfd[0], pid, false)))
+        goto error;
+
+    return 0;
+
+ error:
+    VIR_FORCE_CLOSE(sv[0]);
+    VIR_FORCE_CLOSE(sv[1]);
+    VIR_FORCE_CLOSE(errfd[0]);
+    VIR_FORCE_CLOSE(errfd[1]);
+
+    virCommandAbort(cmd);
+
     return -1;
 }
-#endif
+#endif /* WIN32 */
 
 int virNetSocketNewConnectSSH(const char *nodename,
                               const char *service,
@@ -1290,13 +1307,11 @@ void virNetSocketDispose(void *obj)
         sock->watch = -1;
     }
 
-#ifndef WIN32
     /* If a server socket, then unlink UNIX path */
     if (sock->unlinkUNIX &&
         sock->localAddr.data.sa.sa_family == AF_UNIX &&
         sock->localAddr.data.un.sun_path[0] != '\0')
         unlink(sock->localAddr.data.un.sun_path);
-#endif
 
     /* Make sure it can't send any more I/O during shutdown */
     if (sock->tlsSession)
@@ -1531,6 +1546,90 @@ int virNetSocketGetUNIXIdentity(virNetSocket *sock,
     virObjectUnlock(sock);
     return ret;
 }
+#elif defined(WIN32)
+/* User SID of process @pid (or of ourselves if @pid is 0), to free with g_free */
+static PSID
+virNetSocketWin32ProcessUser(pid_t pid)
+{
+    HANDLE proc = pid ? OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid)
+                      : GetCurrentProcess();
+    HANDLE token = NULL;
+    DWORD len = 0;
+    g_autofree TOKEN_USER *user = NULL;
+    PSID sid = NULL;
+
+    if (!proc || !OpenProcessToken(proc, TOKEN_QUERY, &token))
+        goto cleanup;
+    GetTokenInformation(token, TokenUser, NULL, 0, &len);
+    user = g_malloc0(len);
+    if (!GetTokenInformation(token, TokenUser, user, len, &len))
+        goto cleanup;
+    len = GetLengthSid(user->User.Sid);
+    sid = g_malloc0(len);
+    CopySid(len, sid, user->User.Sid);
+
+ cleanup:
+    if (token)
+        CloseHandle(token);
+    if (pid && proc)
+        CloseHandle(proc);
+    return sid;
+}
+
+
+/*
+ * AF_UNIX sockets give the pid of the peer.  Windows has no uid: a peer
+ * running as the same user as the daemon gets the daemon's uid, any other
+ * user the relative identifier (RID) of its SID.
+ */
+int virNetSocketGetUNIXIdentity(virNetSocket *sock,
+                                uid_t *uid,
+                                gid_t *gid,
+                                pid_t *pid,
+                                unsigned long long *timestamp)
+{
+    SOCKET s;
+    ULONG peerpid = 0;
+    DWORD bytes = 0;
+    g_autofree void *peersid = NULL;
+    g_autofree void *selfsid = NULL;
+    int ret = -1;
+
+    virObjectLock(sock);
+
+    s = (SOCKET) _get_osfhandle(sock->fd);
+    if (WSAIoctl(s, SIO_AF_UNIX_GETPEERPID, NULL, 0, &peerpid, sizeof(peerpid),
+                 &bytes, NULL, NULL) != 0 || peerpid == 0) {
+        virReportSystemError(EINVAL, "%s",
+                             _("Failed to get client socket identity"));
+        goto cleanup;
+    }
+    if (virProcessGetStartTime(peerpid, timestamp) < 0)
+        goto cleanup;
+
+    peersid = virNetSocketWin32ProcessUser(peerpid);
+    selfsid = virNetSocketWin32ProcessUser(0);
+    if (!peersid || !selfsid) {
+        virReportSystemError(EACCES, "%s",
+                             _("Failed to get client socket identity"));
+        goto cleanup;
+    }
+    if (EqualSid(peersid, selfsid)) {
+        *uid = getuid();
+        *gid = getgid();
+    } else {
+        PUCHAR count = GetSidSubAuthorityCount(peersid);
+
+        *uid = *GetSidSubAuthority(peersid, *count - 1);
+        *gid = *uid;
+    }
+    *pid = peerpid;
+    ret = 0;
+
+ cleanup:
+    virObjectUnlock(sock);
+    return ret;
+}
 #else
 int virNetSocketGetUNIXIdentity(virNetSocket *sock G_GNUC_UNUSED,
                                 uid_t *uid G_GNUC_UNUSED,
@@ -1614,7 +1713,7 @@ static ssize_t virNetSocketTLSSessionWrite(const char *buf,
                                            void *opaque)
 {
     virNetSocket *sock = opaque;
-    return write(sock->fd, buf, len); /* sc_avoid_write */
+    return virSocketSend(sock->fd, buf, len);
 }
 
 
@@ -1623,7 +1722,7 @@ static ssize_t virNetSocketTLSSessionRead(char *buf,
                                           void *opaque)
 {
     virNetSocket *sock = opaque;
-    return read(sock->fd, buf, len);
+    return virSocketRecv(sock->fd, buf, len);
 }
 
 
@@ -1741,7 +1840,7 @@ static ssize_t virNetSocketReadWire(virNetSocket *sock, char *buf, size_t len)
         VIR_NET_TLS_HANDSHAKE_COMPLETE) {
         ret = virNetTLSSessionRead(sock->tlsSession, buf, len);
     } else {
-        ret = read(sock->fd, buf, len);
+        ret = virSocketRecv(sock->fd, buf, len);
     }
 
     if ((ret < 0) && (errno == EINTR))
@@ -1809,7 +1908,7 @@ static ssize_t virNetSocketWriteWire(virNetSocket *sock, const char *buf, size_t
         VIR_NET_TLS_HANDSHAKE_COMPLETE) {
         ret = virNetTLSSessionWrite(sock->tlsSession, buf, len);
     } else {
-        ret = write(sock->fd, buf, len); /* sc_avoid_write */
+        ret = virSocketSend(sock->fd, buf, len);
     }
 
     if (ret < 0) {
@@ -2220,7 +2319,6 @@ void virNetSocketClose(virNetSocket *sock)
         sock->fd = -1;
     }
 
-#ifndef WIN32
     /* If a server socket, then unlink UNIX path */
     if (sock->unlinkUNIX &&
         sock->localAddr.data.sa.sa_family == AF_UNIX &&
@@ -2228,7 +2326,6 @@ void virNetSocketClose(virNetSocket *sock)
         if (unlink(sock->localAddr.data.un.sun_path) == 0)
             sock->localAddr.data.un.sun_path[0] = '\0';
     }
-#endif
 
     virObjectUnlock(sock);
 }

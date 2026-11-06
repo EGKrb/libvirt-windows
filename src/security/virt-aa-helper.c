@@ -1301,22 +1301,22 @@ get_files(vahControl * ctl)
         /* Unix socket for QEMU and swtpm to use */
         virBufferAsprintf(&buf,
                           "  \"%s/libvirt/qemu/swtpm/%s-swtpm.sock\" rw,\n",
-                          RUNSTATEDIR, shortName);
+                          VIR_INSTALL_PATH(RUNSTATEDIR), shortName);
         /* Paths for swtpm to use: give it access to its state
          * directory (state files and fsync on dir), log, and PID files.
          */
         virBufferAsprintf(&buf,
                           "  \"%s/lib/libvirt/swtpm/%s/%s/\" r,\n",
-                          LOCALSTATEDIR, uuidstr, tpmpath);
+                          VIR_INSTALL_PATH(LOCALSTATEDIR), uuidstr, tpmpath);
         virBufferAsprintf(&buf,
                           "  \"%s/lib/libvirt/swtpm/%s/%s/**\" rwk,\n",
-                          LOCALSTATEDIR, uuidstr, tpmpath);
+                          VIR_INSTALL_PATH(LOCALSTATEDIR), uuidstr, tpmpath);
         virBufferAsprintf(&buf,
                           "  \"%s/log/swtpm/libvirt/qemu/%s-swtpm.log\" w,\n",
-                          LOCALSTATEDIR, ctl->def->name);
+                          VIR_INSTALL_PATH(LOCALSTATEDIR), ctl->def->name);
         virBufferAsprintf(&buf,
                           "  \"%s/libvirt/qemu/swtpm/%s-swtpm.pid\" rw,\n",
-                          RUNSTATEDIR, shortName);
+                          VIR_INSTALL_PATH(RUNSTATEDIR), shortName);
     }
 
     for (i = 0; i < ctl->def->nsmartcards; i++) {
@@ -1612,15 +1612,15 @@ main(int argc, char **argv)
                 ctl->def->virtType == VIR_DOMAIN_VIRT_KQEMU ||
                 ctl->def->virtType == VIR_DOMAIN_VIRT_KVM) {
                 virBufferAsprintf(&buf, "  \"%s/log/libvirt/**/%s.log\" w,\n",
-                                  LOCALSTATEDIR, ctl->def->name);
+                                  VIR_INSTALL_PATH(LOCALSTATEDIR), ctl->def->name);
                 virBufferAsprintf(&buf, "  \"%s/lib/libvirt/qemu/domain-%s/monitor.sock\" rw,\n",
-                                  LOCALSTATEDIR, ctl->def->name);
+                                  VIR_INSTALL_PATH(LOCALSTATEDIR), ctl->def->name);
                 virBufferAsprintf(&buf, "  \"%s/lib/libvirt/qemu/domain-%d-%.*s/*\" rw,\n",
-                                  LOCALSTATEDIR, ctl->def->id, 20, ctl->def->name);
+                                  VIR_INSTALL_PATH(LOCALSTATEDIR), ctl->def->id, 20, ctl->def->name);
                 virBufferAsprintf(&buf, "  \"%s/libvirt/**/%s.pid\" rwk,\n",
-                                  RUNSTATEDIR, ctl->def->name);
+                                  VIR_INSTALL_PATH(RUNSTATEDIR), ctl->def->name);
                 virBufferAsprintf(&buf, "  \"%s/libvirt/**/*.tunnelmigrate.dest.%s\" rw,\n",
-                                  RUNSTATEDIR, ctl->def->name);
+                                  VIR_INSTALL_PATH(RUNSTATEDIR), ctl->def->name);
             }
             if (ctl->files)
                 virBufferAdd(&buf, ctl->files, -1);

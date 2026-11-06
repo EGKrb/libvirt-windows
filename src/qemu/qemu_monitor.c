@@ -21,11 +21,14 @@
 
 #include <config.h>
 
-#include <poll.h>
+#ifndef WIN32
+# include <poll.h>
+#endif
 #include <unistd.h>
 #include <fcntl.h>
 #include <gio/gio.h>
 
+#include "virsocket.h"
 #include "qemu_alias.h"
 #include "qemu_monitor.h"
 #include "qemu_monitor_json.h"
@@ -211,7 +214,8 @@ qemuMonitorDispose(void *obj)
 
 
 static int
-qemuMonitorOpenUnix(const char *monitor)
+qemuMonitorOpenUnix(const char *monitor,
+                    pid_t pid G_GNUC_UNUSED)
 {
     struct sockaddr_un addr = { 0 };
     VIR_AUTOCLOSE monfd = -1;
@@ -230,11 +234,35 @@ qemuMonitorOpenUnix(const char *monitor)
         return -1;
     }
 
+#ifdef WIN32
+    {
+        /* QEMU creates the socket on Windows: wait, as long as it runs,
+         * until it listens (30 seconds) */
+        size_t i;
+
+        for (i = 0; connect(monfd, (struct sockaddr *) &addr, sizeof(addr)) < 0; i++) {
+            if (i >= 300 || (pid > 0 && virProcessKill(pid, 0) < 0)) {
+                virReportSystemError(errno, "%s",
+                                     _("failed to connect to monitor socket"));
+                return -1;
+            }
+            g_usleep(100 * 1000);
+
+            /* a socket whose connect() failed cannot be connected again */
+            closesocket(monfd);
+            if ((monfd = socket(AF_UNIX, SOCK_STREAM, 0)) < 0) {
+                virReportSystemError(errno, "%s", _("failed to create socket"));
+                return -1;
+            }
+        }
+    }
+#else
     if (connect(monfd, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
         virReportSystemError(errno, "%s",
                              _("failed to connect to monitor socket"));
         return -1;
     }
+#endif
 
     ret = monfd;
     monfd = -1;
@@ -318,7 +346,7 @@ qemuMonitorIOWrite(qemuMonitor *mon)
     buf = mon->msg->txBuffer + mon->msg->txOffset;
     len = mon->msg->txLength - mon->msg->txOffset;
     if (mon->msg->txFD == -1)
-        done = write(mon->fd, buf, len); /* sc_avoid_write */
+        done = virSocketSendWatched(mon->socket, mon->fd, buf, len);
     else
         done = qemuMonitorIOWriteWithFD(mon, buf, len, mon->msg->txFD);
 
@@ -373,9 +401,9 @@ qemuMonitorIORead(qemuMonitor *mon)
        until we block on EAGAIN, or hit EOF */
     while (avail > 1) {
         int got;
-        got = read(mon->fd,
-                   mon->buffer + mon->bufferOffset,
-                   avail - 1);
+        got = virSocketRecvWatched(mon->socket, mon->fd,
+                                   mon->buffer + mon->bufferOffset,
+                                   avail - 1);
         if (got < 0) {
             if (errno == EAGAIN)
                 break;
@@ -554,6 +582,7 @@ qemuMonitorOpenInternal(virDomainObj *vm,
     qemuDomainObjPrivate *priv = vm->privateData;
     qemuMonitor *mon;
     g_autoptr(GError) gerr = NULL;
+    int gfd;
 
     if (!cb->eofNotify) {
         virReportError(VIR_ERR_INTERNAL_ERROR, "%s",
@@ -595,8 +624,10 @@ qemuMonitorOpenInternal(virDomainObj *vm,
         goto cleanup;
     }
 
-    mon->socket = g_socket_new_from_fd(fd, &gerr);
+    gfd = virSocketGLibFD(fd);
+    mon->socket = g_socket_new_from_fd(gfd, &gerr);
     if (!mon->socket) {
+        virSocketGLibFDFree(gfd);
         virReportError(VIR_ERR_INTERNAL_ERROR,
                        _("Unable to create socket object: %1$s"),
                        gerr->message);
@@ -652,7 +683,7 @@ qemuMonitorOpen(virDomainObj *vm,
     }
 
     virObjectUnlock(vm);
-    fd = qemuMonitorOpenUnix(config->data.nix.path);
+    fd = qemuMonitorOpenUnix(config->data.nix.path, vm->pid);
     virObjectLock(vm);
 
     if (fd < 0)
@@ -748,6 +779,10 @@ qemuMonitorClose(qemuMonitor *mon)
     if (mon->socket) {
         qemuMonitorUnregister(mon);
         g_clear_pointer(&mon->socket, g_object_unref);
+#ifdef WIN32
+        /* the GSocket had its own handle, see virSocketGLibFD() */
+        VIR_FORCE_CLOSE(mon->fd);
+#endif
         mon->fd = -1;
     }
 

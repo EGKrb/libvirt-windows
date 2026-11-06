@@ -7417,7 +7417,7 @@ vboxDomainScreenshot(virDomainPtr dom,
     }
 
     if (privileged) {
-        cacheDir = g_strdup_printf("%s/cache/libvirt", LOCALSTATEDIR);
+        cacheDir = g_strdup_printf("%s/cache/libvirt", VIR_INSTALL_PATH(LOCALSTATEDIR));
     } else {
         cacheDir = virGetUserCacheDirectory();
     }

@@ -168,7 +168,7 @@ virHostdevManagerNew(void)
         return NULL;
 
     if (privileged) {
-        hostdevMgr->stateDir = g_strdup(HOSTDEV_STATE_DIR);
+        hostdevMgr->stateDir = g_strdup(VIR_INSTALL_PATH(HOSTDEV_STATE_DIR));
 
         if (g_mkdir_with_parents(hostdevMgr->stateDir, 0777) < 0) {
             virReportError(VIR_ERR_OPERATION_FAILED,

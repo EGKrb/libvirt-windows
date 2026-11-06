@@ -3397,7 +3397,6 @@ cmdBlockresize(vshControl *ctl, const vshCmd *cmd)
     return true;
 }
 
-#ifndef WIN32
 /*
  * "console" command
  */
@@ -3481,7 +3480,6 @@ cmdConsole(vshControl *ctl, const vshCmd *cmd)
 
     return cmdRunConsole(ctl, dom, name, resume, flags);
 }
-#endif /* WIN32 */
 
 /* "domif-setlink" command
  */
@@ -4477,12 +4475,10 @@ static const vshCmdInfo info_start = {
 static const vshCmdOptDef opts_start[] = {
     VIRSH_COMMON_OPT_DOMAIN(N_("name of the inactive domain"),
                             VIR_CONNECT_LIST_DOMAINS_SHUTOFF),
-#ifndef WIN32
     {.name = "console",
      .type = VSH_OT_BOOL,
      .help = N_("attach to console after creation")
     },
-#endif
     {.name = "paused",
      .type = VSH_OT_BOOL,
      .help = N_("leave the guest paused after creation")
@@ -4532,10 +4528,8 @@ static bool
 cmdStart(vshControl *ctl, const vshCmd *cmd)
 {
     g_autoptr(virshDomain) dom = NULL;
-#ifndef WIN32
     bool console = vshCommandOptBool(cmd, "console");
     bool resume_domain = false;
-#endif
     unsigned int flags = VIR_DOMAIN_NONE;
     int rc;
     size_t nfds = 0;
@@ -4555,11 +4549,9 @@ cmdStart(vshControl *ctl, const vshCmd *cmd)
 
     if (vshCommandOptBool(cmd, "paused")) {
         flags |= VIR_DOMAIN_START_PAUSED;
-#ifndef WIN32
     } else if (console) {
         flags |= VIR_DOMAIN_START_PAUSED;
         resume_domain = true;
-#endif
     }
     if (vshCommandOptBool(cmd, "autodestroy"))
         flags |= VIR_DOMAIN_START_AUTODESTROY;
@@ -4596,7 +4588,6 @@ cmdStart(vshControl *ctl, const vshCmd *cmd)
     }
 
     rc = virshDomainCreateHelper(dom, nfds, fds, flags);
-#ifndef WIN32
     /* If the driver does not support the paused flag, let's fallback to the old
      * behavior without the flag. */
     if (rc < 0 && resume_domain &&
@@ -4608,7 +4599,6 @@ cmdStart(vshControl *ctl, const vshCmd *cmd)
         resume_domain = false;
         rc = virshDomainCreateHelper(dom, nfds, fds, flags);
     }
-#endif
 
     if (rc < 0) {
         vshError(ctl, _("Failed to start domain '%1$s'"), virDomainGetName(dom));
@@ -4618,10 +4608,8 @@ cmdStart(vshControl *ctl, const vshCmd *cmd)
  started:
     vshPrintExtra(ctl, _("Domain '%1$s' started\n"),
                   virDomainGetName(dom));
-#ifndef WIN32
     if (console && !cmdRunConsole(ctl, dom, NULL, resume_domain, 0))
         return false;
-#endif
 
     return true;
 }
@@ -8627,12 +8615,10 @@ static const vshCmdInfo info_create = {
 
 static const vshCmdOptDef opts_create[] = {
     VIRSH_COMMON_OPT_FILE(N_("file containing an XML domain description")),
-#ifndef WIN32
     {.name = "console",
      .type = VSH_OT_BOOL,
      .help = N_("attach to console after creation")
     },
-#endif
     {.name = "paused",
      .type = VSH_OT_BOOL,
      .help = N_("leave the guest paused after creation")
@@ -8678,10 +8664,8 @@ cmdCreate(vshControl *ctl, const vshCmd *cmd)
     g_autoptr(virshDomain) dom = NULL;
     const char *from = NULL;
     g_autofree char *buffer = NULL;
-#ifndef WIN32
     bool console = vshCommandOptBool(cmd, "console");
     bool resume_domain = false;
-#endif
     unsigned int flags = 0;
     size_t nfds = 0;
     g_autofree int *fds = NULL;
@@ -8698,11 +8682,9 @@ cmdCreate(vshControl *ctl, const vshCmd *cmd)
 
     if (vshCommandOptBool(cmd, "paused")) {
         flags |= VIR_DOMAIN_START_PAUSED;
-#ifndef WIN32
     } else if (console) {
         flags |= VIR_DOMAIN_START_PAUSED;
         resume_domain = true;
-#endif
     }
     if (vshCommandOptBool(cmd, "autodestroy"))
         flags |= VIR_DOMAIN_START_AUTODESTROY;
@@ -8712,7 +8694,6 @@ cmdCreate(vshControl *ctl, const vshCmd *cmd)
         flags |= VIR_DOMAIN_START_RESET_NVRAM;
 
     dom = virshDomainCreateXMLHelper(priv->conn, buffer, nfds, fds, flags);
-#ifndef WIN32
     /* If the driver does not support the paused flag, let's fallback to the old
      * behavior without the flag. */
     if (!dom && resume_domain && last_error && last_error->code == VIR_ERR_INVALID_ARG) {
@@ -8722,7 +8703,6 @@ cmdCreate(vshControl *ctl, const vshCmd *cmd)
       resume_domain = false;
       dom = virshDomainCreateXMLHelper(priv->conn, buffer, nfds, fds, flags);
     }
-#endif
 
     if (!dom) {
         vshError(ctl, _("Failed to create domain from %1$s"), from);
@@ -8731,10 +8711,8 @@ cmdCreate(vshControl *ctl, const vshCmd *cmd)
 
     vshPrintExtra(ctl, _("Domain '%1$s' created from %2$s\n"),
                   virDomainGetName(dom), from);
-#ifndef WIN32
     if (console)
         cmdRunConsole(ctl, dom, NULL, resume_domain, 0);
-#endif
     return true;
 }
 
@@ -14185,14 +14163,12 @@ const vshCmdDef domManagementCmds[] = {
      .info = &info_change_media,
      .flags = 0
     },
-#ifndef WIN32
     {.name = "console",
      .handler = cmdConsole,
      .opts = opts_console,
      .info = &info_console,
      .flags = 0
     },
-#endif
     {.name = "cpu-stats",
      .handler = cmdCPUStats,
      .opts = opts_cpu_stats,

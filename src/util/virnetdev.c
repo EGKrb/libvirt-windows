@@ -34,6 +34,11 @@
 #include "virutil.h"
 #include "virjson.h"
 
+#ifdef WIN32
+# include "virnetdevbridge.h"
+# include <iphlpapi.h>
+#endif
+
 #ifndef WIN32
 # include <sys/ioctl.h>
 #endif
@@ -215,6 +220,40 @@ int virNetDevExists(const char *ifname)
     }
 
     return 1;
+}
+#elif defined(WIN32)
+/* A device is a switch of a libvirt network (its bridge) or an adapter of
+ * the host, by its name in the Network Connections of Windows */
+int virNetDevExists(const char *ifname)
+{
+    g_autofree char *sock = virNetDevBridgeSwitchSocketPath(ifname);
+    g_autofree wchar_t *wname = g_utf8_to_utf16(ifname, -1, NULL, NULL, NULL);
+    g_autofree IP_ADAPTER_ADDRESSES *addrs = NULL;
+    IP_ADAPTER_ADDRESSES *a;
+    ULONG size = 16 * 1024;
+    ULONG rc;
+
+    if (virFileExists(sock))
+        return 1;
+
+    do {
+        g_free(addrs);
+        addrs = g_malloc(size);
+        rc = GetAdaptersAddresses(AF_UNSPEC,
+                                  GAA_FLAG_SKIP_UNICAST | GAA_FLAG_SKIP_ANYCAST |
+                                  GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER,
+                                  NULL, addrs, &size);
+    } while (rc == ERROR_BUFFER_OVERFLOW);
+
+    if (rc != NO_ERROR) {
+        virReportSystemError(EIO, _("Unable to check interface %1$s"), ifname);
+        return -1;
+    }
+    for (a = addrs; a; a = a->Next) {
+        if (wname && a->FriendlyName && wcscmp(a->FriendlyName, wname) == 0)
+            return 1;
+    }
+    return 0;
 }
 #else
 int virNetDevExists(const char *ifname)

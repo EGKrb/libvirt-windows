@@ -35,12 +35,13 @@
 # include <sys/cpuset.h>
 #endif
 
-#include <sys/utsname.h>
 
 #if WITH_CAPNG
 # include <cap-ng.h>
 #endif
 
+#include "virutsname.h"
+#include "virsocket.h"
 #include "qemu_process.h"
 #define LIBVIRT_QEMU_PROCESSPRIV_H_ALLOW
 #include "qemu_processpriv.h"
@@ -2507,7 +2508,7 @@ qemuProcessWaitForMonitor(virQEMUDriver *driver,
     }
 
  cleanup:
-    if (logCtxt && kill(vm->pid, 0) == -1 && errno == ESRCH) {
+    if (logCtxt && virProcessKill(vm->pid, 0) == -1 && errno == ESRCH) {
         qemuProcessReportLogError(logCtxt,
                                   _("process exited while connecting to monitor"));
         ret = -1;
@@ -7621,6 +7622,11 @@ qemuProcessPrepareHostBackendChardevOne(virDomainDeviceDef *dev,
         break;
 
     case VIR_DOMAIN_CHR_TYPE_UNIX:
+#ifdef WIN32
+        /* Descriptors cannot be handed to QEMU on Windows: QEMU creates the
+         * listening socket from its path, see qemuMonitorOpenUnix() */
+        break;
+#endif
         if (chardev->data.nix.listen) {
             g_autofree char *name = g_strdup_printf("%s-source", devalias);
             VIR_AUTOCLOSE sourcefd = -1;
@@ -10437,9 +10443,66 @@ qemuProcessQMPInit(qemuProcessQMP *proc)
 # define hwaccel "kvm:mshv:tcg"
 #elif defined(__APPLE__)
 # define hwaccel "hvf:tcg"
+#elif defined(WIN32)
+# define hwaccel "whpx:tcg"
 #else
 # define hwaccel "tcg"
 #endif
+
+#ifdef WIN32
+/*
+ * Without -daemonize, nothing tells when QEMU is ready: wait, as long as it
+ * runs, until its QMP socket accepts a connection (QMP accepts a new client
+ * once the previous one is gone).
+ */
+static int
+qemuProcessQMPWaitMonitor(qemuProcessQMP *proc)
+{
+    struct sockaddr_un addr = { .sun_family = AF_UNIX };
+    size_t i;
+
+    if (virStrcpyStatic(addr.sun_path, proc->monpath) < 0) {
+        virReportError(VIR_ERR_INTERNAL_ERROR,
+                       _("Monitor path %1$s too big for destination"),
+                       proc->monpath);
+        return -1;
+    }
+
+    /* 30 seconds */
+    for (i = 0; i < 300; i++) {
+        int fd;
+
+        if (virProcessKill(proc->pid, 0) < 0) {
+            int status = 0;
+
+            /* gives the whole stderr of QEMU */
+            ignore_value(virCommandWait(proc->cmd, &status));
+            proc->pid = 0;
+            virReportError(VIR_ERR_INTERNAL_ERROR,
+                           _("Failed to start QEMU binary %1$s for probing: %2$s"),
+                           proc->binary,
+                           proc->stdErr && *proc->stdErr ? proc->stdErr
+                                                         : _("unknown error"));
+            return -1;
+        }
+
+        if ((fd = socket(AF_UNIX, SOCK_STREAM, 0)) >= 0) {
+            int rc = connect(fd, (struct sockaddr *) &addr, sizeof(addr));
+
+            closesocket(fd);
+            if (rc == 0)
+                return 0;
+        }
+        g_usleep(100 * 1000);
+    }
+
+    virReportError(VIR_ERR_INTERNAL_ERROR,
+                   _("QEMU binary %1$s did not open its monitor for probing"),
+                   proc->binary);
+    return -1;
+}
+#endif /* WIN32 */
+
 
 static int
 qemuProcessQMPLaunch(qemuProcessQMP *proc)
@@ -10471,8 +10534,11 @@ qemuProcessQMPLaunch(qemuProcessQMP *proc)
                                      "-machine", machine,
                                      "-qmp", proc->monarg,
                                      "-pidfile", proc->pidfile,
-                                     "-daemonize",
                                     NULL);
+#ifndef WIN32
+    /* QEMU for Windows cannot daemonize: see qemuProcessQMPWaitMonitor() */
+    virCommandAddArg(proc->cmd, "-daemonize");
+#endif
     virCommandAddEnvPassCommon(proc->cmd);
     virCommandClearCaps(proc->cmd);
 
@@ -10487,6 +10553,13 @@ qemuProcessQMPLaunch(qemuProcessQMP *proc)
     virCommandSetUID(proc->cmd, proc->runUid);
 
     virCommandSetErrorBuffer(proc->cmd, &(proc->stdErr));
+
+#ifdef WIN32
+    virCommandDoAsyncIO(proc->cmd);
+    if (virCommandRunAsync(proc->cmd, &proc->pid) < 0)
+        return -1;
+    return qemuProcessQMPWaitMonitor(proc);
+#endif
 
     if (virCommandRun(proc->cmd, &status) < 0)
         return -1;

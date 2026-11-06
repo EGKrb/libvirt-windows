@@ -174,20 +174,20 @@ virQEMUDriverConfig *virQEMUDriverConfigNew(bool privileged,
         cfg->varstoreDir = g_strdup_printf("%s/varstore", cfg->libDir);
         cfg->memoryBackingDir = g_strdup_printf("%s/ram", cfg->libDir);
     } else if (privileged) {
-        cfg->logDir = g_strdup_printf("%s/log/libvirt/qemu", LOCALSTATEDIR);
+        cfg->logDir = g_strdup_printf("%s/log/libvirt/qemu", VIR_INSTALL_PATH(LOCALSTATEDIR));
 
         cfg->swtpmLogDir = g_strdup_printf("%s/log/swtpm/libvirt/qemu",
-                                           LOCALSTATEDIR);
+                                           VIR_INSTALL_PATH(LOCALSTATEDIR));
 
-        cfg->configBaseDir = g_strdup(SYSCONFDIR "/libvirt");
+        cfg->configBaseDir = g_strdup(VIR_INSTALL_PATH(SYSCONFDIR "/libvirt"));
 
-        cfg->stateDir = g_strdup_printf("%s/libvirt/qemu", RUNSTATEDIR);
+        cfg->stateDir = g_strdup_printf("%s/libvirt/qemu", VIR_INSTALL_PATH(RUNSTATEDIR));
         cfg->swtpmStateDir = g_strdup_printf("%s/swtpm", cfg->stateDir);
         cfg->channelTargetDir = g_strdup_printf("%s/channel", cfg->stateDir);
 
-        cfg->cacheDir = g_strdup_printf("%s/cache/libvirt/qemu", LOCALSTATEDIR);
+        cfg->cacheDir = g_strdup_printf("%s/cache/libvirt/qemu", VIR_INSTALL_PATH(LOCALSTATEDIR));
 
-        cfg->libDir = g_strdup_printf("%s/lib/libvirt/qemu", LOCALSTATEDIR);
+        cfg->libDir = g_strdup_printf("%s/lib/libvirt/qemu", VIR_INSTALL_PATH(LOCALSTATEDIR));
         cfg->saveDir = g_strdup_printf("%s/save", cfg->libDir);
         cfg->snapshotDir = g_strdup_printf("%s/snapshot", cfg->libDir);
         cfg->checkpointDir = g_strdup_printf("%s/checkpoint", cfg->libDir);
@@ -196,7 +196,7 @@ virQEMUDriverConfig *virQEMUDriverConfigNew(bool privileged,
         cfg->varstoreDir = g_strdup_printf("%s/varstore", cfg->libDir);
         cfg->memoryBackingDir = g_strdup_printf("%s/ram", cfg->libDir);
         cfg->swtpmStorageDir = g_strdup_printf("%s/lib/libvirt/swtpm",
-                                               LOCALSTATEDIR);
+                                               VIR_INSTALL_PATH(LOCALSTATEDIR));
     } else {
         g_autofree char *rundir = NULL;
         g_autofree char *cachedir = NULL;
@@ -252,7 +252,7 @@ virQEMUDriverConfig *virQEMUDriverConfigNew(bool privileged,
      * directory doesn't exist (although we don't check if this exists).
      */
     if (root == NULL) {
-        cfg->defaultTLSx509certdir = g_strdup(SYSCONFDIR "/pki/qemu");
+        cfg->defaultTLSx509certdir = g_strdup(VIR_INSTALL_PATH(SYSCONFDIR "/pki/qemu"));
     } else {
         cfg->defaultTLSx509certdir = g_strdup_printf("%s/etc/pki/qemu", root);
     }
@@ -302,7 +302,12 @@ virQEMUDriverConfig *virQEMUDriverConfigNew(bool privileged,
 
     cfg->logTimestamp = true;
     cfg->glusterDebugLevel = 4;
+#ifdef WIN32
+    /* virtlogd hands its log files over SCM_RIGHTS, which Windows lacks */
+    cfg->stdioLogD = false;
+#else
     cfg->stdioLogD = true;
+#endif
 
     cfg->namespaces = virBitmapNew(QEMU_DOMAIN_NS_LAST);
 
@@ -1562,8 +1567,8 @@ virQEMUDriverConfigSetDefaults(virQEMUDriverConfig *cfg)
     do { \
         if (cfg->val ## TLSx509certdir) \
             break; \
-        if (virFileExists(SYSCONFDIR "/pki/libvirt-"#val)) { \
-            cfg->val ## TLSx509certdir = g_strdup(SYSCONFDIR "/pki/libvirt-"#val); \
+        if (virFileExists(VIR_INSTALL_PATH(SYSCONFDIR "/pki/libvirt-"#val))) { \
+            cfg->val ## TLSx509certdir = g_strdup(VIR_INSTALL_PATH(SYSCONFDIR "/pki/libvirt-"#val)); \
         } else { \
             cfg->val ## TLSx509certdir = g_strdup(cfg->defaultTLSx509certdir); \
         } \

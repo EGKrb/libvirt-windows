@@ -402,7 +402,7 @@ static int virLockManagerSanlockInit(unsigned int version,
     driver->io_timeout = 0;
     driver->user = (uid_t) -1;
     driver->group = (gid_t) -1;
-    driver->autoDiskLeasePath = g_strdup(LOCALSTATEDIR "/lib/libvirt/sanlock");
+    driver->autoDiskLeasePath = g_strdup(VIR_INSTALL_PATH(LOCALSTATEDIR "/lib/libvirt/sanlock"));
 
     if (virLockManagerSanlockLoadConfig(driver, configFile) < 0)
         goto error;
@@ -808,7 +808,7 @@ virLockManagerSanlockRegisterKillscript(int sock,
      * path or args even though it will just copy them into its own
      * buffers.
      */
-    path = (char *) VIR_LOCK_MANAGER_SANLOCK_KILLPATH;
+    path = (char *) VIR_INSTALL_PATH(VIR_LOCK_MANAGER_SANLOCK_KILLPATH);
     args = virBufferContentAndReset(&buf);
 
     VIR_DEBUG("Register sanlock killpath: %s %s", path, args);

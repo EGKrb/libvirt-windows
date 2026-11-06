@@ -621,7 +621,7 @@ static int lxcContainerPrepareRoot(virDomainDef *def,
     if (lxcContainerResolveSymlinks(root, false) < 0)
         return -1;
 
-    dst = g_strdup_printf("%s/%s.root", LXC_STATE_DIR, def->name);
+    dst = g_strdup_printf("%s/%s.root", VIR_INSTALL_PATH(LXC_STATE_DIR), def->name);
 
     tmp = root->dst;
     root->dst = dst;
@@ -1597,7 +1597,7 @@ static int lxcContainerSetupPivotRoot(virDomainDef *vmDef,
     if (virCgroupNewSelf(&cgroup) < 0)
         return -1;
 
-    if (virFileResolveAllLinks(LXC_STATE_DIR, &stateDir) < 0)
+    if (virFileResolveAllLinks(VIR_INSTALL_PATH(LXC_STATE_DIR), &stateDir) < 0)
         return -1;
 
     /* Ensure the root filesystem is mounted */
@@ -1978,7 +1978,7 @@ static int lxcContainerChild(void *data)
         const char *tty = argv->ttyPaths[0];
         if (STRPREFIX(tty, "/dev/pts/"))
             tty += strlen("/dev/pts/");
-        ttyPath = g_strdup_printf("%s/%s.devpts/%s", LXC_STATE_DIR, vmDef->name,
+        ttyPath = g_strdup_printf("%s/%s.devpts/%s", VIR_INSTALL_PATH(LXC_STATE_DIR), vmDef->name,
                                   tty);
     } else {
         virReportError(VIR_ERR_INTERNAL_ERROR, "%s",

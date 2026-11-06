@@ -153,10 +153,10 @@ main(int argc, char **argv)
 
     server_duid = g_strdup(g_getenv("DNSMASQ_SERVER_DUID"));
 
-    custom_lease_file = g_strdup_printf(LOCALSTATEDIR "/lib/libvirt/dnsmasq/%s.status",
+    custom_lease_file = g_strdup_printf("%s/lib/libvirt/dnsmasq/%s.status", VIR_INSTALL_PATH(LOCALSTATEDIR),
                                         interface);
 
-    pid_file = g_strdup(RUNSTATEDIR "/leaseshelper.pid");
+    pid_file = g_strdup(VIR_INSTALL_PATH(RUNSTATEDIR "/leaseshelper.pid"));
 
     /* Try to claim the pidfile, exiting if we can't */
     if ((pid_file_fd = virPidFileAcquirePathFull(pid_file, true, false, getpid())) < 0) {

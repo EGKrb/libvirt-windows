@@ -1,0 +1,3 @@
+[submodule "subprojects/keycodemapdb"]
+	path = subprojects/keycodemapdb
+	url = https://gitlab.com/qemu-project/keycodemapdb.git

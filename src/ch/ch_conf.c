@@ -175,10 +175,10 @@ virCHDriverConfigNew(bool privileged)
     }
 
     if (privileged) {
-        cfg->logDir = g_strdup_printf("%s/log/libvirt/ch", LOCALSTATEDIR);
-        cfg->stateDir = g_strdup_printf("%s/libvirt/ch", RUNSTATEDIR);
-        cfg->saveDir = g_strdup_printf("%s/lib/libvirt/ch/save", LOCALSTATEDIR);
-        cfg->configDir = g_strdup(SYSCONFDIR "/libvirt");
+        cfg->logDir = g_strdup_printf("%s/log/libvirt/ch", VIR_INSTALL_PATH(LOCALSTATEDIR));
+        cfg->stateDir = g_strdup_printf("%s/libvirt/ch", VIR_INSTALL_PATH(RUNSTATEDIR));
+        cfg->saveDir = g_strdup_printf("%s/lib/libvirt/ch/save", VIR_INSTALL_PATH(LOCALSTATEDIR));
+        cfg->configDir = g_strdup(VIR_INSTALL_PATH(SYSCONFDIR "/libvirt"));
     } else {
         g_autofree char *rundir = NULL;
         g_autofree char *cachedir = NULL;

@@ -506,8 +506,8 @@ secretStateInitialize(bool privileged,
         driver->configDir = g_strdup_printf("%s/etc/secrets", root);
         driver->stateDir = g_strdup_printf("%s/run/secrets", root);
     } else if (privileged) {
-        driver->configDir = g_strdup_printf("%s/libvirt/secrets", SYSCONFDIR);
-        driver->stateDir = g_strdup_printf("%s/libvirt/secrets", RUNSTATEDIR);
+        driver->configDir = g_strdup_printf("%s/libvirt/secrets", VIR_INSTALL_PATH(SYSCONFDIR));
+        driver->stateDir = g_strdup_printf("%s/libvirt/secrets", VIR_INSTALL_PATH(RUNSTATEDIR));
     } else {
         g_autofree char *rundir = NULL;
         g_autofree char *cfgdir = NULL;

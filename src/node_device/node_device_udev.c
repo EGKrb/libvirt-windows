@@ -2536,7 +2536,7 @@ nodeStateInitialize(bool privileged,
     driver->privileged = privileged;
 
     if (privileged) {
-        driver->stateDir = g_strdup_printf("%s/libvirt/nodedev", RUNSTATEDIR);
+        driver->stateDir = g_strdup_printf("%s/libvirt/nodedev", VIR_INSTALL_PATH(RUNSTATEDIR));
     } else {
         g_autofree char *rundir = NULL;
 

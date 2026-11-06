@@ -834,9 +834,7 @@ doRemoteOpenExtractURIArgs(virConnectPtr conn,
                            char **tls_priority,
                            char **mode_str,
                            char **proxy_str,
-#ifndef WIN32
                            bool *tty,
-#endif
                            bool *sanity,
                            bool *verify)
 {
@@ -867,9 +865,7 @@ doRemoteOpenExtractURIArgs(virConnectPtr conn,
         EXTRACT_URI_ARG_STR("proxy", *proxy_str);
         EXTRACT_URI_ARG_BOOL("no_sanity", *sanity);
         EXTRACT_URI_ARG_BOOL("no_verify", *verify);
-#ifndef WIN32
         EXTRACT_URI_ARG_BOOL("no_tty", *tty);
-#endif
 
         if (STRCASEEQ(var->name, "authfile")) {
             /* Strip this param, used by virauth.c */
@@ -937,9 +933,7 @@ doRemoteOpen(virConnectPtr conn,
     g_autofree char *virtSshURI = NULL;
     bool sanity = true;
     bool verify = true;
-#ifndef WIN32
     bool tty = true;
-#endif
     int mode;
     int proxy;
 
@@ -983,9 +977,7 @@ doRemoteOpen(virConnectPtr conn,
                                        &tls_priority,
                                        &mode_str,
                                        &proxy_str,
-#ifndef WIN32
                                        &tty,
-#endif
                                        &sanity,
                                        &verify) < 0) {
             goto error;
@@ -1191,7 +1183,6 @@ doRemoteOpen(virConnectPtr conn,
         priv->is_secure = 1;
         break;
 
-#ifndef WIN32
     case REMOTE_DRIVER_TRANSPORT_UNIX:
         if (!(priv->client = virNetClientNewUNIX(sockname,
                                                  daemon_path)))
@@ -1242,16 +1233,6 @@ doRemoteOpen(virConnectPtr conn,
          * pessimistic */
     }   break;
 
-#else /* WIN32 */
-
-    case REMOTE_DRIVER_TRANSPORT_UNIX:
-    case REMOTE_DRIVER_TRANSPORT_SSH:
-    case REMOTE_DRIVER_TRANSPORT_EXT:
-        virReportError(VIR_ERR_INVALID_ARG, "%s",
-                       _("transport methods unix, ssh and ext are not supported under Windows"));
-        goto error;
-
-#endif /* WIN32 */
 
     case REMOTE_DRIVER_TRANSPORT_LAST:
     default:

@@ -26,6 +26,10 @@
 #include <sys/time.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#ifdef WIN32
+# define WIN32_LEAN_AND_MEAN
+# include <windows.h>
+#endif
 
 #include "internal.h"
 #include "virerror.h"
@@ -876,6 +880,10 @@ main(int argc, char **argv)
 
 #ifndef WIN32
         if (tcgetattr(STDIN_FILENO, &ctl->termattr) < 0)
+            ctl->istty = false;
+#else
+        /* NUL is a character device too: only a console is a terminal */
+        if (!GetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), &ctl->conInMode))
             ctl->istty = false;
 #endif
     }

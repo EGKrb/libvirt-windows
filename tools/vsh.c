@@ -27,6 +27,10 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <signal.h>
+#ifdef WIN32
+# define WIN32_LEAN_AND_MEAN
+# include <windows.h>
+#endif
 
 #if WITH_READLINE
 /* In order to have proper rl_message declaration with older
@@ -2079,6 +2083,13 @@ vshTTYRestore(vshControl *ctl G_GNUC_UNUSED)
 
     if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &ctl->termattr) < 0)
         return -1;
+#else
+    if (ctl->conModeSaved) {
+        SetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), ctl->conInMode);
+        if (ctl->conOutMode)
+            SetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), ctl->conOutMode);
+        ctl->conModeSaved = false;
+    }
 #endif
 
     return 0;
@@ -2110,6 +2121,37 @@ vshTTYMakeRaw(vshControl *ctl G_GNUC_UNUSED,
                      g_strerror(errno));
         return -1;
     }
+#else
+    HANDLE in = GetStdHandle(STD_INPUT_HANDLE);
+    HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
+    DWORD inmode;
+    DWORD outmode;
+
+    if (!ctl->istty || !GetConsoleMode(in, &inmode)) {
+        if (report_errors) {
+            vshError(ctl, "%s",
+                     _("unable to make terminal raw: console isn't a tty"));
+        }
+
+        return -1;
+    }
+    ctl->conInMode = inmode;
+    ctl->conOutMode = GetConsoleMode(out, &outmode) ? outmode : 0;
+    ctl->conModeSaved = true;
+
+    /* As cfmakeraw(): no echo, line editing nor Ctrl+C processing, and keys
+     * come as the escape sequences of a terminal */
+    if (!SetConsoleMode(in, ENABLE_VIRTUAL_TERMINAL_INPUT)) {
+        if (report_errors)
+            vshError(ctl, "%s", _("unable to set tty attributes"));
+        return -1;
+    }
+    /* the escape sequences of the guest are interpreted, and a line feed
+     * does not imply a carriage return (no OPOST) */
+    if (ctl->conOutMode)
+        SetConsoleMode(out, ctl->conOutMode | ENABLE_PROCESSED_OUTPUT |
+                       ENABLE_VIRTUAL_TERMINAL_PROCESSING |
+                       DISABLE_NEWLINE_AUTO_RETURN);
 #endif
 
     return 0;

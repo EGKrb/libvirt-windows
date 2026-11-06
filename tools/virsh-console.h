@@ -20,9 +20,7 @@
 
 #pragma once
 
-#ifndef WIN32
-
-# include <virsh.h>
+#include <virsh.h>
 
 int virshRunConsole(vshControl *ctl,
                     virDomainPtr dom,
@@ -30,4 +28,3 @@ int virshRunConsole(vshControl *ctl,
                     const bool resume_domain,
                     unsigned int flags);
 
-#endif /* !WIN32 */

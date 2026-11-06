@@ -166,10 +166,10 @@ virNWFilterDriverConfigNew(bool privileged)
     if (!privileged)
         return g_steal_pointer(&cfg);
 
-    cfg->stateDir = g_strdup(RUNSTATEDIR "/libvirt/nwfilter");
-    cfg->configDir = g_strdup(SYSCONFDIR "/libvirt/nwfilter");
-    cfg->bindingDir = g_strdup(RUNSTATEDIR "/libvirt/nwfilter-binding");
-    configfile = g_strdup(SYSCONFDIR "/libvirt/nwfilter.conf");
+    cfg->stateDir = g_strdup(VIR_INSTALL_PATH(RUNSTATEDIR "/libvirt/nwfilter"));
+    cfg->configDir = g_strdup(VIR_INSTALL_PATH(SYSCONFDIR "/libvirt/nwfilter"));
+    cfg->bindingDir = g_strdup(VIR_INSTALL_PATH(RUNSTATEDIR "/libvirt/nwfilter-binding"));
+    configfile = g_strdup(VIR_INSTALL_PATH(SYSCONFDIR "/libvirt/nwfilter.conf"));
 
     if (virNWFilterLoadDriverConfig(cfg, configfile) < 0)
         return NULL;

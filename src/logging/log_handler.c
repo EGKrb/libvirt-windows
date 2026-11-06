@@ -31,7 +31,13 @@
 
 #include <unistd.h>
 #include <fcntl.h>
-#include <poll.h>
+#ifdef WIN32
+# define WIN32_LEAN_AND_MEAN
+# include <windows.h>
+# include <io.h>
+#else
+# include <poll.h>
+#endif
 
 #include "configmake.h"
 
@@ -410,28 +416,35 @@ virLogHandlerDomainOpenLogFile(virLogHandler *handler,
 }
 
 
+/* Whether reading the pipe @fd would not block: 1 if so, 0 if not, -1 on error */
+static int
+virLogHandlerPipeReadable(int fd)
+{
+#ifdef WIN32
+    DWORD avail = 0;
+
+    if (!PeekNamedPipe((HANDLE)_get_osfhandle(fd), NULL, 0, NULL, &avail, NULL))
+        return GetLastError() == ERROR_BROKEN_PIPE ? 1 : -1;  /* EOF */
+    return avail > 0;
+#else
+    struct pollfd pfd = { .fd = fd, .events = POLLIN };
+    int ret;
+
+    while ((ret = poll(&pfd, 1, 0)) < 0 && errno == EINTR)
+        ;
+    return ret;
+#endif
+}
+
+
 static void
 virLogHandlerDomainLogFileDrain(virLogHandlerLogFile *file)
 {
     char buf[1024];
     ssize_t len;
-    struct pollfd pfd;
-    int ret;
 
     for (;;) {
-        pfd.fd = file->pipefd;
-        pfd.events = POLLIN;
-        pfd.revents = 0;
-
-        ret = poll(&pfd, 1, 0);
-        if (ret < 0) {
-            if (errno == EINTR)
-                continue;
-
-            return;
-        }
-
-        if (ret == 0)
+        if (virLogHandlerPipeReadable(file->pipefd) <= 0)
             return;
 
         len = read(file->pipefd, buf, sizeof(buf));

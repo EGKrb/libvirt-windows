@@ -3478,9 +3478,10 @@ qemuDomainObjPrivateXMLParse(xmlXPathContextPtr ctxt,
         g_autofree char *pid = virXMLPropString(nodes[i], "pid");
         g_autoptr(qemuSlirp) slirp = qemuSlirpNew();
         virDomainDeviceDef dev;
+        int slirpPid;
 
         if (!alias || !pid || !slirp ||
-            virStrToLong_i(pid, NULL, 10, &slirp->pid) < 0) {
+            virStrToLong_i(pid, NULL, 10, &slirpPid) < 0) {
             virReportError(VIR_ERR_INTERNAL_ERROR, "%s",
                            _("failed to parse slirp helper list"));
             return -1;
@@ -3492,6 +3493,8 @@ qemuDomainObjPrivateXMLParse(xmlXPathContextPtr ctxt,
 
         if (qemuDomainObjPrivateXMLParseSlirpFeatures(nodes[i], ctxt, slirp) < 0)
             return -1;
+
+        slirp->pid = slirpPid;
 
         QEMU_DOMAIN_NETWORK_PRIVATE(dev.data.net)->slirp = g_steal_pointer(&slirp);
     }

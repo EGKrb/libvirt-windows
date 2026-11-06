@@ -268,9 +268,9 @@ storageStateInitialize(bool privileged,
         goto error;
 
     if (privileged) {
-        driver->configDir = g_strdup(SYSCONFDIR "/libvirt/storage");
-        driver->autostartDir = g_strdup(SYSCONFDIR "/libvirt/storage/autostart");
-        driver->stateDir = g_strdup(RUNSTATEDIR "/libvirt/storage");
+        driver->configDir = g_strdup(VIR_INSTALL_PATH(SYSCONFDIR "/libvirt/storage"));
+        driver->autostartDir = g_strdup(VIR_INSTALL_PATH(SYSCONFDIR "/libvirt/storage/autostart"));
+        driver->stateDir = g_strdup(VIR_INSTALL_PATH(RUNSTATEDIR "/libvirt/storage"));
     } else {
         configdir = virGetUserConfigDirectory();
         rundir = virGetUserRuntimeDirectory();

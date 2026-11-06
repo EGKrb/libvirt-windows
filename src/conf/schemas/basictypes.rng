@@ -731,6 +731,7 @@
         <value>vz</value>
         <value>bhyve</value>
         <value>hvf</value>
+        <value>whpx</value>
       </choice>
     </attribute>
   </define>

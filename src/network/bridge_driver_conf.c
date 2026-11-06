@@ -185,12 +185,12 @@ virNetworkDriverConfigNew(bool privileged)
      * /etc/libvirt/... && /var/(run|lib)/libvirt/... (system/privileged).
      */
     if (privileged) {
-        configdir = g_strdup(SYSCONFDIR "/libvirt");
-        cfg->networkConfigDir = g_strdup(SYSCONFDIR "/libvirt/qemu/networks");
-        cfg->networkAutostartDir = g_strdup(SYSCONFDIR "/libvirt/qemu/networks/autostart");
-        cfg->stateDir = g_strdup(RUNSTATEDIR "/libvirt/network");
-        cfg->pidDir = g_strdup(RUNSTATEDIR "/libvirt/network");
-        cfg->dnsmasqStateDir = g_strdup(LOCALSTATEDIR "/lib/libvirt/dnsmasq");
+        configdir = g_strdup(VIR_INSTALL_PATH(SYSCONFDIR "/libvirt"));
+        cfg->networkConfigDir = g_strdup(VIR_INSTALL_PATH(SYSCONFDIR "/libvirt/qemu/networks"));
+        cfg->networkAutostartDir = g_strdup(VIR_INSTALL_PATH(SYSCONFDIR "/libvirt/qemu/networks/autostart"));
+        cfg->stateDir = g_strdup(VIR_INSTALL_PATH(RUNSTATEDIR "/libvirt/network"));
+        cfg->pidDir = g_strdup(VIR_INSTALL_PATH(RUNSTATEDIR "/libvirt/network"));
+        cfg->dnsmasqStateDir = g_strdup(VIR_INSTALL_PATH(LOCALSTATEDIR "/lib/libvirt/dnsmasq"));
     } else {
         g_autofree char *rundir = virGetUserRuntimeDirectory();
 

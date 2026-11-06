@@ -29,6 +29,7 @@
 #include "viralloc.h"
 #include "virlog.h"
 #include "virstring.h"
+#include "configmake.h"
 
 #include <unistd.h>
 #include <sys/types.h>
@@ -878,6 +879,61 @@ virNetDevTapInterfaceStats(const char *ifname,
 
     freeifaddrs(ifap);
     return ret;
+}
+#elif defined(WIN32)
+/* The counters the switch of the port keeps, in the domain's view (rx is
+ * what the guest received), in run/libvirt/network/BRIDGE.stats */
+int
+virNetDevTapInterfaceStats(const char *ifname,
+                           virDomainInterfaceStatsPtr stats,
+                           bool swapped)
+{
+    g_autofree char *brname = NULL;
+    g_autofree char *path = NULL;
+    g_autoptr(GKeyFile) kf = g_key_file_new();
+    char macstr[VIR_MAC_STRING_BUFLEN];
+    virMacAddr mac;
+    long long rx[4], tx[4];
+    static const char *const keys[] = { "bytes", "packets", "errs", "drop" };
+    size_t i;
+
+    if (virNetDevBridgeSwitchPortGet(ifname, &brname, &mac) < 0)
+        return -1;
+    path = g_strdup_printf("%s/%s.stats",
+                           VIR_INSTALL_PATH(RUNSTATEDIR "/libvirt/network"), brname);
+    virMacAddrFormat(&mac, macstr);
+    if (!g_key_file_load_from_file(kf, path, G_KEY_FILE_NONE, NULL) ||
+        !g_key_file_has_group(kf, macstr)) {
+        /* nothing went through the port yet */
+        memset(stats, 0, sizeof(*stats));
+        return 0;
+    }
+    for (i = 0; i < G_N_ELEMENTS(keys); i++) {
+        g_autofree char *rxkey = g_strdup_printf("rx_%s", keys[i]);
+        g_autofree char *txkey = g_strdup_printf("tx_%s", keys[i]);
+
+        rx[i] = g_key_file_get_int64(kf, macstr, rxkey, NULL);
+        tx[i] = g_key_file_get_int64(kf, macstr, txkey, NULL);
+    }
+    /* @swapped asks for the domain's view of a host side device: the
+     * switch's counters are that view already */
+    if (!swapped) {
+        for (i = 0; i < G_N_ELEMENTS(keys); i++) {
+            long long t = rx[i];
+
+            rx[i] = tx[i];
+            tx[i] = t;
+        }
+    }
+    stats->rx_bytes = rx[0];
+    stats->rx_packets = rx[1];
+    stats->rx_errs = rx[2];
+    stats->rx_drop = rx[3];
+    stats->tx_bytes = tx[0];
+    stats->tx_packets = tx[1];
+    stats->tx_errs = tx[2];
+    stats->tx_drop = tx[3];
+    return 0;
 }
 #else
 int

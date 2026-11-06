@@ -22,6 +22,10 @@
 
 #include <unistd.h>
 #include <fcntl.h>
+#ifdef WIN32
+# define WIN32_LEAN_AND_MEAN
+# include <windows.h>
+#endif
 
 #include "virnetdaemon.h"
 #include "virlog.h"
@@ -62,20 +66,32 @@ struct _virNetDaemonSignal {
     virNetDaemonSignalFunc func;
     void *opaque;
 };
-#endif /* !WIN32 */
+#else /* WIN32 */
+typedef struct _virNetDaemonSignal virNetDaemonSignal;
+struct _virNetDaemonSignal {
+    int signum;
+    virNetDaemonSignalFunc func;
+    void *opaque;
+    HANDLE event;  /* named event set by virProcessKill() */
+};
+#endif /* WIN32 */
 
 struct _virNetDaemon {
     virObjectLockable parent;
 
     bool privileged;
 
-#ifndef WIN32
     size_t nsignals;
     virNetDaemonSignal **signals;
+#ifndef WIN32
     int sigread;
     int sigwrite;
     int sigwatch;
-#endif /* !WIN32 */
+#else /* WIN32 */
+    HANDLE sigwake;     /* stops or refreshes the signal thread */
+    GThread *sigthread;
+    bool sigquit;
+#endif /* WIN32 */
 
     GHashTable *servers;
     virJSONValue *srvObject;
@@ -124,6 +140,10 @@ daemonServerClose(void *payload,
                   const char *key G_GNUC_UNUSED,
                   void *opaque G_GNUC_UNUSED);
 
+#ifdef WIN32
+static void virNetDaemonSignalStop(virNetDaemon *dmn);
+#endif
+
 static void
 virNetDaemonDispose(void *obj)
 {
@@ -140,7 +160,9 @@ virNetDaemonDispose(void *obj)
     VIR_FORCE_CLOSE(dmn->sigwrite);
     if (dmn->sigwatch > 0)
         virEventRemoveHandle(dmn->sigwatch);
-#endif /* !WIN32 */
+#else /* WIN32 */
+    virNetDaemonSignalStop(dmn);
+#endif /* WIN32 */
 
     g_free(dmn->stateStopThread);
 
@@ -676,15 +698,193 @@ virNetDaemonAddSignalHandler(virNetDaemon *dmn,
 
 #else /* WIN32 */
 
-int
-virNetDaemonAddSignalHandler(virNetDaemon *dmn G_GNUC_UNUSED,
-                             int signum G_GNUC_UNUSED,
-                             virNetDaemonSignalFunc func G_GNUC_UNUSED,
-                             void *opaque G_GNUC_UNUSED)
+/*
+ * Windows has no signals.  A daemon receives those it handles either as
+ * console control events (Ctrl+C is SIGINT; Ctrl+Break, closing the console,
+ * logoff and shutdown are SIGTERM), or as the named events that
+ * virProcessKill() sets.  Either way the handler then runs from the event
+ * loop, as it does on POSIX.
+ */
+
+typedef struct {
+    virNetDaemon *dmn;
+    int signum;
+} virNetDaemonSignalDispatch;
+
+static virNetDaemon *consoleDaemon;
+
+
+static gboolean
+virNetDaemonSignalEvent(gpointer opaque)
 {
-    virReportSystemError(ENOSYS, "%s",
-                         _("Signal handling not available on this platform"));
-    return -1;
+    virNetDaemonSignalDispatch *dispatch = opaque;
+    virNetDaemon *dmn = dispatch->dmn;
+    size_t i;
+
+    virObjectLock(dmn);
+    for (i = 0; i < dmn->nsignals; i++) {
+        if (dmn->signals[i]->signum == dispatch->signum) {
+            virNetDaemonSignalFunc func = dmn->signals[i]->func;
+            void *funcopaque = dmn->signals[i]->opaque;
+
+            virObjectUnlock(dmn);
+            VIR_DEBUG("Dispatch signal num=%d", dispatch->signum);
+            func(dmn, NULL, funcopaque);
+            goto cleanup;
+        }
+    }
+    virObjectUnlock(dmn);
+    virReportError(VIR_ERR_INTERNAL_ERROR,
+                   _("Unexpected signal received: %1$d"), dispatch->signum);
+
+ cleanup:
+    virObjectUnref(dmn);
+    g_free(dispatch);
+    return G_SOURCE_REMOVE;
+}
+
+
+/* Run the handler of @signum from the event loop; false if none */
+static bool
+virNetDaemonSignalQueue(virNetDaemon *dmn, int signum)
+{
+    virNetDaemonSignalDispatch *dispatch;
+    bool handled = false;
+    size_t i;
+
+    virObjectLock(dmn);
+    for (i = 0; i < dmn->nsignals; i++)
+        handled |= dmn->signals[i]->signum == signum;
+    virObjectUnlock(dmn);
+    if (!handled)
+        return false;
+
+    dispatch = g_new0(virNetDaemonSignalDispatch, 1);
+    dispatch->dmn = virObjectRef(dmn);
+    dispatch->signum = signum;
+    g_idle_add(virNetDaemonSignalEvent, dispatch);
+    return true;
+}
+
+
+static BOOL WINAPI
+virNetDaemonConsoleHandler(DWORD type)
+{
+    virNetDaemon *dmn = consoleDaemon;
+
+    if (!dmn)
+        return FALSE;
+    return virNetDaemonSignalQueue(dmn, type == CTRL_C_EVENT ? SIGINT : SIGTERM);
+}
+
+
+static gpointer
+virNetDaemonSignalThread(gpointer opaque)
+{
+    virNetDaemon *dmn = opaque;
+
+    for (;;) {
+        HANDLE handles[MAXIMUM_WAIT_OBJECTS];
+        int signums[MAXIMUM_WAIT_OBJECTS];
+        DWORD n = 0;
+        DWORD rc;
+        size_t i;
+
+        virObjectLock(dmn);
+        if (dmn->sigquit) {
+            virObjectUnlock(dmn);
+            return NULL;
+        }
+        handles[n++] = dmn->sigwake;
+        for (i = 0; i < dmn->nsignals && n < MAXIMUM_WAIT_OBJECTS; i++) {
+            signums[n] = dmn->signals[i]->signum;
+            handles[n++] = dmn->signals[i]->event;
+        }
+        virObjectUnlock(dmn);
+
+        rc = WaitForMultipleObjects(n, handles, FALSE, INFINITE);
+        if (rc > WAIT_OBJECT_0 && rc < WAIT_OBJECT_0 + n)
+            virNetDaemonSignalQueue(dmn, signums[rc - WAIT_OBJECT_0]);
+        else if (rc != WAIT_OBJECT_0)
+            return NULL;
+    }
+}
+
+
+static int
+virNetDaemonSignalSetup(virNetDaemon *dmn)
+{
+    if (dmn->sigthread)
+        return 0;
+
+    if (!(dmn->sigwake = CreateEventA(NULL, FALSE, FALSE, NULL))) {
+        virReportSystemError(EINVAL, "%s",
+                             _("Failed to create the signal wakeup event"));
+        return -1;
+    }
+    dmn->sigthread = g_thread_new("daemon-signals", virNetDaemonSignalThread, dmn);
+
+    if (!consoleDaemon) {
+        consoleDaemon = dmn;
+        SetConsoleCtrlHandler(virNetDaemonConsoleHandler, TRUE);
+    }
+    return 0;
+}
+
+
+static void
+virNetDaemonSignalStop(virNetDaemon *dmn)
+{
+    size_t i;
+
+    if (dmn->sigthread) {
+        virObjectLock(dmn);
+        dmn->sigquit = true;
+        virObjectUnlock(dmn);
+        SetEvent(dmn->sigwake);
+        g_thread_join(dmn->sigthread);
+        CloseHandle(dmn->sigwake);
+    }
+    if (consoleDaemon == dmn) {
+        SetConsoleCtrlHandler(virNetDaemonConsoleHandler, FALSE);
+        consoleDaemon = NULL;
+    }
+    for (i = 0; i < dmn->nsignals; i++) {
+        CloseHandle(dmn->signals[i]->event);
+        g_free(dmn->signals[i]);
+    }
+    g_free(dmn->signals);
+}
+
+
+int
+virNetDaemonAddSignalHandler(virNetDaemon *dmn,
+                             int signum,
+                             virNetDaemonSignalFunc func,
+                             void *opaque)
+{
+    g_autofree virNetDaemonSignal *sigdata = NULL;
+    g_autofree char *name = VIR_PROCESS_WIN32_SIGNAL_EVENT(getpid(), signum);
+    VIR_LOCK_GUARD lock = virObjectLockGuard(dmn);
+
+    if (virNetDaemonSignalSetup(dmn) < 0)
+        return -1;
+
+    sigdata = g_new0(virNetDaemonSignal, 1);
+    sigdata->signum = signum;
+    sigdata->func = func;
+    sigdata->opaque = opaque;
+    if (!(sigdata->event = CreateEventA(NULL, FALSE, FALSE, name))) {
+        virReportSystemError(EINVAL, _("Failed to create the signal event %1$s"),
+                             name);
+        return -1;
+    }
+
+    VIR_EXPAND_N(dmn->signals, dmn->nsignals, 1);
+    dmn->signals[dmn->nsignals - 1] = g_steal_pointer(&sigdata);
+    /* make the signal thread wait on the new event too */
+    SetEvent(dmn->sigwake);
+    return 0;
 }
 
 #endif /* WIN32 */

@@ -138,7 +138,7 @@ remoteGetUNIXSocketHelper(remoteDriverTransport transport,
          * any machine with /run will have a /var/run symlink.
          * The portable option is to thus use $LOCALSTATEDIR/run
          */
-        sockname = g_strdup_printf("%s/run/libvirt/%s-%s", LOCALSTATEDIR,
+        sockname = g_strdup_printf("%s/run/libvirt/%s-%s", VIR_INSTALL_PATH(LOCALSTATEDIR),
                                    sock_prefix,
                                    flags & REMOTE_DRIVER_OPEN_RO ?
                                    "sock-ro" : "sock");
@@ -185,7 +185,7 @@ remoteProbeSessionDriverFromBinary(char **driver)
 
         if (!(daemonpath = virFileFindResource(daemonname,
                                                abs_top_builddir "/src",
-                                               SBINDIR)))
+                                               VIR_INSTALL_PATH(SBINDIR))))
             return -1;
 
         if (virFileExists(daemonpath)) {
@@ -233,7 +233,7 @@ remoteProbeSystemDriverFromSocket(bool readonly, char **driver)
 
     for (i = 0; i < (ssize_t) G_N_ELEMENTS(drivers); i++) {
         g_autofree char *sockname =
-            g_strdup_printf("%s/libvirt/virt%sd-%s", RUNSTATEDIR,
+            g_strdup_printf("%s/libvirt/virt%sd-%s", VIR_INSTALL_PATH(RUNSTATEDIR),
                             drivers[i], readonly ? "sock-ro" : "sock");
 
         if (virFileExists(sockname)) {
@@ -421,7 +421,7 @@ remoteGetUNIXSocket(remoteDriverTransport transport,
         if (!(*daemon_path = virFileFindResourceFull(daemon_name,
                                                      NULL, NULL,
                                                      abs_top_builddir "/src",
-                                                     SBINDIR,
+                                                     VIR_INSTALL_PATH(SBINDIR),
                                                      env_name)))
             return NULL;
     } else {

@@ -251,8 +251,13 @@ virGlobalInit(void)
     g_networking_init();
 
 #ifdef WITH_LIBINTL_H
-    if (!bindtextdomain(PACKAGE, LOCALEDIR))
+    if (!bindtextdomain(PACKAGE, VIR_INSTALL_PATH(LOCALEDIR)))
         goto error;
+# ifdef WIN32
+    /* UTF-8 messages, like the programs using us, see virGettextInitialize() */
+    if (!bind_textdomain_codeset(PACKAGE, "UTF-8"))
+        goto error;
+# endif
 #endif /* WITH_LIBINTL_H */
 
     /*

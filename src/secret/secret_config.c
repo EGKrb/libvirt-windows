@@ -40,7 +40,7 @@ int
 virSecretDaemonConfigFilePath(bool privileged, char **configfile)
 {
     if (privileged) {
-        *configfile = g_strdup(SYSCONFDIR "/libvirt/secret.conf");
+        *configfile = g_strdup(VIR_INSTALL_PATH(SYSCONFDIR "/libvirt/secret.conf"));
     } else {
         g_autofree char *configdir = NULL;
 

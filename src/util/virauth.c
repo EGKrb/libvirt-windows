@@ -76,7 +76,7 @@ virAuthGetConfigFilePathURI(virURI *uri,
 
     VIR_FREE(*path);
 
-    *path = g_strdup(SYSCONFDIR "/libvirt/auth.conf");
+    *path = g_strdup(VIR_INSTALL_PATH(SYSCONFDIR "/libvirt/auth.conf"));
 
     VIR_DEBUG("Checking for readability of '%s'", *path);
     if (access(*path, R_OK) == 0)

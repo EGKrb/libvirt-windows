@@ -39,6 +39,27 @@ typedef enum {
 
 VIR_ENUM_DECL(virProcessSchedPolicy);
 
+#ifdef WIN32
+/*
+ * Windows has no wait status: virProcessWait() encodes the exit code of a
+ * child the way waitpid() does, so that callers can use the usual macros.
+ * A process killed by virProcessKill() reports the signal it was sent.
+ */
+# define WIFEXITED(status) (((status) & 0x7f) == 0)
+# define WEXITSTATUS(status) (((status) >> 8) & 0xff)
+# define WIFSIGNALED(status) (((status) & 0x7f) != 0)
+# define WTERMSIG(status) ((status) & 0x7f)
+
+void virProcessWin32AddChild(pid_t pid, void *handle);
+
+/*
+ * Named event on which a libvirt daemon receives signal @signum (see
+ * virNetDaemonAddSignalHandler()); virProcessKill() sets it.
+ */
+# define VIR_PROCESS_WIN32_SIGNAL_EVENT(pid, signum) \
+    g_strdup_printf("Local\\libvirt-signal-%lld-%d", (long long) (pid), (signum))
+#endif
+
 char *
 virProcessTranslateStatus(int status);
 

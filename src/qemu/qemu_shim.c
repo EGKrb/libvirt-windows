@@ -25,6 +25,7 @@
 #include <unistd.h>
 
 #include "virfile.h"
+#include "virutil.h"
 #include "virgettext.h"
 #include "viridentity.h"
 #include "virthread.h"
@@ -243,7 +244,7 @@ int main(int argc, char **argv)
                    argv[0], deltams());
     virEventRegisterDefaultImpl();
 
-    if (pipe(quitfd) < 0) {
+    if (virPipeQuiet(quitfd) < 0) {
         g_printerr("%s: cannot create event loop pipe: %s",
                    argv[0], g_strerror(errno));
         goto cleanup;

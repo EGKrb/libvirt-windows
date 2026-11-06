@@ -24,6 +24,12 @@
 #include "virfile.h"
 #include "virlog.h"
 #include "virstring.h"
+#include "configmake.h"
+
+#ifdef WIN32
+# define WIN32_LEAN_AND_MEAN
+# include <windows.h>
+#endif
 
 #ifdef WITH_NET_IF_H
 # include <net/if.h>
@@ -1356,3 +1362,102 @@ virNetDevBridgeFDBDel(const virMacAddr *mac, const char *ifname,
 {
     return virNetDevBridgeFDBAddDel(mac, ifname, flags, false);
 }
+
+
+#ifdef WIN32
+char *
+virNetDevBridgeSwitchSocketPath(const char *brname)
+{
+    return g_strdup_printf("%s/%s.sock",
+                           VIR_INSTALL_PATH(RUNSTATEDIR "/libvirt/network"),
+                           brname);
+}
+
+
+char *
+virNetDevBridgeSwitchPortPath(const char *ifname)
+{
+    return g_strdup_printf("%s/ports/%s",
+                           VIR_INSTALL_PATH(RUNSTATEDIR "/libvirt/network"),
+                           ifname);
+}
+
+
+int
+virNetDevBridgeSwitchPortAdd(const char *brname,
+                             const char *ifname,
+                             const virMacAddr *mac)
+{
+    g_autofree char *path = virNetDevBridgeSwitchPortPath(ifname);
+    g_autofree char *dir = g_path_get_dirname(path);
+    g_autoptr(GKeyFile) kf = g_key_file_new();
+    g_autoptr(GError) err = NULL;
+    char macstr[VIR_MAC_STRING_BUFLEN];
+
+    if (g_mkdir_with_parents(dir, 0777) < 0) {
+        virReportSystemError(errno, _("cannot create directory %1$s"), dir);
+        return -1;
+    }
+    g_key_file_set_string(kf, "port", "bridge", brname);
+    g_key_file_set_string(kf, "port", "mac", virMacAddrFormat(mac, macstr));
+    if (!g_key_file_save_to_file(kf, path, &err)) {
+        virReportError(VIR_ERR_INTERNAL_ERROR,
+                       _("cannot write switch port file %1$s: %2$s"),
+                       path, err->message);
+        return -1;
+    }
+    virNetDevBridgeSwitchNotify(brname);
+    return 0;
+}
+
+
+void
+virNetDevBridgeSwitchPortRemove(const char *ifname)
+{
+    g_autofree char *path = virNetDevBridgeSwitchPortPath(ifname);
+    g_autofree char *brname = NULL;
+    virMacAddr mac;
+
+    if (virNetDevBridgeSwitchPortGet(ifname, &brname, &mac) < 0)
+        return;
+    unlink(path);
+    virNetDevBridgeSwitchNotify(brname);
+}
+
+
+int
+virNetDevBridgeSwitchPortGet(const char *ifname,
+                             char **brname,
+                             virMacAddr *mac)
+{
+    g_autofree char *path = virNetDevBridgeSwitchPortPath(ifname);
+    g_autoptr(GKeyFile) kf = g_key_file_new();
+    g_autofree char *macstr = NULL;
+
+    *brname = NULL;
+    if (!g_key_file_load_from_file(kf, path, G_KEY_FILE_NONE, NULL) ||
+        !(macstr = g_key_file_get_string(kf, "port", "mac", NULL)) ||
+        virMacAddrParse(macstr, mac) < 0 ||
+        !(*brname = g_key_file_get_string(kf, "port", "bridge", NULL))) {
+        virReportError(VIR_ERR_OPERATION_INVALID,
+                       _("interface '%1$s' is not a port of a network switch"),
+                       ifname);
+        return -1;
+    }
+    return 0;
+}
+
+
+void
+virNetDevBridgeSwitchNotify(const char *brname)
+{
+    g_autofree char *name = g_strdup_printf("Local\\libvirt-netswitch-%s", brname);
+    HANDLE ev = OpenEventA(EVENT_MODIFY_STATE, FALSE, name);
+
+    /* no switch running: it reads the files when it starts */
+    if (ev) {
+        SetEvent(ev);
+        CloseHandle(ev);
+    }
+}
+#endif

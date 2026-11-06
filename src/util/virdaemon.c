@@ -24,6 +24,10 @@
 #include <sys/stat.h>
 #ifndef WIN32
 # include <sys/wait.h>
+#else
+# define WIN32_LEAN_AND_MEAN
+# include <windows.h>
+# include <io.h>
 #endif
 #include <fcntl.h>
 #include <unistd.h>
@@ -144,6 +148,115 @@ virDaemonForkIntoBackground(const char *argv0)
     return -1;
 }
 
+#else /* WIN32 */
+
+/* Inherited handle of the status pipe, in the daemon relaunched in background */
+# define VIR_DAEMON_STATUS_HANDLE_ENV "LIBVIRT_DAEMON_STATUS_HANDLE"
+
+/*
+ * There is no fork(): the daemon relaunches itself with the same command
+ * line, detached from the console, and the new process returns the write
+ * end of the status pipe from here, as the POSIX grandchild does.
+ */
+int
+virDaemonForkIntoBackground(const char *argv0)
+{
+    const char *inherited = g_getenv(VIR_DAEMON_STATUS_HANDLE_ENV);
+    g_autofree char *attrbuf = NULL;
+    g_autofree char *handlestr = NULL;
+    LPPROC_THREAD_ATTRIBUTE_LIST attrs = NULL;
+    SIZE_T attrsize = 0;
+    STARTUPINFOEXW si = { 0 };
+    PROCESS_INFORMATION pi = { 0 };
+    WCHAR exe[MAX_PATH];
+    HANDLE devnull = INVALID_HANDLE_VALUE;
+    HANDLE statusread = NULL;
+    HANDLE statuswrite = NULL;
+    SECURITY_ATTRIBUTES inherit = { sizeof(inherit), NULL, TRUE };
+    HANDLE handles[2];
+    DWORD got = 0;
+    char status;
+
+    if (inherited) {
+        /* the relaunched daemon */
+        intptr_t handle = (intptr_t) g_ascii_strtoll(inherited, NULL, 10);
+
+        g_unsetenv(VIR_DAEMON_STATUS_HANDLE_ENV);
+        return _open_osfhandle(handle, _O_WRONLY | _O_BINARY);
+    }
+
+    if (!CreatePipe(&statusread, &statuswrite, &inherit, 0) ||
+        !SetHandleInformation(statusread, HANDLE_FLAG_INHERIT, 0))
+        goto error;
+    devnull = CreateFileA("NUL", GENERIC_READ | GENERIC_WRITE,
+                          FILE_SHARE_READ | FILE_SHARE_WRITE, &inherit,
+                          OPEN_EXISTING, 0, NULL);
+    if (devnull == INVALID_HANDLE_VALUE)
+        goto error;
+
+    handlestr = g_strdup_printf("%lld", (long long) (intptr_t) statuswrite);
+    g_setenv(VIR_DAEMON_STATUS_HANDLE_ENV, handlestr, TRUE);
+
+    /* stdio on NUL, and only the status pipe inherited */
+    handles[0] = devnull;
+    handles[1] = statuswrite;
+    InitializeProcThreadAttributeList(NULL, 1, 0, &attrsize);
+    attrbuf = g_new0(char, attrsize);
+    attrs = (LPPROC_THREAD_ATTRIBUTE_LIST) attrbuf;
+    if (!InitializeProcThreadAttributeList(attrs, 1, 0, &attrsize) ||
+        !UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                                   handles, sizeof(handles), NULL, NULL))
+        goto error;
+    si.StartupInfo.cb = sizeof(si);
+    si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    si.StartupInfo.hStdInput = devnull;
+    si.StartupInfo.hStdOutput = devnull;
+    si.StartupInfo.hStdError = devnull;
+    si.lpAttributeList = attrs;
+
+    if (!GetModuleFileNameW(NULL, exe, G_N_ELEMENTS(exe)) ||
+        !CreateProcessW(exe, GetCommandLineW(), NULL, NULL, TRUE,
+                        DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP |
+                        EXTENDED_STARTUPINFO_PRESENT,
+                        NULL, NULL, &si.StartupInfo, &pi))
+        goto error;
+    g_unsetenv(VIR_DAEMON_STATUS_HANDLE_ENV);
+    DeleteProcThreadAttributeList(attrs);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    CloseHandle(devnull);
+    CloseHandle(statuswrite);
+
+    /* Block until the daemon initializes successfully */
+    if (!ReadFile(statusread, &status, 1, &got, NULL) || got != 1) {
+        fprintf(stderr,
+                _("%1$s: error: unable to determine if daemon is running: %2$s\n"),
+                argv0, g_strerror(EPIPE));
+        exit(EXIT_FAILURE);
+    } else if (status != 0) {
+        fprintf(stderr,
+                _("%1$s: error: %2$s. Check the log file or run without --daemon for more info.\n"),
+                argv0, virDaemonErrTypeToString(status));
+        exit(EXIT_FAILURE);
+    }
+    _exit(EXIT_SUCCESS);
+
+ error:
+    g_unsetenv(VIR_DAEMON_STATUS_HANDLE_ENV);
+    if (attrs)
+        DeleteProcThreadAttributeList(attrs);
+    if (devnull != INVALID_HANDLE_VALUE)
+        CloseHandle(devnull);
+    if (statusread)
+        CloseHandle(statusread);
+    if (statuswrite)
+        CloseHandle(statuswrite);
+    errno = ECHILD;
+    return -1;
+}
+
+#endif /* WIN32 */
+
 
 /*
  * Set up the logging environment
@@ -232,13 +345,13 @@ virDaemonUnixSocketPaths(const char *sock_prefix,
         if (privileged) {
             if (sockfile)
                 *sockfile = g_strdup_printf("%s/libvirt/%s-sock",
-                                            RUNSTATEDIR, sock_prefix);
+                                            VIR_INSTALL_PATH(RUNSTATEDIR), sock_prefix);
             if (rosockfile)
                 *rosockfile = g_strdup_printf("%s/libvirt/%s-sock-ro",
-                                              RUNSTATEDIR, sock_prefix);
+                                              VIR_INSTALL_PATH(RUNSTATEDIR), sock_prefix);
             if (admsockfile)
                 *admsockfile = g_strdup_printf("%s/libvirt/%s-admin-sock",
-                                               RUNSTATEDIR, sock_prefix);
+                                               VIR_INSTALL_PATH(RUNSTATEDIR), sock_prefix);
         } else {
             mode_t old_umask;
             g_autofree char *rundir = virGetUserRuntimeDirectory();
@@ -260,36 +373,3 @@ virDaemonUnixSocketPaths(const char *sock_prefix,
     return 0;
 }
 
-#else /* WIN32 */
-
-int virDaemonForkIntoBackground(const char *argv0 G_GNUC_UNUSED)
-{
-    errno = ENOTSUP;
-    return -1;
-}
-
-int virDaemonSetupLogging(const char *daemon_name G_GNUC_UNUSED,
-                          unsigned int log_level G_GNUC_UNUSED,
-                          char *log_filters G_GNUC_UNUSED,
-                          char *log_outputs G_GNUC_UNUSED,
-                          bool privileged G_GNUC_UNUSED,
-                          bool verbose G_GNUC_UNUSED,
-                          bool godaemon G_GNUC_UNUSED)
-{
-    /* NOOP */
-    errno = ENOTSUP;
-    return -1;
-}
-
-int virDaemonUnixSocketPaths(const char *sock_prefix G_GNUC_UNUSED,
-                             bool privileged G_GNUC_UNUSED,
-                             char *unix_sock_dir G_GNUC_UNUSED,
-                             char **sockfile G_GNUC_UNUSED,
-                             char **rosockfile G_GNUC_UNUSED,
-                             char **adminSockfile G_GNUC_UNUSED)
-{
-    errno = ENOTSUP;
-    return -1;
-}
-
-#endif /* WIN32 */

@@ -35,7 +35,7 @@ int
 virLockDaemonConfigFilePath(bool privileged, char **configfile)
 {
     if (privileged) {
-        *configfile = g_strdup(SYSCONFDIR "/libvirt/virtlockd.conf");
+        *configfile = g_strdup(VIR_INSTALL_PATH(SYSCONFDIR "/libvirt/virtlockd.conf"));
     } else {
         g_autofree char *configdir = NULL;
 

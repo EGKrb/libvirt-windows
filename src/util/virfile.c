@@ -26,6 +26,11 @@
 #include "internal.h"
 
 #include <fcntl.h>
+#ifdef WIN32
+# define WIN32_LEAN_AND_MEAN
+# include <windows.h>
+# include <io.h>
+#endif
 #ifndef WIN32
 # include <termios.h>
 #endif
@@ -441,7 +446,7 @@ virFileWrapperFdNew(int *fd, const char *name, unsigned int flags)
 
     if (!(iohelper_path = virFileFindResource("libvirt_iohelper",
                                               abs_top_builddir "/src",
-                                              LIBEXECDIR)))
+                                              VIR_INSTALL_PATH(LIBEXECDIR))))
         goto error;
 
     ret->cmd = virCommandNewArgList(iohelper_path, name, NULL);
@@ -626,22 +631,122 @@ int virFileUnlock(int fd, off_t start, off_t len)
 
 #else /* WIN32 */
 
-
-int virFileLock(int fd G_GNUC_UNUSED,
-                bool shared G_GNUC_UNUSED,
-                off_t start G_GNUC_UNUSED,
-                off_t len G_GNUC_UNUSED,
-                bool waitForLock G_GNUC_UNUSED)
+/* The prefix of the installation: the parent of the directory of this DLL */
+static gpointer
+virInstallFindPrefix(gpointer opaque G_GNUC_UNUSED)
 {
-    return -ENOSYS;
+    HMODULE module = NULL;
+    WCHAR file[MAX_PATH];
+    g_autofree char *path = NULL;
+    g_autofree char *bindir = NULL;
+    char *prefix;
+    char *p;
+
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            (LPCWSTR) virInstallPath, &module) ||
+        !GetModuleFileNameW(module, file, G_N_ELEMENTS(file)) ||
+        !(path = g_utf16_to_utf8(file, -1, NULL, NULL, NULL)))
+        return NULL;
+
+    bindir = g_path_get_dirname(path);
+    prefix = g_path_get_dirname(bindir);
+    for (p = prefix; *p; p++) {
+        if (*p == '\\')
+            *p = '/';
+    }
+    return prefix;
 }
 
 
-int virFileUnlock(int fd G_GNUC_UNUSED,
-                  off_t start G_GNUC_UNUSED,
-                  off_t len G_GNUC_UNUSED)
+/*
+ * virInstallPath:
+ * @path: a path under PREFIX, as configured at build time
+ *
+ * Returns @path under the prefix where libvirt is installed now, as a
+ * string that is never freed, or @path itself if it is not under PREFIX.
+ */
+const char *
+virInstallPath(const char *path)
 {
-    return -ENOSYS;
+    static GOnce once = G_ONCE_INIT;
+    const char *prefix = g_once(&once, virInstallFindPrefix, NULL);
+    size_t len = strlen(PREFIX);
+    g_autofree char *relocated = NULL;
+
+    if (!prefix ||
+        g_ascii_strncasecmp(path, PREFIX, len) != 0 ||
+        (path[len] != '\0' && path[len] != '/' && path[len] != '\\'))
+        return path;
+
+    relocated = g_strconcat(prefix, path + len, NULL);
+    return g_intern_string(relocated);
+}
+
+
+/*
+ * LockFileEx() locks are mandatory: a locked range cannot be read or written
+ * by other processes.  libvirt locks are advisory (a pid file is read while
+ * its daemon holds a lock on it), so they are taken on a shadow range far
+ * beyond the end of the file, which Windows allows and where only locks
+ * conflict with each other.
+ */
+# define VIR_FILE_LOCK_SHADOW_OFFSET (1ULL << 62)
+
+static void
+virFileLockRange(off_t start, off_t len, OVERLAPPED *ov, DWORD *lenlow,
+                 DWORD *lenhigh)
+{
+    uint64_t offset = VIR_FILE_LOCK_SHADOW_OFFSET + start;
+    /* 0: up to the end of the file, whatever its size */
+    uint64_t length = len ? (uint64_t) len : VIR_FILE_LOCK_SHADOW_OFFSET;
+
+    memset(ov, 0, sizeof(*ov));
+    ov->Offset = (DWORD) offset;
+    ov->OffsetHigh = (DWORD) (offset >> 32);
+    *lenlow = (DWORD) length;
+    *lenhigh = (DWORD) (length >> 32);
+}
+
+
+int virFileLock(int fd, bool shared, off_t start, off_t len, bool waitForLock)
+{
+    HANDLE h = (HANDLE) _get_osfhandle(fd);
+    OVERLAPPED ov;
+    DWORD lenlow, lenhigh;
+    DWORD flags = (shared ? 0 : LOCKFILE_EXCLUSIVE_LOCK) |
+                  (waitForLock ? 0 : LOCKFILE_FAIL_IMMEDIATELY);
+
+    if (h == INVALID_HANDLE_VALUE) {
+        errno = EBADF;
+        return -EBADF;
+    }
+    virFileLockRange(start, len, &ov, &lenlow, &lenhigh);
+    if (!LockFileEx(h, flags, 0, lenlow, lenhigh, &ov)) {
+        /* like F_SETLK on a range locked by another process */
+        errno = GetLastError() == ERROR_LOCK_VIOLATION ? EAGAIN : EINVAL;
+        return -errno;
+    }
+    return 0;
+}
+
+
+int virFileUnlock(int fd, off_t start, off_t len)
+{
+    HANDLE h = (HANDLE) _get_osfhandle(fd);
+    OVERLAPPED ov;
+    DWORD lenlow, lenhigh;
+
+    if (h == INVALID_HANDLE_VALUE) {
+        errno = EBADF;
+        return -EBADF;
+    }
+    virFileLockRange(start, len, &ov, &lenlow, &lenhigh);
+    if (!UnlockFileEx(h, 0, lenlow, lenhigh, &ov)) {
+        errno = EINVAL;
+        return -errno;
+    }
+    return 0;
 }
 
 
@@ -1809,6 +1914,176 @@ virFileWriteStr(const char *path, const char *str, mode_t mode)
     return 0;
 }
 
+#ifdef WIN32
+/* Volume and index of the file at @path, links followed: st_dev and st_ino */
+static bool
+virFileWin32Identity(const char *path, BY_HANDLE_FILE_INFORMATION *info)
+{
+    g_autofree gunichar2 *wpath = g_utf8_to_utf16(path, -1, NULL, NULL, NULL);
+    HANDLE h;
+    bool ok;
+
+    if (!wpath)
+        return false;
+    h = CreateFileW(wpath, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    if (h == INVALID_HANDLE_VALUE)
+        return false;
+    ok = GetFileInformationByHandle(h, info);
+    CloseHandle(h);
+    return ok;
+}
+
+
+/* @path with Windows separators, which link targets need */
+static gunichar2 *
+virFileWin32WidePath(const char *path)
+{
+    g_autofree char *native = g_strdup(path);
+
+    g_strdelimit(native, "/", '\\');
+    return g_utf8_to_utf16(native, -1, NULL, NULL, NULL);
+}
+
+
+/*
+ * Without the privilege a symbolic link takes, a link is emulated the way
+ * Cygwin and MSYS2 do (winsymlinks:sys): a file with the SYSTEM attribute
+ * holding "!<symlink>", a UTF-16 byte order mark and the target.  The
+ * autostart links of libvirt are such links on a stock Windows.
+ */
+static const char virFileWin32SysLinkMagic[] = "!<symlink>\xff\xfe";
+
+
+/* The target of the emulated link @path, NULL if it is not one */
+static char *
+virFileWin32ReadSysLink(const char *path)
+{
+    g_autofree gunichar2 *wpath = virFileWin32WidePath(path);
+    size_t magiclen = sizeof(virFileWin32SysLinkMagic) - 1;
+    g_autofree char *buf = NULL;
+    DWORD attrs;
+    size_t len;
+
+    if (!wpath ||
+        (attrs = GetFileAttributesW(wpath)) == INVALID_FILE_ATTRIBUTES ||
+        !(attrs & FILE_ATTRIBUTE_SYSTEM) || (attrs & FILE_ATTRIBUTE_DIRECTORY))
+        return NULL;
+    if (!g_file_get_contents(path, &buf, &len, NULL) || len > 65536 ||
+        len < magiclen || memcmp(buf, virFileWin32SysLinkMagic, magiclen) != 0)
+        return NULL;
+
+    return g_utf16_to_utf8((const gunichar2 *)(buf + magiclen),
+                           (len - magiclen) / 2, NULL, NULL, NULL);
+}
+
+
+static int
+virFileWin32WriteSysLink(const char *target, const char *linkpath)
+{
+    g_autofree gunichar2 *wlink = virFileWin32WidePath(linkpath);
+    glong wlen = 0;
+    g_autofree gunichar2 *wtarget = g_utf8_to_utf16(target, -1, NULL, &wlen, NULL);
+    VIR_AUTOCLOSE fd = -1;
+
+    if (!wlink || !wtarget) {
+        errno = EINVAL;
+        return -1;
+    }
+    if ((fd = open(linkpath, O_WRONLY | O_CREAT | O_EXCL | O_BINARY, 0644)) < 0)
+        return -1;
+    if (safewrite(fd, virFileWin32SysLinkMagic, sizeof(virFileWin32SysLinkMagic) - 1) < 0 ||
+        safewrite(fd, wtarget, (wlen + 1) * sizeof(gunichar2)) < 0 ||
+        VIR_CLOSE(fd) < 0) {
+        int saved = errno;
+
+        unlink(linkpath);
+        errno = saved;
+        return -1;
+    }
+    if (!SetFileAttributesW(wlink, FILE_ATTRIBUTE_SYSTEM)) {
+        unlink(linkpath);
+        errno = EIO;
+        return -1;
+    }
+    return 0;
+}
+
+
+/*
+ * symlink() for Windows.  Creating a symbolic link takes the privilege of
+ * an administrator, or the Developer Mode of Windows for anyone; without
+ * it, the link is emulated (see above).
+ */
+int
+virWin32Symlink(const char *target, const char *linkpath)
+{
+    g_autofree gunichar2 *wtarget = virFileWin32WidePath(target);
+    g_autofree gunichar2 *wlink = virFileWin32WidePath(linkpath);
+    g_autofree char *dir = g_path_get_dirname(linkpath);
+    g_autofree char *resolved = NULL;
+    DWORD flags = SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE;
+    DWORD err;
+
+    if (!wtarget || !wlink) {
+        errno = EINVAL;
+        return -1;
+    }
+    /* a link to a directory must be created as such */
+    resolved = g_path_is_absolute(target) ? g_strdup(target)
+                                          : g_build_filename(dir, target, NULL);
+    if (g_file_test(resolved, G_FILE_TEST_IS_DIR))
+        flags |= SYMBOLIC_LINK_FLAG_DIRECTORY;
+
+    if (CreateSymbolicLinkW(wlink, wtarget, flags))
+        return 0;
+    /* before Windows 10 1703, the flag is unknown */
+    if (GetLastError() == ERROR_INVALID_PARAMETER &&
+        CreateSymbolicLinkW(wlink, wtarget,
+                            flags & ~SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE))
+        return 0;
+
+    err = GetLastError();
+    if (err == ERROR_PRIVILEGE_NOT_HELD && !(flags & SYMBOLIC_LINK_FLAG_DIRECTORY))
+        return virFileWin32WriteSysLink(target, linkpath);
+    errno = err == ERROR_PRIVILEGE_NOT_HELD ? EPERM :
+            err == ERROR_ALREADY_EXISTS ? EEXIST :
+            err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND ? ENOENT :
+            EIO;
+    return -1;
+}
+
+
+/*
+ * rename() for Windows, with the POSIX semantics callers rely on: an
+ * existing @newpath is replaced, which the C runtime refuses to do.  As on
+ * POSIX, moving to another volume fails with EXDEV.
+ */
+int
+virWin32Rename(const char *oldpath, const char *newpath)
+{
+    g_autofree gunichar2 *wold = virFileWin32WidePath(oldpath);
+    g_autofree gunichar2 *wnew = virFileWin32WidePath(newpath);
+    DWORD err;
+
+    if (!wold || !wnew) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (MoveFileExW(wold, wnew, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+        return 0;
+
+    err = GetLastError();
+    errno = err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND ? ENOENT :
+            err == ERROR_ACCESS_DENIED || err == ERROR_SHARING_VIOLATION ? EACCES :
+            err == ERROR_NOT_SAME_DEVICE ? EXDEV :
+            err == ERROR_DIR_NOT_EMPTY ? ENOTEMPTY :
+            EIO;
+    return -1;
+}
+#endif /* WIN32 */
+
+
 #define SAME_INODE(Stat_buf_1, Stat_buf_2) \
   ((Stat_buf_1).st_ino == (Stat_buf_2).st_ino \
    && (Stat_buf_1).st_dev == (Stat_buf_2).st_dev)
@@ -1820,12 +2095,37 @@ bool
 virFileLinkPointsTo(const char *checkLink,
                     const char *checkDest)
 {
+#ifdef WIN32
+    /* stat() has no inode numbers on Windows: compare the file identities */
+    BY_HANDLE_FILE_INFORMATION src;
+    BY_HANDLE_FILE_INFORMATION dest;
+    g_autofree char *target = virFileWin32ReadSysLink(checkLink);
+    g_autofree char *resolved = NULL;
+
+    if (target) {
+        if (g_path_is_absolute(target)) {
+            resolved = g_steal_pointer(&target);
+        } else {
+            g_autofree char *dir = g_path_get_dirname(checkLink);
+
+            resolved = g_build_filename(dir, target, NULL);
+        }
+        checkLink = resolved;
+    }
+
+    return (virFileWin32Identity(checkLink, &src)
+            && virFileWin32Identity(checkDest, &dest)
+            && src.dwVolumeSerialNumber == dest.dwVolumeSerialNumber
+            && src.nFileIndexHigh == dest.nFileIndexHigh
+            && src.nFileIndexLow == dest.nFileIndexLow);
+#else
     struct stat src_sb;
     struct stat dest_sb;
 
     return (stat(checkLink, &src_sb) == 0
             && stat(checkDest, &dest_sb) == 0
             && SAME_INODE(src_sb, dest_sb));
+#endif
 }
 
 
@@ -1930,7 +2230,24 @@ virFileIsLink(const char *linkpath)
 #ifndef WIN32
     return S_ISLNK(st.st_mode) != 0;
 #else /* WIN32 */
-    return 0;
+    {
+        /* a symbolic link is a reparse point with the symlink tag */
+        g_autofree gunichar2 *wpath = virFileWin32WidePath(linkpath);
+        WIN32_FIND_DATAW data;
+        HANDLE find;
+
+        g_autofree char *target = NULL;
+
+        if (!wpath ||
+            (find = FindFirstFileW(wpath, &data)) == INVALID_HANDLE_VALUE)
+            return 0;
+        FindClose(find);
+        if ((data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) &&
+            data.dwReserved0 == IO_REPARSE_TAG_SYMLINK)
+            return 1;
+        target = virFileWin32ReadSysLink(linkpath);
+        return target != NULL;
+    }
 #endif /* WIN32 */
 }
 
@@ -3110,32 +3427,53 @@ virFileAccessibleAs(const char *path,
     return access(path, mode);
 }
 
-/* return -errno on failure, or 0 on success */
+/*
+ * Windows has no file owners and no setuid: files are opened and created
+ * by the daemon itself, as virFileOpenAsNoFork() does on POSIX.
+ *
+ * return fd on success, -errno on failure
+ */
 int
-virFileOpenAs(const char *path G_GNUC_UNUSED,
-              int openflags G_GNUC_UNUSED,
-              mode_t mode G_GNUC_UNUSED,
+virFileOpenAs(const char *path,
+              int openflags,
+              mode_t mode,
               uid_t uid G_GNUC_UNUSED,
               gid_t gid G_GNUC_UNUSED,
-              unsigned int flags_unused G_GNUC_UNUSED)
+              unsigned int flags G_GNUC_UNUSED)
 {
-    virReportError(VIR_ERR_INTERNAL_ERROR,
-                   "%s", _("virFileOpenAs is not implemented for WIN32"));
+    int fd;
 
-    return -ENOSYS;
+    if ((fd = open(path, openflags | O_BINARY, mode)) < 0) {
+        int ret = -errno;
+
+        if (!(openflags & O_CREAT))
+            return ret;
+        virReportSystemError(errno, _("failed to create file '%1$s'"), path);
+        return ret;
+    }
+    return fd;
 }
 
+/* return -errno on failure, or 0 on success */
 int
-virDirCreate(const char *path G_GNUC_UNUSED,
-             mode_t mode G_GNUC_UNUSED,
+virDirCreate(const char *path,
+             mode_t mode,
              uid_t uid G_GNUC_UNUSED,
              gid_t gid G_GNUC_UNUSED,
-             unsigned int flags_unused G_GNUC_UNUSED)
+             unsigned int flags)
 {
-    virReportError(VIR_ERR_INTERNAL_ERROR,
-                   "%s", _("virDirCreate is not implemented for WIN32"));
+    /* as virDirCreateNoFork() on POSIX */
+    if ((flags & VIR_DIR_CREATE_ALLOW_EXIST) && virFileExists(path))
+        return 0;
 
-    return -ENOSYS;
+    if (g_mkdir(path, mode) < 0) {
+        int ret = -errno;
+
+        virReportSystemError(errno, _("failed to create directory '%1$s'"),
+                             path);
+        return ret;
+    }
+    return 0;
 }
 
 int

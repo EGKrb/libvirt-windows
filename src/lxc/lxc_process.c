@@ -456,7 +456,7 @@ static int virLXCProcessSetupNamespaceNet(int ns_type, const char *name)
         return -1;
     }
 
-    path = g_strdup_printf("%s/netns/%s", RUNSTATEDIR, name);
+    path = g_strdup_printf("%s/netns/%s", VIR_INSTALL_PATH(RUNSTATEDIR), name);
     fd = open(path, O_RDONLY);
     if (fd < 0) {
         virReportSystemError(errno,

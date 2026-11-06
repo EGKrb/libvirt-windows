@@ -199,6 +199,8 @@ virDomainInterfaceStartDevice(virDomainNetDef *net)
     switch (actualType) {
     case VIR_DOMAIN_NET_TYPE_BRIDGE:
     case VIR_DOMAIN_NET_TYPE_NETWORK:
+#ifndef WIN32
+        /* (on Windows the switch of the bridge learns the addresses) */
         if (virDomainNetGetActualBridgeMACTableManager(net) ==
                 VIR_NETWORK_BRIDGE_MAC_TABLE_MANAGER_LIBVIRT) {
             /* libvirt is managing the FDB of the bridge this device
@@ -213,6 +215,7 @@ virDomainInterfaceStartDevice(virDomainNetDef *net)
                                       VIR_NETDEVBRIDGE_FDB_FLAG_TEMP) < 0)
                 return -1;
         }
+#endif
         break;
 
     case VIR_DOMAIN_NET_TYPE_DIRECT: {
@@ -304,6 +307,7 @@ virDomainInterfaceStopDevice(virDomainNetDef *net)
     switch (actualType) {
     case VIR_DOMAIN_NET_TYPE_BRIDGE:
     case VIR_DOMAIN_NET_TYPE_NETWORK:
+#ifndef WIN32
         if (virDomainNetGetActualBridgeMACTableManager(net) ==
                 VIR_NETWORK_BRIDGE_MAC_TABLE_MANAGER_LIBVIRT) {
             /* remove the FDB entries that were added during
@@ -314,6 +318,7 @@ virDomainInterfaceStopDevice(virDomainNetDef *net)
                                       VIR_NETDEVBRIDGE_FDB_FLAG_TEMP) < 0)
                 return -1;
         }
+#endif
         break;
 
     case VIR_DOMAIN_NET_TYPE_DIRECT: {
@@ -436,6 +441,11 @@ virDomainInterfaceDeleteDevice(virDomainDef *def,
         break;
     case VIR_DOMAIN_NET_TYPE_BRIDGE:
     case VIR_DOMAIN_NET_TYPE_NETWORK: {
+#ifdef WIN32
+        /* the port of the switch (see qemuBuildInterfaceConnect) */
+        if (net->ifname)
+            virNetDevBridgeSwitchPortRemove(net->ifname);
+#endif
 #ifdef VIR_NETDEV_TAP_REQUIRE_MANUAL_CLEANUP
         const virNetDevVPortProfile *vport = virDomainNetGetActualVirtPortProfile(net);
 

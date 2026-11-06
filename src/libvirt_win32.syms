@@ -1,0 +1,46 @@
+#
+# Windows-specific private symbols.
+#
+
+# configmake.h
+virInstallPath;
+
+# util/virsocket.h
+virSocketGLibRecv;
+virSocketGLibSend;
+vir_accept;
+vir_bind;
+vir_closesocket;
+vir_connect;
+vir_getpeername;
+vir_getsockname;
+vir_getsockopt;
+vir_ioctlsocket;
+vir_listen;
+vir_recv;
+vir_send;
+vir_setsockopt;
+vir_socket;
+
+# util/virutsname.h
+virWin32Uname;
+
+# util/virfile.h
+virWin32Rename;
+virWin32Symlink;
+
+# util/virnetdevbridge.h
+virNetDevBridgeSwitchNotify;
+virNetDevBridgeSwitchPortAdd;
+virNetDevBridgeSwitchPortGet;
+virNetDevBridgeSwitchPortPath;
+virNetDevBridgeSwitchPortRemove;
+virNetDevBridgeSwitchSocketPath;
+
+# util/virprocess.h
+virProcessWin32AddChild;
+
+# Let emacs know we want case-insensitive sorting
+# Local Variables:
+# sort-fold-case: t
+# End:

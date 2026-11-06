@@ -108,7 +108,7 @@ netcfStateInitialize(bool privileged,
     driver->privileged = privileged;
 
     if (privileged) {
-        driver->stateDir = g_strdup_printf("%s/libvirt/interface", RUNSTATEDIR);
+        driver->stateDir = g_strdup_printf("%s/libvirt/interface", VIR_INSTALL_PATH(RUNSTATEDIR));
     } else {
         g_autofree char *rundir = NULL;
 

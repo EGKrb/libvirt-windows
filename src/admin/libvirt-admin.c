@@ -57,7 +57,7 @@ virAdmGlobalInit(void)
         goto error;
 
 #ifdef WITH_LIBINTL_H
-    if (!bindtextdomain(PACKAGE, LOCALEDIR))
+    if (!bindtextdomain(PACKAGE, VIR_INSTALL_PATH(LOCALEDIR)))
         goto error;
 #endif /* WITH_LIBINTL_H */
 
@@ -146,7 +146,7 @@ getSocketPath(virURI *uri)
         }
 
         if (STREQ_NULLABLE(uri->path, "/system")) {
-            sock_path = g_strdup_printf(RUNSTATEDIR "/libvirt/%s", sockbase);
+            sock_path = g_strdup_printf("%s/libvirt/%s", VIR_INSTALL_PATH(RUNSTATEDIR), sockbase);
         } else if (STREQ_NULLABLE(uri->path, "/session")) {
             sock_path = g_strdup_printf("%s/%s", rundir, sockbase);
         } else {

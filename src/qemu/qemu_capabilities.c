@@ -21,6 +21,7 @@
 
 #include <config.h>
 
+#include "virutsname.h"
 #include "qemu_capabilities.h"
 #include "viralloc.h"
 #include "virarch.h"
@@ -50,7 +51,6 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#include <sys/utsname.h>
 #ifdef __APPLE__
 # include <sys/types.h>
 # include <sys/sysctl.h>
@@ -776,6 +776,7 @@ VIR_ENUM_IMPL(virQEMUCaps,
               "arm-smmuv3.cmdqv", /* QEMU_CAPS_ARM_SMMUV3_CMDQV */
               "iothread.poll-weight", /* QEMU_CAPS_IOTHREAD_POLL_WEIGHT */
               "win-dmp.guest-aware", /* QEMU_CAPS_WIN_DMP_GUEST_AWARE */
+              "whpx", /* QEMU_CAPS_WHPX */
     );
 
 
@@ -871,6 +872,7 @@ struct _virQEMUCaps {
     virQEMUCapsAccel hvf;
     virQEMUCapsAccel tcg;
     virQEMUCapsAccel mshv;
+    virQEMUCapsAccel whpx;
 };
 
 static virClass *virQEMUCapsClass;
@@ -970,7 +972,8 @@ virQEMUCapsHaveAccel(virQEMUCaps *qemuCaps)
 {
     return virQEMUCapsGet(qemuCaps, QEMU_CAPS_KVM) ||
            virQEMUCapsGet(qemuCaps, QEMU_CAPS_HVF) ||
-           virQEMUCapsGet(qemuCaps, QEMU_CAPS_MSHV);
+           virQEMUCapsGet(qemuCaps, QEMU_CAPS_MSHV) ||
+           virQEMUCapsGet(qemuCaps, QEMU_CAPS_WHPX);
 }
 
 
@@ -983,6 +986,8 @@ virQEMUCapsAccelStr(virDomainVirtType type)
         return "hvf";
     else if (type == VIR_DOMAIN_VIRT_HYPERV)
         return "mshv";
+    else if (type == VIR_DOMAIN_VIRT_WHPX)
+        return "whpx";
 
     return "tcg";
 }
@@ -998,6 +1003,8 @@ virQEMUCapsGetAccel(virQEMUCaps *qemuCaps,
         return &qemuCaps->hvf;
     else if (type == VIR_DOMAIN_VIRT_HYPERV)
         return &qemuCaps->mshv;
+    else if (type == VIR_DOMAIN_VIRT_WHPX)
+        return &qemuCaps->whpx;
 
     return &qemuCaps->tcg;
 }
@@ -1107,6 +1114,8 @@ virQEMUCapsGetMachineTypesCaps(virQEMUCaps *qemuCaps,
         accel = &qemuCaps->hvf;
     else if (virQEMUCapsGet(qemuCaps, QEMU_CAPS_MSHV))
         accel = &qemuCaps->mshv;
+    else if (virQEMUCapsGet(qemuCaps, QEMU_CAPS_WHPX))
+        accel = &qemuCaps->whpx;
     else
         accel = &qemuCaps->tcg;
 
@@ -1217,6 +1226,10 @@ virQEMUCapsInitGuestFromBinary(virCaps *caps,
     }
     if (virQEMUCapsGet(qemuCaps, QEMU_CAPS_MSHV)) {
         virCapabilitiesAddGuestDomain(guest, VIR_DOMAIN_VIRT_HYPERV,
+                                      NULL, NULL, 0, NULL);
+    }
+    if (virQEMUCapsGet(qemuCaps, QEMU_CAPS_WHPX)) {
+        virCapabilitiesAddGuestDomain(guest, VIR_DOMAIN_VIRT_WHPX,
                                       NULL, NULL, 0, NULL);
     }
 
@@ -1916,6 +1929,10 @@ virQEMUCapsProcessStringFlags(virQEMUCaps *qemuCaps,
     size_t i;
     char **value;
 
+    /* the probed type may not exist in this QEMU (DeviceNotFound) */
+    if (!values)
+        return;
+
     for (i = 0; i < nflags; i++) {
         if (virQEMUCapsGet(qemuCaps, flags[i].flag))
             continue;
@@ -2143,6 +2160,8 @@ virQEMUCapsNewCopy(virQEMUCaps *qemuCaps)
 
     virQEMUCapsAccelCopy(&ret->kvm, &qemuCaps->kvm);
     virQEMUCapsAccelCopy(&ret->hvf, &qemuCaps->hvf);
+    virQEMUCapsAccelCopy(&ret->mshv, &qemuCaps->mshv);
+    virQEMUCapsAccelCopy(&ret->whpx, &qemuCaps->whpx);
     virQEMUCapsAccelCopy(&ret->tcg, &qemuCaps->tcg);
     virQEMUCapsAccelCopy(&ret->mshv, &qemuCaps->mshv);
 
@@ -2203,6 +2222,8 @@ void virQEMUCapsDispose(void *obj)
 
     virQEMUCapsAccelClear(&qemuCaps->kvm);
     virQEMUCapsAccelClear(&qemuCaps->hvf);
+    virQEMUCapsAccelClear(&qemuCaps->mshv);
+    virQEMUCapsAccelClear(&qemuCaps->whpx);
     virQEMUCapsAccelClear(&qemuCaps->tcg);
     virQEMUCapsAccelClear(&qemuCaps->mshv);
 }
@@ -2434,6 +2455,10 @@ virQEMUCapsIsVirtTypeSupported(virQEMUCaps *qemuCaps,
 
     if (virtType == VIR_DOMAIN_VIRT_HYPERV &&
         virQEMUCapsGet(qemuCaps, QEMU_CAPS_MSHV))
+        return true;
+
+    if (virtType == VIR_DOMAIN_VIRT_WHPX &&
+        virQEMUCapsGet(qemuCaps, QEMU_CAPS_WHPX))
         return true;
 
     return false;
@@ -3009,6 +3034,7 @@ virQEMUCapsHasMachines(virQEMUCaps *qemuCaps)
     return !!qemuCaps->kvm.nmachineTypes ||
            !!qemuCaps->hvf.nmachineTypes ||
            !!qemuCaps->mshv.nmachineTypes ||
+           !!qemuCaps->whpx.nmachineTypes ||
            !!qemuCaps->tcg.nmachineTypes;
 }
 
@@ -3585,6 +3611,8 @@ virQEMUCapsProbeAccels(virQEMUCaps *qemuCaps,
         virQEMUCapsSet(qemuCaps, QEMU_CAPS_KVM);
     else if (STREQ(enabled, "mshv"))
         virQEMUCapsSet(qemuCaps, QEMU_CAPS_MSHV);
+    else if (STREQ(enabled, "whpx"))
+        virQEMUCapsSet(qemuCaps, QEMU_CAPS_WHPX);
 
     return 0;
 }
@@ -5075,6 +5103,10 @@ virQEMUCapsLoadCache(virArch hostArch,
         virQEMUCapsLoadAccel(qemuCaps, ctxt, VIR_DOMAIN_VIRT_HYPERV) < 0) {
         return -1;
     }
+    if (virQEMUCapsGet(qemuCaps, QEMU_CAPS_WHPX) &&
+        virQEMUCapsLoadAccel(qemuCaps, ctxt, VIR_DOMAIN_VIRT_WHPX) < 0) {
+        return -1;
+    }
     if (virQEMUCapsLoadAccel(qemuCaps, ctxt, VIR_DOMAIN_VIRT_QEMU) < 0)
         return -1;
 
@@ -5096,6 +5128,8 @@ virQEMUCapsLoadCache(virArch hostArch,
         virQEMUCapsInitHostCPUModel(qemuCaps, hostArch, VIR_DOMAIN_VIRT_HVF);
     if (virQEMUCapsGet(qemuCaps, QEMU_CAPS_MSHV))
         virQEMUCapsInitHostCPUModel(qemuCaps, hostArch, VIR_DOMAIN_VIRT_HYPERV);
+    if (virQEMUCapsGet(qemuCaps, QEMU_CAPS_WHPX))
+        virQEMUCapsInitHostCPUModel(qemuCaps, hostArch, VIR_DOMAIN_VIRT_WHPX);
     virQEMUCapsInitHostCPUModel(qemuCaps, hostArch, VIR_DOMAIN_VIRT_QEMU);
 
     if (virXPathBoolean("boolean(./kvmSupportsNesting)", ctxt) > 0)
@@ -5448,6 +5482,8 @@ virQEMUCapsFormatCache(virQEMUCaps *qemuCaps)
         virQEMUCapsFormatAccel(qemuCaps, &buf, VIR_DOMAIN_VIRT_HVF);
     if (virQEMUCapsGet(qemuCaps, QEMU_CAPS_MSHV))
         virQEMUCapsFormatAccel(qemuCaps, &buf, VIR_DOMAIN_VIRT_HYPERV);
+    if (virQEMUCapsGet(qemuCaps, QEMU_CAPS_WHPX))
+        virQEMUCapsFormatAccel(qemuCaps, &buf, VIR_DOMAIN_VIRT_WHPX);
     virQEMUCapsFormatAccel(qemuCaps, &buf, VIR_DOMAIN_VIRT_QEMU);
 
     for (i = 0; i < qemuCaps->ngicCapabilities; i++) {
@@ -5736,11 +5772,11 @@ virQEMUCapsIsValid(void *data,
         return false;
     }
 
-    if (sb.st_ctime != qemuCaps->ctime) {
+    if (VIR_STAT_CHANGE_TIME(sb) != qemuCaps->ctime) {
         VIR_DEBUG("Outdated capabilities for '%s': QEMU binary changed "
                   "(%lld vs %lld)",
                   qemuCaps->binary,
-                  (long long)sb.st_ctime, (long long)qemuCaps->ctime);
+                  (long long)VIR_STAT_CHANGE_TIME(sb), (long long)qemuCaps->ctime);
         return false;
     }
 
@@ -5958,6 +5994,9 @@ virQEMUCapsGetVirtType(virQEMUCaps *qemuCaps)
     if (virQEMUCapsGet(qemuCaps, QEMU_CAPS_MSHV))
         return VIR_DOMAIN_VIRT_HYPERV;
 
+    if (virQEMUCapsGet(qemuCaps, QEMU_CAPS_WHPX))
+        return VIR_DOMAIN_VIRT_WHPX;
+
     if (virQEMUCapsGet(qemuCaps, QEMU_CAPS_TCG))
         return VIR_DOMAIN_VIRT_QEMU;
 
@@ -6169,7 +6208,7 @@ virQEMUCapsNewForBinaryInternal(virArch hostArch,
                              binary);
         return NULL;
     }
-    qemuCaps->ctime = sb.st_ctime;
+    qemuCaps->ctime = VIR_STAT_CHANGE_TIME(sb);
 
     /* Make sure the binary we are about to try exec'ing exists.
      * Technically we could catch the exec() failure, but that's
@@ -6206,6 +6245,8 @@ virQEMUCapsNewForBinaryInternal(virArch hostArch,
         virQEMUCapsInitHostCPUModel(qemuCaps, hostArch, VIR_DOMAIN_VIRT_HVF);
     if (virQEMUCapsGet(qemuCaps, QEMU_CAPS_MSHV))
         virQEMUCapsInitHostCPUModel(qemuCaps, hostArch, VIR_DOMAIN_VIRT_HYPERV);
+    if (virQEMUCapsGet(qemuCaps, QEMU_CAPS_WHPX))
+        virQEMUCapsInitHostCPUModel(qemuCaps, hostArch, VIR_DOMAIN_VIRT_WHPX);
 
     virQEMUCapsInitHostCPUModel(qemuCaps, hostArch, VIR_DOMAIN_VIRT_QEMU);
 
@@ -7544,4 +7585,5 @@ virQEMUCapsStripMachineAliases(virQEMUCaps *qemuCaps)
     virQEMUCapsStripMachineAliasesForVirtType(qemuCaps, VIR_DOMAIN_VIRT_HVF);
     virQEMUCapsStripMachineAliasesForVirtType(qemuCaps, VIR_DOMAIN_VIRT_QEMU);
     virQEMUCapsStripMachineAliasesForVirtType(qemuCaps, VIR_DOMAIN_VIRT_HYPERV);
+    virQEMUCapsStripMachineAliasesForVirtType(qemuCaps, VIR_DOMAIN_VIRT_WHPX);
 }

@@ -196,7 +196,7 @@ static virLXCController *virLXCControllerNew(const char *name)
     if (!(driver = virLXCControllerDriverNew()))
         goto error;
 
-    configFile = virDomainConfigFile(LXC_STATE_DIR, ctrl->name);
+    configFile = virDomainConfigFile(VIR_INSTALL_PATH(LXC_STATE_DIR), ctrl->name);
 
     if ((ctrl->vm = virDomainObjParseFile(configFile,
                                           driver->xmlopt,
@@ -920,7 +920,7 @@ static int virLXCControllerSetupServer(virLXCController *ctrl)
     virNetServerService *svc = NULL;
     g_autofree char *sockpath = NULL;
 
-    sockpath = g_strdup_printf("%s/%s.sock", LXC_STATE_DIR, ctrl->name);
+    sockpath = g_strdup_printf("%s/%s.sock", VIR_INSTALL_PATH(LXC_STATE_DIR), ctrl->name);
 
     if (!(srv = virNetServerNew("LXC", 1,
                                 0, 0, 0, 1,
@@ -1421,7 +1421,7 @@ static int virLXCControllerSetupDev(virLXCController *ctrl)
     mount_options = virSecurityManagerGetMountOptions(ctrl->securityManager,
                                                       ctrl->def);
 
-    dev = g_strdup_printf("/%s/%s.dev", LXC_STATE_DIR, ctrl->def->name);
+    dev = g_strdup_printf("/%s/%s.dev", VIR_INSTALL_PATH(LXC_STATE_DIR), ctrl->def->name);
 
     /*
      * tmpfs is limited to 64kb, since we only have device nodes in there
@@ -1464,7 +1464,7 @@ static int virLXCControllerPopulateDevices(virLXCController *ctrl)
         g_autofree char *path = NULL;
         dev_t dev;
 
-        path = g_strdup_printf("/%s/%s.dev/%s", LXC_STATE_DIR, ctrl->def->name,
+        path = g_strdup_printf("/%s/%s.dev/%s", VIR_INSTALL_PATH(LXC_STATE_DIR), ctrl->def->name,
                                devs[i].path);
 
         dev = makedev(devs[i].maj, devs[i].min);
@@ -1519,12 +1519,12 @@ virLXCControllerSetupTimers(virLXCController *ctrl)
             return -1;
         case VIR_DOMAIN_TIMER_NAME_RTC:
             timer_dev = "/dev/rtc0";
-            path = g_strdup_printf("/%s/%s.dev/%s", LXC_STATE_DIR,
+            path = g_strdup_printf("/%s/%s.dev/%s", VIR_INSTALL_PATH(LXC_STATE_DIR),
                                    def->name, "/rtc");
             break;
         case VIR_DOMAIN_TIMER_NAME_HPET:
             timer_dev = "/dev/hpet";
-            path = g_strdup_printf("/%s/%s.dev/%s", LXC_STATE_DIR,
+            path = g_strdup_printf("/%s/%s.dev/%s", VIR_INSTALL_PATH(LXC_STATE_DIR),
                                    ctrl->def->name, "/hpet");
             break;
         }
@@ -1570,7 +1570,7 @@ virLXCControllerSetupHostdevSubsysUSB(virDomainDef *vmDef,
 
     src = g_strdup_printf(USB_DEVFS "/%03d/%03d", usbsrc->bus, usbsrc->device);
 
-    vroot = g_strdup_printf("/%s/%s.dev/bus/usb/", LXC_STATE_DIR, vmDef->name);
+    vroot = g_strdup_printf("/%s/%s.dev/bus/usb/", VIR_INSTALL_PATH(LXC_STATE_DIR), vmDef->name);
 
     dstdir = g_strdup_printf("%s/%03d/", vroot, usbsrc->bus);
 
@@ -1641,7 +1641,7 @@ virLXCControllerSetupHostdevCapsStorage(virDomainDef *vmDef,
     while (*(path + len) == '/')
         len++;
 
-    dst = g_strdup_printf("/%s/%s.dev/%s", LXC_STATE_DIR, vmDef->name,
+    dst = g_strdup_printf("/%s/%s.dev/%s", VIR_INSTALL_PATH(LXC_STATE_DIR), vmDef->name,
                           strchr(path + len, '/'));
 
     if (stat(dev, &sb) < 0) {
@@ -1715,7 +1715,7 @@ virLXCControllerSetupHostdevCapsMisc(virDomainDef *vmDef,
     while (*(path + len) == '/')
         len++;
 
-    dst = g_strdup_printf("/%s/%s.dev/%s", LXC_STATE_DIR, vmDef->name,
+    dst = g_strdup_printf("/%s/%s.dev/%s", VIR_INSTALL_PATH(LXC_STATE_DIR), vmDef->name,
                           strchr(path + len, '/'));
 
     if (stat(dev, &sb) < 0) {
@@ -1876,7 +1876,7 @@ static int virLXCControllerSetupDisk(virLXCController *ctrl,
         goto cleanup;
     }
 
-    dst = g_strdup_printf("/%s/%s.dev/%s", LXC_STATE_DIR, ctrl->def->name,
+    dst = g_strdup_printf("/%s/%s.dev/%s", VIR_INSTALL_PATH(LXC_STATE_DIR), ctrl->def->name,
                           def->dst);
 
     if (stat(def->src->path, &sb) < 0) {
@@ -2060,7 +2060,7 @@ lxcCreateTty(virLXCController *ctrl, int *ttyprimary,
      * kernels, we can skip those steps.  ptyno shouldn't currently be
      * anything other than 0, but let's play it safe.  */
     *ttyName = g_strdup_printf("/dev/pts/%d", ptyno);
-    *ttyHostPath = g_strdup_printf("/%s/%s.devpts/%d", LXC_STATE_DIR, ctrl->def->name, ptyno);
+    *ttyHostPath = g_strdup_printf("/%s/%s.devpts/%d", VIR_INSTALL_PATH(LXC_STATE_DIR), ctrl->def->name, ptyno);
 
     ret = 0;
 
@@ -2115,8 +2115,8 @@ virLXCControllerSetupDevPTS(virLXCController *ctrl)
     mount_options = virSecurityManagerGetMountOptions(ctrl->securityManager,
                                                       ctrl->def);
 
-    devpts = g_strdup_printf("%s/%s.devpts", LXC_STATE_DIR, ctrl->def->name);
-    ctrl->devptmx = g_strdup_printf("%s/%s.devpts/ptmx", LXC_STATE_DIR, ctrl->def->name);
+    devpts = g_strdup_printf("%s/%s.devpts", VIR_INSTALL_PATH(LXC_STATE_DIR), ctrl->def->name);
+    ctrl->devptmx = g_strdup_printf("%s/%s.devpts/ptmx", VIR_INSTALL_PATH(LXC_STATE_DIR), ctrl->def->name);
 
     if (g_mkdir_with_parents(devpts, 0777) < 0) {
         virReportSystemError(errno,
@@ -2677,10 +2677,10 @@ int main(int argc, char *argv[])
             goto cleanup;
 
         if (pid > 0) {
-            if ((rc = virPidFileWrite(LXC_STATE_DIR, name, pid)) < 0) {
+            if ((rc = virPidFileWrite(VIR_INSTALL_PATH(LXC_STATE_DIR), name, pid)) < 0) {
                 virReportSystemError(-rc,
                                      _("Unable to write pid file '%1$s/%2$s.pid'"),
-                                     LXC_STATE_DIR, name);
+                                     VIR_INSTALL_PATH(LXC_STATE_DIR), name);
                 _exit(1);
             }
 
@@ -2713,7 +2713,7 @@ int main(int argc, char *argv[])
                 virGetLastErrorMessage());
     }
 
-    virPidFileDelete(LXC_STATE_DIR, name);
+    virPidFileDelete(VIR_INSTALL_PATH(LXC_STATE_DIR), name);
     if (ctrl)
         virLXCControllerDeleteInterfaces(ctrl);
     for (i = 0; i < nttyFDs; i++)

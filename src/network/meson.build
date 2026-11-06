@@ -95,13 +95,32 @@ if conf.has('WITH_NETWORK')
     'name': 'virtnetworkd',
   }
 
-  virt_helpers += {
-    'name': 'libvirt_leaseshelper',
-    'sources': [
-      network_leases_helper_sources,
-      dtrace_gen_objects,
-    ],
-  }
+  if host_machine.system() == 'windows'
+    # no bridge, TAP device nor dnsmasq: a switch with libslirp as its
+    # gateway, which serves DHCP and DNS itself
+    virt_helpers += {
+      'name': 'libvirt_netswitch',
+      'sources': [
+        files('netswitch.c'),
+      ],
+      'include': [
+        conf_inc_dir,
+      ],
+      'deps': [
+        dependency('slirp', version: '>=4.7.0'),
+        cc.find_library('iphlpapi'),
+        cc.find_library('ws2_32'),
+      ],
+    }
+  else
+    virt_helpers += {
+      'name': 'libvirt_leaseshelper',
+      'sources': [
+        network_leases_helper_sources,
+        dtrace_gen_objects,
+      ],
+    }
+  endif
 
   virt_daemon_units += {
     'service': 'virtnetworkd',

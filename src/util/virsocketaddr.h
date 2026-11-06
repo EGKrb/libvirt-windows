@@ -28,9 +28,7 @@ typedef struct {
         struct sockaddr_storage stor;
         struct sockaddr_in inet4;
         struct sockaddr_in6 inet6;
-#ifndef WIN32
         struct sockaddr_un un;
-#endif
     } data;
     socklen_t len;
 } virSocketAddr;

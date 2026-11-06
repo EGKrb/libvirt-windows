@@ -34,6 +34,7 @@
 #include "virlog.h"
 #include "viruuid.h"
 #include "virfile.h"
+#include "virutil.h"
 #include "virpidfile.h"
 #include "configmake.h"
 #include "qemu_tpm.h"

@@ -84,6 +84,20 @@ static inline int getegid(void)
 { return 0; }
 #endif
 
+#ifdef WIN32
+/* Windows has no Unix owners: everything belongs to the account of the
+ * process (uid 0), so changing the owner is a no-op */
+static inline int chown(const char *path G_GNUC_UNUSED,
+                        uid_t uid G_GNUC_UNUSED, gid_t gid G_GNUC_UNUSED)
+{ return 0; }
+static inline int lchown(const char *path G_GNUC_UNUSED,
+                         uid_t uid G_GNUC_UNUSED, gid_t gid G_GNUC_UNUSED)
+{ return 0; }
+static inline int fchown(int fd G_GNUC_UNUSED,
+                         uid_t uid G_GNUC_UNUSED, gid_t gid G_GNUC_UNUSED)
+{ return 0; }
+#endif
+
 #ifdef FUNC_PTHREAD_SIGMASK_BROKEN
 # undef pthread_sigmask
 static inline int pthread_sigmask(int how,

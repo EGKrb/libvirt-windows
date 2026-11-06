@@ -38,6 +38,11 @@
 #include "configmake.h"
 #include "virtypedparam.h"
 
+#ifdef WIN32
+# define WIN32_LEAN_AND_MEAN
+# include <windows.h>
+#endif
+
 VIR_LOG_INIT("driver");
 
 #define VIR_FROM_THIS VIR_FROM_NONE
@@ -60,7 +65,7 @@ virDriverLoadModule(const char *name,
                                             "libvirt_driver_",
                                             VIR_FILE_MODULE_EXT,
                                             abs_top_builddir "/src",
-                                            DEFAULT_DRIVER_DIR,
+                                            VIR_INSTALL_PATH(DEFAULT_DRIVER_DIR),
                                             "LIBVIRT_DRIVER_DIR")))
         return -1;
 
@@ -91,6 +96,20 @@ virDriverShouldAutostart(const char *dir,
     *autostart = false;
 
     path = g_strdup_printf("%s/autostarted", dir);
+
+#ifdef WIN32
+    {
+        /* @dir is not emptied at boot as /run is: a mark left before the
+         * last boot of Windows does not count */
+        GStatBuf sb;
+        time_t boot = time(NULL) - (time_t)(GetTickCount64() / 1000);
+
+        if (g_stat(path, &sb) == 0 && sb.st_mtime < boot) {
+            VIR_DEBUG("Autostart file %s predates the boot, removing it", path);
+            unlink(path);
+        }
+    }
+#endif
 
     if (virFileExists(path)) {
         VIR_DEBUG("Autostart file %s exists, skipping autostart", path);

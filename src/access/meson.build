@@ -69,7 +69,7 @@ polgen = custom_target(
   'org.libvirt.api.policy.in',
   input: access_perm_h,
   output: 'org.libvirt.api.policy.in',
-  command: [ meson_python_prog, python3_prog, genpolkit_prog, '@INPUT@' ],
+  command: [ meson_python_prog, python3_prog.full_path(), genpolkit_prog.full_path(), '@INPUT@' ],
   capture: true,
   build_by_default: true,
 )

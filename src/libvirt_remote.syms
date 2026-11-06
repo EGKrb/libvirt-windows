@@ -7,11 +7,32 @@
 
 # Generated files
 xdr_*;
-# Hack only required for Win32 to make tests link properly,
-# as the wildcard above doesn't work there. Fortunately
-# Win32 builds don't require the other xdr_* syms exported.
-# since there's no libvirtd built.
+# The wildcard above doesn't work for Win32 DLLs: list the generated
+# functions of rpc/virnetprotocol.x and rpc/virkeepaliveprotocol.x,
+# which the tests and the daemons use.
+xdr_keepalive_procedure;
+xdr_virNetMessageDomain;
+xdr_virNetMessageDomain_clear;
 xdr_virNetMessageError;
+xdr_virNetMessageError_clear;
+xdr_virNetMessageHeader;
+xdr_virNetMessageHeader_clear;
+xdr_virNetMessageNetwork;
+xdr_virNetMessageNetwork_clear;
+xdr_virNetMessageNonnullDomain;
+xdr_virNetMessageNonnullDomain_clear;
+xdr_virNetMessageNonnullNetwork;
+xdr_virNetMessageNonnullNetwork_clear;
+xdr_virNetMessageNonnullString;
+xdr_virNetMessageNonnullString_clear;
+xdr_virNetMessageStatus;
+xdr_virNetMessageString;
+xdr_virNetMessageString_clear;
+xdr_virNetMessageType;
+xdr_virNetMessageUUID;
+xdr_virNetMessageUUID_clear;
+xdr_virNetStreamHole;
+xdr_virNetStreamHole_clear;
 
 
 # remote/remote_sockets.h

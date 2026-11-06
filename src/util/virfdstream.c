@@ -45,7 +45,44 @@
 
 VIR_LOG_INIT("fdstream");
 
-#ifndef WIN32
+/*
+ * On Windows the event loop only watches sockets: the channel between a
+ * stream and its I/O thread is a socket pair rather than a pipe, and the
+ * fd of a stream, a socket or a file, is read and written accordingly.
+ */
+#ifdef WIN32
+static bool
+virFDStreamIsSocket(int fd)
+{
+    int type;
+    socklen_t len = sizeof(type);
+
+    return getsockopt(fd, SOL_SOCKET, SO_TYPE, (char *) &type, &len) == 0;
+}
+
+static ssize_t
+virFDStreamFDRead(int fd, void *buf, size_t len)
+{
+    return virFDStreamIsSocket(fd) ? vir_recv(fd, buf, len) : read(fd, buf, len);
+}
+
+static ssize_t
+virFDStreamFDWrite(int fd, const void *buf, size_t len)
+{
+    return virFDStreamIsSocket(fd) ? vir_send(fd, buf, len) : write(fd, buf, len);
+}
+
+# define virFDStreamFDSafeRead(fd, buf, len) virFDStreamFDRead(fd, buf, len)
+# define virFDStreamFDSafeWrite(fd, buf, len) virFDStreamFDWrite(fd, buf, len)
+# define virFDStreamChannel(fds) virSocketPair(fds)
+#else
+# define virFDStreamFDRead(fd, buf, len) read(fd, buf, len)
+# define virFDStreamFDWrite(fd, buf, len) write(fd, buf, len) /* sc_avoid_write */
+# define virFDStreamFDSafeRead(fd, buf, len) saferead(fd, buf, len)
+# define virFDStreamFDSafeWrite(fd, buf, len) safewrite(fd, buf, len)
+# define virFDStreamChannel(fds) virPipe(fds)
+#endif
+
 typedef enum {
     VIR_FDSTREAM_MSG_TYPE_DATA,
     VIR_FDSTREAM_MSG_TYPE_HOLE,
@@ -150,7 +187,7 @@ virFDStreamMsgQueuePush(virFDStreamData *fdst,
     *tmp = g_steal_pointer(msg);
     virCondSignal(&fdst->threadCond);
 
-    if (safewrite(fd, &c, sizeof(c)) != sizeof(c)) {
+    if (virFDStreamFDSafeWrite(fd, &c, sizeof(c)) != sizeof(c)) {
         virReportSystemError(errno,
                              _("Unable to write to %1$s"),
                              fdname);
@@ -175,7 +212,7 @@ virFDStreamMsgQueuePop(virFDStreamData *fdst,
 
     virCondSignal(&fdst->threadCond);
 
-    if (saferead(fd, &c, sizeof(c)) != sizeof(c)) {
+    if (virFDStreamFDSafeRead(fd, &c, sizeof(c)) != sizeof(c)) {
         virReportSystemError(errno,
                              _("Unable to read from %1$s"),
                              fdname);
@@ -849,7 +886,7 @@ static int virFDStreamWrite(virStreamPtr st, const char *bytes, size_t nbytes)
         ret = nbytes;
     } else {
      retry:
-        ret = write(fdst->fd, bytes, nbytes); /* sc_avoid_write */
+        ret = virFDStreamFDWrite(fdst->fd, bytes, nbytes);
         if (ret < 0) {
             VIR_WARNINGS_NO_WLOGICALOP_EQUAL_EXPR
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -981,7 +1018,7 @@ static int virFDStreamRead(virStreamPtr st, char *bytes, size_t nbytes)
         ret = got;
     } else {
      retry:
-        ret = read(fdst->fd, bytes, nbytes);
+        ret = virFDStreamFDRead(fdst->fd, bytes, nbytes);
         if (ret < 0) {
             VIR_WARNINGS_NO_WLOGICALOP_EQUAL_EXPR
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -1279,6 +1316,10 @@ virFDStreamOpenFileInternal(virStreamPtr st,
               st, path, oflags, offset, length, mode);
 
     oflags |= O_NOCTTY;
+#ifdef WIN32
+    /* whatever the default mode of the program embedding libvirt */
+    oflags |= O_BINARY;
+#endif
 
     if (oflags & O_CREAT)
         fd = open(path, oflags, mode);
@@ -1323,8 +1364,11 @@ virFDStreamOpenFileInternal(virStreamPtr st,
             goto error;
         }
 
-        if (virPipe(pipefds) < 0)
+        if (virFDStreamChannel(pipefds) < 0) {
+            virReportSystemError(errno, "%s",
+                                 _("Unable to create the stream I/O channel"));
             goto error;
+        }
 
         threadData = g_new0(virFDStreamThreadData, 1);
 
@@ -1401,6 +1445,12 @@ int virFDStreamOpenPTY(virStreamPtr st,
                        unsigned long long length,
                        int oflags)
 {
+#ifdef WIN32
+    virReportSystemError(ENOSYS,
+                         _("Opening the terminal %1$s is not supported on Windows"),
+                         path);
+    return -1;
+#else
     virFDStreamData *fdst = NULL;
     struct termios rawattr;
 
@@ -1433,6 +1483,7 @@ int virFDStreamOpenPTY(virStreamPtr st,
  cleanup:
     virFDStreamClose(st);
     return -1;
+#endif /* WIN32 */
 }
 
 int virFDStreamOpenBlockDevice(virStreamPtr st,
@@ -1467,92 +1518,3 @@ int virFDStreamSetInternalCloseCb(virStreamPtr st,
     return 0;
 }
 
-#else /* WIN32 */
-
-int
-virFDStreamOpen(virStreamPtr st G_GNUC_UNUSED,
-                int fd G_GNUC_UNUSED)
-{
-    virReportSystemError(ENOSYS, "%s",
-                         _("File streams are not supported on this platform"));
-    return -1;
-}
-
-
-int
-virFDStreamConnectUNIX(virStreamPtr st G_GNUC_UNUSED,
-                       const char *path G_GNUC_UNUSED,
-                       bool abstract G_GNUC_UNUSED)
-{
-    virReportSystemError(ENOSYS, "%s",
-                         _("File streams are not supported on this platform"));
-    return -1;
-}
-
-
-int
-virFDStreamOpenFile(virStreamPtr st G_GNUC_UNUSED,
-                    const char *path G_GNUC_UNUSED,
-                    unsigned long long offset G_GNUC_UNUSED,
-                    unsigned long long length G_GNUC_UNUSED,
-                    int oflags G_GNUC_UNUSED)
-{
-    virReportSystemError(ENOSYS, "%s",
-                         _("File streams are not supported on this platform"));
-    return -1;
-}
-
-
-int
-virFDStreamCreateFile(virStreamPtr st G_GNUC_UNUSED,
-                      const char *path G_GNUC_UNUSED,
-                      unsigned long long offset G_GNUC_UNUSED,
-                      unsigned long long length G_GNUC_UNUSED,
-                      int oflags G_GNUC_UNUSED,
-                      mode_t mode G_GNUC_UNUSED)
-{
-    virReportSystemError(ENOSYS, "%s",
-                         _("File streams are not supported on this platform"));
-    return -1;
-}
-
-
-int
-virFDStreamOpenPTY(virStreamPtr st G_GNUC_UNUSED,
-                   const char *path G_GNUC_UNUSED,
-                   unsigned long long offset G_GNUC_UNUSED,
-                   unsigned long long length G_GNUC_UNUSED,
-                   int oflags G_GNUC_UNUSED)
-{
-    virReportSystemError(ENOSYS, "%s",
-                         _("File streams are not supported on this platform"));
-    return -1;
-}
-
-
-int
-virFDStreamOpenBlockDevice(virStreamPtr st G_GNUC_UNUSED,
-                           const char *path G_GNUC_UNUSED,
-                           unsigned long long offset G_GNUC_UNUSED,
-                           unsigned long long length G_GNUC_UNUSED,
-                           bool sparse G_GNUC_UNUSED,
-                           int oflags G_GNUC_UNUSED)
-{
-    virReportSystemError(ENOSYS, "%s",
-                         _("File streams are not supported on this platform"));
-    return -1;
-}
-
-
-int
-virFDStreamSetInternalCloseCb(virStreamPtr st G_GNUC_UNUSED,
-                              virFDStreamInternalCloseCb cb G_GNUC_UNUSED,
-                              void *opaque G_GNUC_UNUSED,
-                              virFDStreamInternalCloseCbFreeOpaque fcb G_GNUC_UNUSED)
-{
-    virReportSystemError(ENOSYS, "%s",
-                         _("File streams are not supported on this platform"));
-    return -1;
-}
-
-#endif /* WIN32 */

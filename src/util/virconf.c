@@ -1542,7 +1542,7 @@ virConfLoadConfigPath(const char *name)
 {
     char *path;
     if (geteuid() == 0) {
-        path = g_strdup_printf("%s/libvirt/%s", SYSCONFDIR, name);
+        path = g_strdup_printf("%s/libvirt/%s", VIR_INSTALL_PATH(SYSCONFDIR), name);
     } else {
         g_autofree char *userdir = virGetUserConfigDirectory();
 

@@ -171,7 +171,7 @@ virLogSetDefaultOutputToFile(const char *binary, bool privileged)
 
     if (privileged) {
         virLogDefaultOutput = g_strdup_printf("%d:file:%s/log/libvirt/%s.log",
-                                              virLogDefaultPriority, LOCALSTATEDIR, binary);
+                                              virLogDefaultPriority, VIR_INSTALL_PATH(LOCALSTATEDIR), binary);
     } else {
         logdir = virGetUserCacheDirectory();
 
@@ -1552,9 +1552,10 @@ virLogParseOutput(const char *src)
     VIR_DEBUG("output=%s", src);
 
     /* split our format prio:destination:additional_data to tokens and parse
-     * them individually
+     * them individually; the data of a file is a path, which may contain ':'
+     * (C:/... on Windows)
      */
-    if (!(tokens = g_strsplit(src, ":", 0)) ||
+    if (!(tokens = g_strsplit(src, ":", 3)) ||
         (count = g_strv_length(tokens)) < 2) {
         virReportError(VIR_ERR_INVALID_ARG,
                        _("Malformed format for log output '%1$s'"), src);
@@ -1579,7 +1580,8 @@ virLogParseOutput(const char *src)
     if (((dest == VIR_LOG_TO_STDERR ||
           dest == VIR_LOG_TO_JOURNALD) && count != 2) ||
         ((dest == VIR_LOG_TO_FILE ||
-          dest == VIR_LOG_TO_SYSLOG) && count != 3)) {
+          dest == VIR_LOG_TO_SYSLOG) && count != 3) ||
+        (dest == VIR_LOG_TO_SYSLOG && strchr(tokens[2], ':'))) {
         virReportError(VIR_ERR_INVALID_ARG,
                        _("Log output '%1$s' does not meet the format requirements for destination type '%2$s'"),
                        src, tokens[1]);
@@ -1708,11 +1710,26 @@ virLogParseOutputs(const char *src, virLogOutput ***outputs)
         return -1;
 
     for (next = strings; *next; next++) {
+        g_autoptr(GString) spec = NULL;
+
         /* g_strsplit may return empty strings */
         if (STREQ(*next, ""))
             continue;
 
-        if (!(output = virLogParseOutput(*next)))
+        /*
+         * Each output starts with its priority: words that don't are the
+         * rest of the path of a file output containing spaces (as in
+         * C:/Program Files on Windows).
+         */
+        spec = g_string_new(*next);
+        if (strstr(*next, ":file:")) {
+            while (next[1] && !(g_ascii_isdigit(next[1][0]) && next[1][1] == ':')) {
+                next++;
+                g_string_append_printf(spec, " %s", *next);
+            }
+        }
+
+        if (!(output = virLogParseOutput(spec->str)))
             return -1;
 
         /* let's check if a duplicate output does not already exist in which

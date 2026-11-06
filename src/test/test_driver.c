@@ -8063,7 +8063,7 @@ testDomainScreenshot(virDomainPtr dom G_GNUC_UNUSED,
 
     ret = g_strdup("image/png");
 
-    if (virFDStreamOpenFile(st, PKGDATADIR "/test-screenshot.png", 0, 0, O_RDONLY) < 0)
+    if (virFDStreamOpenFile(st, VIR_INSTALL_PATH(PKGDATADIR "/test-screenshot.png"), 0, 0, O_RDONLY) < 0)
         VIR_FREE(ret);
 
     return ret;

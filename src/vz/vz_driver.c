@@ -4066,7 +4066,7 @@ vzStateCleanup(void)
     if (vz_driver_privileged) {
         g_clear_pointer(&vz_driver, virObjectUnref);
         if (vz_driver_lock_fd != -1)
-            virPidFileRelease(VZ_STATEDIR, "driver", vz_driver_lock_fd);
+            virPidFileRelease(VIR_INSTALL_PATH(VZ_STATEDIR), "driver", vz_driver_lock_fd);
         virMutexDestroy(&vz_driver_lock);
         prlsdkDeinit();
     }
@@ -4091,14 +4091,14 @@ vzStateInitialize(bool privileged,
 
     vz_driver_privileged = privileged;
 
-    if (g_mkdir_with_parents(VZ_STATEDIR, S_IRWXU) < 0) {
+    if (g_mkdir_with_parents(VIR_INSTALL_PATH(VZ_STATEDIR), S_IRWXU) < 0) {
         virReportSystemError(errno, _("cannot create state directory '%1$s'"),
-                             VZ_STATEDIR);
+                             VIR_INSTALL_PATH(VZ_STATEDIR));
         return VIR_DRV_STATE_INIT_ERROR;
     }
 
     if ((vz_driver_lock_fd =
-         virPidFileAcquire(VZ_STATEDIR, "driver", getpid())) < 0)
+         virPidFileAcquire(VIR_INSTALL_PATH(VZ_STATEDIR), "driver", getpid())) < 0)
         return VIR_DRV_STATE_INIT_ERROR;
 
     if (prlsdkInit() < 0) {

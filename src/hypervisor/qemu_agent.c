@@ -29,6 +29,7 @@
 #include <sys/time.h>
 #include <gio/gio.h>
 
+#include "virsocket.h"
 #include "qemu_agent.h"
 #include "viralloc.h"
 #include "virlog.h"
@@ -353,9 +354,15 @@ qemuAgentIOWrite(qemuAgent *agent)
     if (!agent->msg || agent->msg->txOffset == agent->msg->txLength)
         return 0;
 
+#ifdef WIN32
+    done = virSocketSendWatched(agent->socket, agent->fd,
+                                agent->msg->txBuffer + agent->msg->txOffset,
+                                agent->msg->txLength - agent->msg->txOffset);
+#else
     done = safewrite(agent->fd,
                      agent->msg->txBuffer + agent->msg->txOffset,
                      agent->msg->txLength - agent->msg->txOffset);
+#endif
 
     if (done < 0) {
         if (errno == EAGAIN)
@@ -397,9 +404,9 @@ qemuAgentIORead(qemuAgent *agent)
        until we block on EAGAIN, or hit EOF */
     while (avail > 1) {
         int got;
-        got = read(agent->fd,
-                   agent->buffer + agent->bufferOffset,
-                   avail - 1);
+        got = virSocketRecvWatched(agent->socket, agent->fd,
+                                   agent->buffer + agent->bufferOffset,
+                                   avail - 1);
         if (got < 0) {
             if (errno == EAGAIN)
                 break;
@@ -600,6 +607,7 @@ qemuAgentOpen(virDomainObj *vm,
 {
     qemuAgent *agent;
     g_autoptr(GError) gerr = NULL;
+    int gfd;
 
     if (!cb || !cb->eofNotify) {
         virReportError(VIR_ERR_INTERNAL_ERROR, "%s",
@@ -640,8 +648,10 @@ qemuAgentOpen(virDomainObj *vm,
 
     agent->context = g_main_context_ref(context);
 
-    agent->socket = g_socket_new_from_fd(agent->fd, &gerr);
+    gfd = virSocketGLibFD(agent->fd);
+    agent->socket = g_socket_new_from_fd(gfd, &gerr);
     if (!agent->socket) {
+        virSocketGLibFDFree(gfd);
         virReportError(VIR_ERR_INTERNAL_ERROR,
                        _("Unable to create socket object: %1$s"),
                        gerr->message);
@@ -702,6 +712,10 @@ void qemuAgentClose(qemuAgent *agent)
         if (agent->socket) {
             qemuAgentUnregister(agent);
             g_clear_pointer(&agent->socket, g_object_unref);
+#ifdef WIN32
+            /* the GSocket had its own handle, see virSocketGLibFD() */
+            VIR_FORCE_CLOSE(agent->fd);
+#endif
             agent->fd = -1;
         }
 

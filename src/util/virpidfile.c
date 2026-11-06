@@ -36,6 +36,11 @@
 #include "virstring.h"
 #include "virprocess.h"
 
+#ifdef WIN32
+# define WIN32_LEAN_AND_MEAN
+# include <windows.h>
+#endif
+
 #define VIR_FROM_THIS VIR_FROM_NONE
 
 VIR_LOG_INIT("util.pidfile");
@@ -184,6 +189,33 @@ int virPidFileRead(const char *dir,
  * alive, zero will be returned, but @pid will be
  * set to -1.
  */
+#ifdef WIN32
+/*
+ * Does a process whose image is @image run @binPath?  The same file, or
+ * the same name: Windows gives the name the image had when it started, or
+ * its name since an install renamed it to NAME.busy-STAMP to put the new
+ * version in its place (scripts/windows-install.py), as on Linux the
+ * /proc/$pid/exe link of a replaced binary ends in " (deleted)".
+ */
+static bool
+virPidFileWin32SameImage(const char *image, const char *binPath)
+{
+    g_autofree char *a = g_strdup(image);
+    g_autofree char *b = g_strdup(binPath);
+    char *busy;
+
+    if (virFileLinkPointsTo(image, binPath))
+        return true;
+
+    if ((busy = strstr(a, ".busy-")))
+        *busy = '\0';
+    g_strdelimit(a, "/", '\\');
+    g_strdelimit(b, "/", '\\');
+    return g_ascii_strcasecmp(a, b) == 0;
+}
+#endif
+
+
 int virPidFileReadPathIfAlive(const char *path,
                               pid_t *pid,
                               const char *binPath)
@@ -205,9 +237,34 @@ int virPidFileReadPathIfAlive(const char *path,
     if (virPidFileReadPath(path, &retPid) < 0)
         return -1;
 
-#ifndef WIN32
-    /* Check that it's still alive.  Safe to skip this sanity check on
-     * mingw, which lacks kill().  */
+#ifdef WIN32
+    {
+        /* Windows reuses process ids quickly: a pid only names our process
+         * while it is alive and runs @binPath (no /proc/$pid/exe here) */
+        HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, retPid);
+        DWORD code;
+        bool alive = proc && GetExitCodeProcess(proc, &code) && code == STILL_ACTIVE;
+        g_autofree char *image = NULL;
+
+        if (alive && binPath) {
+            DWORD len = 32768;
+            g_autofree wchar_t *wimage = g_new0(wchar_t, len);
+
+            if (QueryFullProcessImageNameW(proc, 0, wimage, &len))
+                image = g_utf16_to_utf8(wimage, len, NULL, NULL, NULL);
+        }
+        if (proc)
+            CloseHandle(proc);
+
+        if (!alive)
+            return 0;
+        if (binPath && !(image && virPidFileWin32SameImage(image, binPath)))
+            return -1;
+        *pid = retPid;
+        return 0;
+    }
+#else
+    /* Check that it's still alive. */
     if (kill(retPid, 0) < 0) {
         *pid = -1;
         return 0;

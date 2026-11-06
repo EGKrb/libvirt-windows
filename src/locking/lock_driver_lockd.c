@@ -119,7 +119,7 @@ static char *virLockManagerLockDaemonPath(bool privileged)
 {
     char *path;
     if (privileged) {
-        path = g_strdup(RUNSTATEDIR "/libvirt/virtlockd-sock");
+        path = g_strdup(VIR_INSTALL_PATH(RUNSTATEDIR "/libvirt/virtlockd-sock"));
     } else {
         g_autofree char *rundir = NULL;
 
@@ -198,7 +198,7 @@ static virNetClient *virLockManagerLockDaemonConnectionNew(bool privileged,
         !(daemonPath = virFileFindResourceFull("virtlockd",
                                                NULL, NULL,
                                                abs_top_builddir "/src",
-                                               SBINDIR,
+                                               VIR_INSTALL_PATH(SBINDIR),
                                                "VIRTLOCKD_PATH")))
         goto error;
 

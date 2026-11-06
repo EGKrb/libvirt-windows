@@ -1115,7 +1115,7 @@ udevStateInitialize(bool privileged,
     driver->lockFD = -1;
 
     if (privileged) {
-        driver->stateDir = g_strdup_printf("%s/libvirt/interface", RUNSTATEDIR);
+        driver->stateDir = g_strdup_printf("%s/libvirt/interface", VIR_INSTALL_PATH(RUNSTATEDIR));
     } else {
         g_autofree char *rundir = NULL;
 

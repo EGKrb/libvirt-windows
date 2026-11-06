@@ -139,7 +139,7 @@ virLockManagerPlugin *virLockManagerPluginNew(const char *name,
                                                 NULL,
                                                 VIR_FILE_MODULE_EXT,
                                                 abs_top_builddir "/src",
-                                                LIBDIR "/libvirt/lock-driver",
+                                                VIR_INSTALL_PATH(LIBDIR "/libvirt/lock-driver"),
                                                 "LIBVIRT_LOCK_MANAGER_PLUGIN_DIR")))
             goto cleanup;
 

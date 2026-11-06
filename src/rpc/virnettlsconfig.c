@@ -117,10 +117,10 @@ void virNetTLSConfigUserTrust(char **cacert,
 void virNetTLSConfigSystemTrust(char **cacert,
                                 char **cacrl)
 {
-    VIR_DEBUG("Locating trust chain in system dir %s", LIBVIRT_PKI_DIR);
+    VIR_DEBUG("Locating trust chain in system dir %s", VIR_INSTALL_PATH(LIBVIRT_PKI_DIR));
 
-    virNetTLSConfigTrust(LIBVIRT_CACERT_DIR,
-                         LIBVIRT_CACRL_DIR,
+    virNetTLSConfigTrust(VIR_INSTALL_PATH(LIBVIRT_CACERT_DIR),
+                         VIR_INSTALL_PATH(LIBVIRT_CACRL_DIR),
                          cacert,
                          cacrl);
 }
@@ -157,11 +157,11 @@ void virNetTLSConfigSystemIdentity(bool isServer,
                                    char **cert,
                                    char **key)
 {
-    VIR_DEBUG("Locating creds in system dir %s", LIBVIRT_PKI_DIR);
+    VIR_DEBUG("Locating creds in system dir %s", VIR_INSTALL_PATH(LIBVIRT_PKI_DIR));
 
     virNetTLSConfigIdentity(isServer,
-                            LIBVIRT_CERT_DIR,
-                            LIBVIRT_KEY_DIR,
+                            VIR_INSTALL_PATH(LIBVIRT_CERT_DIR),
+                            VIR_INSTALL_PATH(LIBVIRT_KEY_DIR),
                             cert,
                             key);
 }
@@ -400,12 +400,12 @@ int virNetTLSConfigSystemCreds(bool isServer,
                                char ***certs,
                                char ***keys)
 {
-    VIR_DEBUG("Locating creds in system dir %s", LIBVIRT_PKI_DIR);
+    VIR_DEBUG("Locating creds in system dir %s", VIR_INSTALL_PATH(LIBVIRT_PKI_DIR));
 
-    return virNetTLSConfigCreds(LIBVIRT_CACERT_DIR,
-                                LIBVIRT_CACRL_DIR,
-                                LIBVIRT_CERT_DIR,
-                                LIBVIRT_KEY_DIR,
+    return virNetTLSConfigCreds(VIR_INSTALL_PATH(LIBVIRT_CACERT_DIR),
+                                VIR_INSTALL_PATH(LIBVIRT_CACRL_DIR),
+                                VIR_INSTALL_PATH(LIBVIRT_CERT_DIR),
+                                VIR_INSTALL_PATH(LIBVIRT_KEY_DIR),
                                 isServer,
                                 false,
                                 !isServer,

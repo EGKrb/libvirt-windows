@@ -57,7 +57,7 @@ virStorageFileLoadBackendModule(const char *name,
                                             "libvirt_storage_file_",
                                             VIR_FILE_MODULE_EXT,
                                             abs_top_builddir "/src",
-                                            STORAGE_FILE_MODULE_DIR,
+                                            VIR_INSTALL_PATH(STORAGE_FILE_MODULE_DIR),
                                             "LIBVIRT_STORAGE_FILE_DIR")))
         return -1;
 

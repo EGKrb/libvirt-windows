@@ -82,7 +82,12 @@ endif
 
 runstatedir = get_option('runstatedir')
 if runstatedir == ''
-  runstatedir = '/run'
+  if host_machine.system() == 'windows'
+    # no /run on Windows: keep the runtime state under the prefix
+    runstatedir = localstatedir / 'run'
+  else
+    runstatedir = '/run'
+  endif
 endif
 
 initconfdir = get_option('initconfdir')
@@ -1328,11 +1333,13 @@ if host_machine.system() == 'windows'
   ole32_dep = cc.find_library('ole32')
   oleaut32_dep = cc.find_library('oleaut32')
   winsock2_dep = cc.find_library('ws2_32')
+  iphlpapi_dep = cc.find_library('iphlpapi')
   win32_dep = declare_dependency(
     dependencies: [
       ole32_dep,
       oleaut32_dep,
       winsock2_dep,
+      iphlpapi_dep,
     ],
   )
   if get_option('default_library') == 'static'
@@ -1492,13 +1499,6 @@ endif
 
 if not get_option('driver_libvirtd').disabled()
   use_libvirtd = true
-
-  if host_machine.system() == 'windows'
-    use_libvirtd = false
-    if get_option('driver_libvirtd').enabled()
-      error('libvirtd daemon is not supported on windows')
-    endif
-  endif
 
   if not conf.has('WITH_REMOTE')
     use_libvirtd = false
@@ -1711,6 +1711,10 @@ if not get_option('driver_qemu').disabled()
       if host_machine.system() in [ 'freebsd', 'darwin' ]
         qemu_user = 'root'
         qemu_group = 'wheel'
+      elif host_machine.system() == 'windows'
+        # no Unix accounts: QEMU runs as the account of the daemon (+0)
+        qemu_user = '+0'
+        qemu_group = '+0'
       else
         # RHEL and CentOS both have ID_LIKE=fedora, SLES has ID_LIKE=suse
         if (os_release.contains('fedora') or
@@ -1735,13 +1739,20 @@ if not get_option('driver_qemu').disabled()
     conf.set_quoted('QEMU_USER', qemu_user)
     conf.set_quoted('QEMU_GROUP', qemu_group)
 
-    qemu_slirp_prog = find_program(
-      'slirp-helper',
-      dirs: [ '/usr/bin', '/usr/libexec' ],
-      required: false
-    )
+    if host_machine.system() == 'windows'
+      # no Unix paths to search; QEMU for Windows has libslirp built in
+      qemu_slirp_prog = find_program('slirp-helper', required: false)
+    else
+      qemu_slirp_prog = find_program(
+        'slirp-helper',
+        dirs: [ '/usr/bin', '/usr/libexec' ],
+        required: false
+      )
+    endif
     if qemu_slirp_prog.found()
       qemu_slirp_path = qemu_slirp_prog.full_path()
+    elif host_machine.system() == 'windows'
+      qemu_slirp_path = 'slirp-helper'
     else
       qemu_slirp_path = '/usr/bin/slirp-helper'
     endif

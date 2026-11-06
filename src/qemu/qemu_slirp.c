@@ -157,7 +157,14 @@ qemuSlirpOpen(qemuSlirp *slirp,
     if (qemuSecuritySetSocketLabel(driver->securityManager, def) < 0)
         goto error;
 
+#ifdef WIN32
+    /* AF_UNIX has no datagram sockets on Windows: there QEMU uses its
+     * built-in user networking (libslirp) rather than the slirp helper */
+    rc = -1;
+    errno = ENOTSUP;
+#else
     rc = socketpair(AF_UNIX, SOCK_DGRAM, 0, pair);
+#endif
 
     if (qemuSecurityClearSocketLabel(driver->securityManager, def) < 0)
         goto error;

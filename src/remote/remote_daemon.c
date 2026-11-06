@@ -25,13 +25,16 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <getopt.h>
-#include <grp.h>
+#ifndef WIN32
+# include <grp.h>
+#endif
 
 #include "libvirt_internal.h"
 #include "virerror.h"
 #include "virfile.h"
 #include "virlog.h"
 #include "virpidfile.h"
+#include "virprocess.h"
 
 #define VIR_FROM_THIS VIR_FROM_QEMU
 
@@ -588,7 +591,7 @@ static void daemonRunStateInit(void *opaque)
                            dmn) < 0) {
         VIR_ERROR(_("Driver state initialization failed"));
         /* Ensure the main event loop quits */
-        kill(getpid(), SIGTERM);
+        virProcessKill(getpid(), SIGTERM);
         goto cleanup;
     }
 
@@ -722,36 +725,36 @@ daemonUsage(const char *argv0, bool privileged)
 
     fprintf(stderr, "    %s\n", _("Configuration file (unless overridden by -f):"));
     fprintf(stderr, "      %s/libvirt/%s.conf\n",
-            privileged ? SYSCONFDIR : "$XDG_CONFIG_HOME", DAEMON_NAME);
+            privileged ? VIR_INSTALL_PATH(SYSCONFDIR) : "$XDG_CONFIG_HOME", DAEMON_NAME);
     fprintf(stderr, "\n");
 
     fprintf(stderr, "    %s\n", _("Sockets:"));
     fprintf(stderr, "      %s/libvirt/%s-sock\n",
-            privileged ? RUNSTATEDIR : "$XDG_RUNTIME_DIR",
+            privileged ? VIR_INSTALL_PATH(RUNSTATEDIR) : "$XDG_RUNTIME_DIR",
             SOCK_PREFIX);
     if (privileged)
         fprintf(stderr, "      %s/libvirt/%s-sock-ro\n",
-                RUNSTATEDIR, SOCK_PREFIX);
+                VIR_INSTALL_PATH(RUNSTATEDIR), SOCK_PREFIX);
     fprintf(stderr, "\n");
 
 #ifdef WITH_IP
     fprintf(stderr, "    %s\n", _("TLS:"));
     fprintf(stderr, "      %s %s\n",
             _("CA certificate:"),
-            privileged ? LIBVIRT_CACERT : "$HOME/.pki/libvirt/cacert.pem");
+            privileged ? VIR_INSTALL_PATH(LIBVIRT_CACERT) : "$HOME/.pki/libvirt/cacert.pem");
     fprintf(stderr, "      %s %s\n",
             _("Server certificate:"),
-            privileged ? LIBVIRT_SERVERCERT : "$HOME/.pki/libvirt/servercert.pem");
+            privileged ? VIR_INSTALL_PATH(LIBVIRT_SERVERCERT) : "$HOME/.pki/libvirt/servercert.pem");
     fprintf(stderr, "      %s %s\n",
             _("Server private key:"),
-            privileged ? LIBVIRT_SERVERKEY : "$HOME/.pki/libvirt/serverkey.pem");
+            privileged ? VIR_INSTALL_PATH(LIBVIRT_SERVERKEY) : "$HOME/.pki/libvirt/serverkey.pem");
     fprintf(stderr, "\n");
 #endif /* ! WITH_IP */
 
     fprintf(stderr, "    %s\n",
             _("PID file (unless overridden by -p):"));
     fprintf(stderr, "      %s/%s.pid\n",
-            privileged ? RUNSTATEDIR : "$XDG_RUNTIME_DIR/libvirt",
+            privileged ? VIR_INSTALL_PATH(RUNSTATEDIR) : "$XDG_RUNTIME_DIR/libvirt",
             DAEMON_NAME);
     fprintf(stderr, "\n");
 }
@@ -933,7 +936,7 @@ int main(int argc, char **argv) {
 
     if (!pid_file &&
         virPidFileConstructPath(privileged,
-                                RUNSTATEDIR,
+                                VIR_INSTALL_PATH(RUNSTATEDIR),
                                 DAEMON_NAME,
                                 &pid_file) < 0) {
         VIR_ERROR(_("Can't determine pid file path."));
@@ -977,7 +980,7 @@ int main(int argc, char **argv) {
 
     /* Ensure the rundir exists (on tmpfs on some systems) */
     if (privileged) {
-        run_dir = g_strdup(RUNSTATEDIR "/libvirt");
+        run_dir = g_strdup(VIR_INSTALL_PATH(RUNSTATEDIR "/libvirt"));
     } else {
         run_dir = virGetUserRuntimeDirectory();
     }

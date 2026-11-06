@@ -22,7 +22,9 @@
 #if WITH_NBDKIT
 # include <libnbd.h>
 #endif
-#include <sys/syscall.h>
+#ifndef WIN32
+# include <sys/syscall.h>
+#endif
 
 #include "vircommand.h"
 #include "virerror.h"
@@ -261,7 +263,7 @@ qemuNbdkitCapsQuery(qemuNbdkitCaps *caps)
     qemuNbdkitCapsQueryPlugins(caps);
     qemuNbdkitCapsQueryFilters(caps);
 
-    caps->ctime = st.st_ctime;
+    caps->ctime = VIR_STAT_CHANGE_TIME(st);
     caps->filterDirMtime = qemuNbdkitGetDirMtime(caps->filterDir);
     caps->pluginDirMtime = qemuNbdkitGetDirMtime(caps->pluginDir);
     caps->libvirtCtime = virGetSelfLastChanged();
@@ -339,10 +341,10 @@ virNbdkitCapsIsValid(void *data,
         return false;
     }
 
-    if (st.st_ctime != nbdkitCaps->ctime) {
+    if (VIR_STAT_CHANGE_TIME(st) != nbdkitCaps->ctime) {
         VIR_DEBUG("Outdated capabilities for '%s': nbdkit binary changed (%lld vs %lld)",
                   nbdkitCaps->path,
-                  (long long)st.st_ctime, (long long)nbdkitCaps->ctime);
+                  (long long)VIR_STAT_CHANGE_TIME(st), (long long)nbdkitCaps->ctime);
         return false;
     }
 

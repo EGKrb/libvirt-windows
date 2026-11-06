@@ -72,7 +72,7 @@ if conf.has('WITH_DTRACE_PROBES')
     input: infile,
     output: out_stp,
     command: [
-      meson_python_prog, python3_prog, dtrace2systemtap_prog,
+      meson_python_prog, python3_prog.full_path(), dtrace2systemtap_prog.full_path(),
       bindir, sbindir, libdir, '@INPUT@'
     ],
     capture: true,
@@ -101,6 +101,12 @@ if host_machine.system() == 'linux'
   used_sym_files += 'libvirt_linux.syms'
 else
   sym_files += 'libvirt_linux.syms'
+endif
+
+if host_machine.system() == 'windows'
+  used_sym_files += 'libvirt_win32.syms'
+else
+  sym_files += 'libvirt_win32.syms'
 endif
 
 if conf.has('WITH_SASL')
@@ -614,6 +620,8 @@ foreach module : virt_modules
     dependencies: [
       src_dep,
       module.get('deps', []),
+      # Winsock on Windows: drivers talk to their processes over sockets
+      win32_dep,
     ],
     link_with: [
       libvirt_lib,
@@ -736,7 +744,7 @@ foreach data : virt_test_aug_files
     input: [ data['conf'], data['aug'] ],
     output: data['name'],
     command: [
-      meson_python_prog, python3_prog, augeas_gentest_prog,
+      meson_python_prog, python3_prog.full_path(), augeas_gentest_prog.full_path(),
       '@INPUT@',
     ],
     capture: true,
@@ -815,7 +823,7 @@ foreach data : virt_daemon_confs
     input: [ conf_out, test_aug_tmp ],
     output: test_aug_out,
     command: [
-      meson_python_prog, python3_prog, augeas_gentest_prog,
+      meson_python_prog, python3_prog.full_path(), augeas_gentest_prog.full_path(),
       '@INPUT@',
     ],
     capture: true,
@@ -953,7 +961,7 @@ if conf.has('WITH_DTRACE_PROBES')
     input: rpc_probe_files,
     output: 'libvirt_functions.stp',
     command: [
-      meson_python_prog, python3_prog, gensystemtap_prog,
+      meson_python_prog, python3_prog.full_path(), gensystemtap_prog.full_path(),
       '@INPUT@',
     ],
     capture: true,

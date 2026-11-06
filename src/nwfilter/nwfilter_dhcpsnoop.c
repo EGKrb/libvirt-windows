@@ -1552,7 +1552,7 @@ virNWFilterSnoopLeaseFileOpen(void)
 {
     virNWFilterSnoopLeaseFileClose();
 
-    virNWFilterSnoopState.leaseFD = open(LEASEFILE, O_CREAT|O_RDWR|O_APPEND,
+    virNWFilterSnoopState.leaseFD = open(VIR_INSTALL_PATH(LEASEFILE), O_CREAT|O_RDWR|O_APPEND,
                                          0644);
 }
 
@@ -1669,18 +1669,18 @@ virNWFilterSnoopLeaseFileRefresh(void)
 {
     int tfd;
 
-    if (g_mkdir_with_parents(LEASEFILE_DIR, 0700) < 0) {
-        virReportError(errno, _("mkdir(\"%1$s\")"), LEASEFILE_DIR);
+    if (g_mkdir_with_parents(VIR_INSTALL_PATH(LEASEFILE_DIR), 0700) < 0) {
+        virReportError(errno, _("mkdir(\"%1$s\")"), VIR_INSTALL_PATH(LEASEFILE_DIR));
         return;
     }
 
-    if (unlink(TMPLEASEFILE) < 0 && errno != ENOENT)
-        virReportSystemError(errno, _("unlink(\"%1$s\")"), TMPLEASEFILE);
+    if (unlink(VIR_INSTALL_PATH(TMPLEASEFILE)) < 0 && errno != ENOENT)
+        virReportSystemError(errno, _("unlink(\"%1$s\")"), VIR_INSTALL_PATH(TMPLEASEFILE));
 
     /* lease file loaded, delete old one */
-    tfd = open(TMPLEASEFILE, O_CREAT|O_RDWR|O_TRUNC|O_EXCL, 0644);
+    tfd = open(VIR_INSTALL_PATH(TMPLEASEFILE), O_CREAT|O_RDWR|O_TRUNC|O_EXCL, 0644);
     if (tfd < 0) {
-        virReportSystemError(errno, _("open(\"%1$s\")"), TMPLEASEFILE);
+        virReportSystemError(errno, _("open(\"%1$s\")"), VIR_INSTALL_PATH(TMPLEASEFILE));
         return;
     }
 
@@ -1694,15 +1694,15 @@ virNWFilterSnoopLeaseFileRefresh(void)
     }
 
     if (VIR_CLOSE(tfd) < 0) {
-        virReportSystemError(errno, _("unable to close %1$s"), TMPLEASEFILE);
+        virReportSystemError(errno, _("unable to close %1$s"), VIR_INSTALL_PATH(TMPLEASEFILE));
         /* assuming the old lease file is still better, skip the renaming */
         goto cleanup;
     }
 
-    if (rename(TMPLEASEFILE, LEASEFILE) < 0) {
+    if (rename(VIR_INSTALL_PATH(TMPLEASEFILE), VIR_INSTALL_PATH(LEASEFILE)) < 0) {
         virReportSystemError(errno, _("rename(\"%1$s\", \"%2$s\")"),
-                             TMPLEASEFILE, LEASEFILE);
-        unlink(TMPLEASEFILE);
+                             VIR_INSTALL_PATH(TMPLEASEFILE), VIR_INSTALL_PATH(LEASEFILE));
+        unlink(VIR_INSTALL_PATH(TMPLEASEFILE));
     }
     g_atomic_int_set(&virNWFilterSnoopState.wLeases, 0);
 
@@ -1723,7 +1723,7 @@ virNWFilterSnoopLeaseFileLoad(void)
     int ln = 0, tmp;
     VIR_LOCK_GUARD lock = virLockGuardLock(&virNWFilterSnoopState.snoopLock);
 
-    fp = fopen(LEASEFILE, "r");
+    fp = fopen(VIR_INSTALL_PATH(LEASEFILE), "r");
     time(&now);
     while (fp && fgets(line, sizeof(line), fp)) {
         unsigned long long timeout;

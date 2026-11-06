@@ -165,7 +165,7 @@ load_profile(virSecurityManager *mgr G_GNUC_UNUSED,
     if (profile_status_file(profile) >= 0)
         create = false;
 
-    cmd = virCommandNewArgList(VIRT_AA_HELPER,
+    cmd = virCommandNewArgList(VIR_INSTALL_PATH(VIRT_AA_HELPER),
                                create ? "-c" : "-r",
                                "-u", profile, NULL);
     if (!create && fn) {
@@ -187,7 +187,7 @@ load_profile(virSecurityManager *mgr G_GNUC_UNUSED,
 static int
 remove_profile(const char *profile)
 {
-    g_autoptr(virCommand) cmd = virCommandNewArgList(VIRT_AA_HELPER, "-D", "-u",
+    g_autoptr(virCommand) cmd = virCommandNewArgList(VIR_INSTALL_PATH(VIRT_AA_HELPER), "-D", "-u",
                                                      profile, NULL);
 
     return virCommandRun(cmd, NULL);

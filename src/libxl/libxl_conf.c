@@ -1835,15 +1835,15 @@ libxlDriverConfigNew(void)
     if (!(cfg = virObjectNew(libxlDriverConfigClass)))
         return NULL;
 
-    cfg->configBaseDir = g_strdup(LIBXL_CONFIG_BASE_DIR);
-    cfg->configDir = g_strdup(LIBXL_CONFIG_DIR);
-    cfg->autostartDir = g_strdup(LIBXL_AUTOSTART_DIR);
-    cfg->logDir = g_strdup(LIBXL_LOG_DIR);
-    cfg->stateDir = g_strdup(LIBXL_STATE_DIR);
-    cfg->libDir = g_strdup(LIBXL_LIB_DIR);
-    cfg->saveDir = g_strdup(LIBXL_SAVE_DIR);
-    cfg->autoDumpDir = g_strdup(LIBXL_DUMP_DIR);
-    cfg->channelDir = g_strdup(LIBXL_CHANNEL_DIR);
+    cfg->configBaseDir = g_strdup(VIR_INSTALL_PATH(LIBXL_CONFIG_BASE_DIR));
+    cfg->configDir = g_strdup(VIR_INSTALL_PATH(LIBXL_CONFIG_DIR));
+    cfg->autostartDir = g_strdup(VIR_INSTALL_PATH(LIBXL_AUTOSTART_DIR));
+    cfg->logDir = g_strdup(VIR_INSTALL_PATH(LIBXL_LOG_DIR));
+    cfg->stateDir = g_strdup(VIR_INSTALL_PATH(LIBXL_STATE_DIR));
+    cfg->libDir = g_strdup(VIR_INSTALL_PATH(LIBXL_LIB_DIR));
+    cfg->saveDir = g_strdup(VIR_INSTALL_PATH(LIBXL_SAVE_DIR));
+    cfg->autoDumpDir = g_strdup(VIR_INSTALL_PATH(LIBXL_DUMP_DIR));
+    cfg->channelDir = g_strdup(VIR_INSTALL_PATH(LIBXL_CHANNEL_DIR));
 
 #ifdef DEFAULT_LOADER_NVRAM
     if (virFirmwareParseList(DEFAULT_LOADER_NVRAM,

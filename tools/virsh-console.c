@@ -20,15 +20,18 @@
 
 #include <config.h>
 
-#ifndef WIN32
-
-# include <sys/types.h>
-# include <sys/stat.h>
-# include <fcntl.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#ifdef WIN32
+# define WIN32_LEAN_AND_MEAN
+# include <windows.h>
+#else
 # include <termios.h>
 # include <poll.h>
-# include <unistd.h>
 # include <signal.h>
+#endif
+#include <unistd.h>
 
 # include "internal.h"
 # include "virsh.h"
@@ -36,6 +39,7 @@
 # include "virsh-util.h"
 # include "virlog.h"
 # include "viralloc.h"
+# include "virfile.h"
 # include "virthread.h"
 # include "virerror.h"
 # include "virobject.h"
@@ -89,10 +93,12 @@ virConsoleOnceInit(void)
 
 VIR_ONCE_GLOBAL_INIT(virConsole);
 
+#ifndef WIN32
 static void
 virConsoleHandleSignal(int sig G_GNUC_UNUSED)
 {
 }
+#endif
 
 
 static void
@@ -147,6 +153,140 @@ virConsoleDispose(void *obj)
 }
 
 
+#ifdef WIN32
+/*
+ * The event loop of Windows only watches sockets, not the console: a thread
+ * reads the terminal, and what comes from the stream is written to it at
+ * once (a console is always writable).
+ */
+
+/* Hand over input read from the terminal, as virConsoleEventOnStdin() does */
+static void
+virConsoleWin32Input(virConsole *con, const char *buf, int got)
+{
+    virObjectLock(con);
+
+    if (!con->st)
+        goto cleanup;
+
+    if (got < 0) {
+        virReportSystemError(errno, "%s", _("cannot read from stdin"));
+        virConsoleShutdown(con, false);
+        goto cleanup;
+    }
+    if (got == 0) {
+        virReportError(VIR_ERR_INTERNAL_ERROR, "%s", _("EOF on stdin"));
+        virConsoleShutdown(con, false);
+        goto cleanup;
+    }
+    if (buf[0] == con->escapeChar) {
+        virConsoleShutdown(con, true);
+        goto cleanup;
+    }
+
+    if (con->terminalToStream.length - con->terminalToStream.offset < got) {
+        VIR_REALLOC_N(con->terminalToStream.data,
+                      con->terminalToStream.offset + got + 1024);
+        con->terminalToStream.length = con->terminalToStream.offset + got + 1024;
+    }
+    memcpy(con->terminalToStream.data + con->terminalToStream.offset, buf, got);
+    con->terminalToStream.offset += got;
+    virStreamEventUpdateCallback(con->st,
+                                 VIR_STREAM_EVENT_READABLE |
+                                 VIR_STREAM_EVENT_WRITABLE);
+
+ cleanup:
+    virObjectUnlock(con);
+}
+
+
+/*
+ * Read the keys typed in the console.  Its input mode is
+ * ENABLE_VIRTUAL_TERMINAL_INPUT (see vshTTYMakeRaw()), so arrows and
+ * function keys come as the escape sequences of a Unix terminal.  Waiting
+ * 100 ms at a time lets the thread end with the console session, rather
+ * than eat a key of the next virsh command.
+ */
+static int
+virConsoleWin32ReadConsole(HANDLE in, char *buf, size_t size)
+{
+    INPUT_RECORD records[64];
+    DWORD n = 0;
+    DWORD i;
+    size_t len = 0;
+
+    if (WaitForSingleObject(in, 100) != WAIT_OBJECT_0)
+        return 0;
+    if (!ReadConsoleInputW(in, records, G_N_ELEMENTS(records), &n)) {
+        errno = EIO;
+        return -1;
+    }
+
+    for (i = 0; i < n; i++) {
+        const KEY_EVENT_RECORD *key = &records[i].Event.KeyEvent;
+        gunichar c = key->uChar.UnicodeChar;
+        WORD repeat;
+
+        if (records[i].EventType != KEY_EVENT || !key->bKeyDown || c == 0)
+            continue;
+        for (repeat = 0; repeat < MAX(key->wRepeatCount, 1); repeat++) {
+            if (len + 6 > size)
+                break;
+            len += g_unichar_to_utf8(c, buf + len);
+        }
+    }
+    return len;
+}
+
+
+static void
+virConsoleWin32StdinThread(void *opaque)
+{
+    virConsole *con = opaque;
+    HANDLE in = GetStdHandle(STD_INPUT_HANDLE);
+    DWORD mode;
+    bool console = GetConsoleMode(in, &mode);
+
+    for (;;) {
+        char buf[1024];
+        int got;
+        bool quit;
+
+        virObjectLock(con);
+        quit = con->quit || !con->st;
+        virObjectUnlock(con);
+        if (quit)
+            break;
+
+        if (console) {
+            if ((got = virConsoleWin32ReadConsole(in, buf, sizeof(buf))) == 0)
+                continue;
+        } else {
+            got = read(STDIN_FILENO, buf, sizeof(buf));
+        }
+        virConsoleWin32Input(con, buf, got);
+    }
+
+    virObjectUnref(con);
+}
+
+
+/* Write what came from the stream; called with @con locked */
+static int
+virConsoleWin32Output(virConsole *con)
+{
+    if (safewrite(STDOUT_FILENO, con->streamToTerminal.data,
+                  con->streamToTerminal.offset) < 0) {
+        virReportSystemError(errno, "%s", _("cannot write to stdout"));
+        virConsoleShutdown(con, false);
+        return -1;
+    }
+    con->streamToTerminal.offset = 0;
+    return 0;
+}
+#endif /* WIN32 */
+
+
 static void
 virConsoleEventOnStream(virStreamPtr st,
                         int events, void *opaque)
@@ -182,9 +322,14 @@ virConsoleEventOnStream(virStreamPtr st,
             goto cleanup;
         }
         con->streamToTerminal.offset += got;
+#ifdef WIN32
+        if (virConsoleWin32Output(con) < 0)
+            goto cleanup;
+#else
         if (con->streamToTerminal.offset)
             virEventUpdateHandle(con->stdoutWatch,
                                  VIR_EVENT_HANDLE_WRITABLE);
+#endif
     }
 
     if (events & VIR_STREAM_EVENT_WRITABLE &&
@@ -226,6 +371,7 @@ virConsoleEventOnStream(virStreamPtr st,
 }
 
 
+#ifndef WIN32
 static void
 virConsoleEventOnStdin(int watch G_GNUC_UNUSED,
                        int fd G_GNUC_UNUSED,
@@ -358,6 +504,9 @@ virConsoleEventOnStdout(int watch G_GNUC_UNUSED,
 }
 
 
+#endif /* !WIN32 */
+
+
 static virConsole *
 virConsoleNew(void)
 {
@@ -407,7 +556,9 @@ virshRunConsole(vshControl *ctl,
     virConsole *con = NULL;
     virshControl *priv = ctl->privData;
     int ret = -1;
-
+#ifdef WIN32
+    virThread stdinThread;
+#else
     struct sigaction old_sigquit;
     struct sigaction old_sigterm;
     struct sigaction old_sigint;
@@ -417,12 +568,14 @@ virshRunConsole(vshControl *ctl,
                                    .sa_flags = SA_SIGINFO };
 
     sigemptyset(&sighandler.sa_mask);
+#endif
 
     if (!(con = virConsoleNew()))
         goto resettty;
 
     virObjectLock(con);
 
+#ifndef WIN32
     /* Trap all common signals so that we can safely restore the original
      * terminal settings on STDIN before the process exits - people don't like
      * being left with a messed up terminal ! */
@@ -431,6 +584,7 @@ virshRunConsole(vshControl *ctl,
     sigaction(SIGINT,  &sighandler, &old_sigint);
     sigaction(SIGHUP,  &sighandler, &old_sighup);
     sigaction(SIGPIPE, &sighandler, &old_sigpipe);
+#endif
 
     con->escapeChar = virshGetEscapeChar(priv->escapeChar);
     con->st = virStreamNew(virDomainGetConnect(dom),
@@ -454,6 +608,15 @@ virshRunConsole(vshControl *ctl,
     if (vshTTYMakeRaw(ctl, true) < 0)
         goto cleanup;
 
+#ifdef WIN32
+    virObjectRef(con);
+    if (virThreadCreate(&stdinThread, false, virConsoleWin32StdinThread, con) < 0) {
+        virObjectUnref(con);
+        virReportSystemError(errno, "%s",
+                             _("unable to create the console input thread"));
+        goto cleanup;
+    }
+#else
     virObjectRef(con);
     if ((con->stdinWatch = virEventAddHandle(STDIN_FILENO,
                                              VIR_EVENT_HANDLE_READABLE,
@@ -473,6 +636,7 @@ virshRunConsole(vshControl *ctl,
         virObjectUnref(con);
         goto cleanup;
     }
+#endif
 
     virObjectRef(con);
     if (virStreamEventAddCallback(con->st,
@@ -515,12 +679,14 @@ virshRunConsole(vshControl *ctl,
     virObjectUnlock(con);
     virObjectUnref(con);
 
+#ifndef WIN32
     /* Restore original signal handlers */
     sigaction(SIGQUIT, &old_sigquit, NULL);
     sigaction(SIGTERM, &old_sigterm, NULL);
     sigaction(SIGINT,  &old_sigint,  NULL);
     sigaction(SIGHUP,  &old_sighup,  NULL);
     sigaction(SIGPIPE, &old_sigpipe, NULL);
+#endif
 
  resettty:
     /* Put STDIN back into the (sane?) state we found
@@ -529,5 +695,3 @@ virshRunConsole(vshControl *ctl,
 
     return ret;
 }
-
-#endif /* !WIN32 */

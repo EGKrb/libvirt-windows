@@ -93,7 +93,7 @@ virCaps *virLXCDriverCapsInit(virLXCDriver *driver)
 
     if (!(lxc_path = virFileFindResource("libvirt_lxc",
                                          abs_top_builddir "/src",
-                                         LIBEXECDIR)))
+                                         VIR_INSTALL_PATH(LIBEXECDIR))))
         return NULL;
 
     guest = virCapabilitiesAddGuest(caps, VIR_DOMAIN_OSTYPE_EXE,
@@ -215,10 +215,10 @@ virLXCDriverConfigNew(void)
     cfg->securityRequireConfined = false;
 
     /* Set the container configuration directory */
-    cfg->configDir = g_strdup(LXC_CONFIG_DIR);
-    cfg->stateDir = g_strdup(LXC_STATE_DIR);
-    cfg->logDir = g_strdup(LXC_LOG_DIR);
-    cfg->autostartDir = g_strdup(LXC_AUTOSTART_DIR);
+    cfg->configDir = g_strdup(VIR_INSTALL_PATH(LXC_CONFIG_DIR));
+    cfg->stateDir = g_strdup(VIR_INSTALL_PATH(LXC_STATE_DIR));
+    cfg->logDir = g_strdup(VIR_INSTALL_PATH(LXC_LOG_DIR));
+    cfg->autostartDir = g_strdup(VIR_INSTALL_PATH(LXC_AUTOSTART_DIR));
 
     return cfg;
 }

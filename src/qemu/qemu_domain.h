@@ -250,7 +250,7 @@ struct _qemuDomainObjPrivate {
     /* Info on dummy process for schedCore. A short lived process used only
      * briefly when starting a guest. Don't save/parse into XML. */
     pid_t schedCoreChildPID;
-    pid_t schedCoreChildFD;
+    int schedCoreChildFD;
 
     GSList *threadContextAliases; /* List of IDs of thread-context objects */
 

@@ -44,7 +44,7 @@ virLogManagerDaemonPath(bool privileged)
 {
     char *path;
     if (privileged) {
-        path = g_strdup(RUNSTATEDIR "/libvirt/virtlogd-sock");
+        path = g_strdup(VIR_INSTALL_PATH(RUNSTATEDIR "/libvirt/virtlogd-sock"));
     } else {
         g_autofree char *rundir = NULL;
 
@@ -73,7 +73,7 @@ virLogManagerConnect(bool privileged,
         !(daemonPath = virFileFindResourceFull("virtlogd",
                                                NULL, NULL,
                                                abs_top_builddir "/src",
-                                               SBINDIR,
+                                               VIR_INSTALL_PATH(SBINDIR),
                                                "VIRTLOGD_PATH")))
         goto error;
 

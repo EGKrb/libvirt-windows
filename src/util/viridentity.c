@@ -212,7 +212,7 @@ virIdentityConstructSystemTokenPath(void)
 {
     g_autofree char *commondir = NULL;
     if (geteuid() == 0) {
-        commondir = g_strdup(RUNSTATEDIR "/libvirt/common");
+        commondir = g_strdup(VIR_INSTALL_PATH(RUNSTATEDIR "/libvirt/common"));
     } else {
         g_autofree char *rundir = virGetUserRuntimeDirectory();
         commondir = g_strdup_printf("%s/common", rundir);

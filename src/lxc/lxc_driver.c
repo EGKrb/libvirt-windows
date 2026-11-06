@@ -1460,7 +1460,7 @@ lxcStateInitialize(bool privileged,
     cfg->log_libvirtd = false; /* by default log to container logfile */
 
     /* Call function to load lxc driver configuration information */
-    if (virLXCLoadDriverConfig(cfg, SYSCONFDIR "/libvirt/lxc.conf") < 0)
+    if (virLXCLoadDriverConfig(cfg, VIR_INSTALL_PATH(SYSCONFDIR "/libvirt/lxc.conf")) < 0)
         goto cleanup;
 
     lxc_driver->inhibitor = virInhibitorNew(

@@ -1370,6 +1370,11 @@ qemuDomainAttachNetDevice(virQEMUDriver *driver,
     }
 
     if (net->mtu && net->managed_tap != VIR_TRISTATE_BOOL_NO &&
+#ifdef WIN32
+        /* network and bridge: see qemuBuildInterfaceCommandLine */
+        actualType != VIR_DOMAIN_NET_TYPE_NETWORK &&
+        actualType != VIR_DOMAIN_NET_TYPE_BRIDGE &&
+#endif
         virNetDevSetMTU(net->ifname, net->mtu) < 0)
         goto cleanup;
 
@@ -5165,6 +5170,12 @@ qemuDomainRemoveNetDevice(virQEMUDriver *driver,
         return -1;
 
     virDomainInterfaceClearQoS(vm->def, net);
+#ifdef WIN32
+    if (net->ifname &&
+        (actualType == VIR_DOMAIN_NET_TYPE_NETWORK ||
+         actualType == VIR_DOMAIN_NET_TYPE_BRIDGE))
+        virNetDevBridgeSwitchPortRemove(net->ifname);
+#endif
 
     /* deactivate the tap/macvtap device on the host, which could also
      * affect the parent device (e.g. macvtap passthrough mode sets

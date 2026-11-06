@@ -383,7 +383,7 @@ virCPUDefParseXML(xmlXPathContextPtr ctxt,
 
         if (!(schemafile = virFileFindResource("cpu.rng",
                                                abs_top_srcdir "/src/conf/schemas",
-                                               PKGDATADIR "/schemas")))
+                                               VIR_INSTALL_PATH(PKGDATADIR "/schemas"))))
             return -1;
 
         if (virXMLValidateNodeAgainstSchema(schemafile, ctxt->node) < 0)

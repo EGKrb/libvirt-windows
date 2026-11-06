@@ -21,7 +21,9 @@
 
 #include <config.h>
 
-#include <poll.h>
+#ifndef WIN32
+# include <poll.h>
+#endif
 #include <unistd.h>
 #include <sys/time.h>
 

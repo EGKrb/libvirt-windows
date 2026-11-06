@@ -369,7 +369,7 @@ lxcSetupFuse(struct virLXCFuse **f,
     if (virMutexInit(&fuse->lock) < 0)
         return -1;
 
-    fuse->mountpoint = g_strdup_printf("%s/%s.fuse/", LXC_STATE_DIR, def->name);
+    fuse->mountpoint = g_strdup_printf("%s/%s.fuse/", VIR_INSTALL_PATH(LXC_STATE_DIR), def->name);
 
     if (g_mkdir_with_parents(fuse->mountpoint, 0777) < 0) {
         virReportSystemError(errno, _("Cannot create %1$s"),

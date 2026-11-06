@@ -22,13 +22,17 @@
 #include <config.h>
 
 #include <sys/types.h>
-#include <poll.h>
+#ifndef WIN32
+# include <poll.h>
+#endif
 #include <sys/time.h>
 #include <dirent.h>
 #include <unistd.h>
 #include <sys/stat.h>
 #include <fcntl.h>
-#include <sys/ioctl.h>
+#ifndef WIN32
+# include <sys/ioctl.h>
+#endif
 
 #include "qemu_driver.h"
 #define LIBVIRT_QEMU_DRIVERPRIV_H_ALLOW
@@ -84,6 +88,7 @@
 #include "storage_file_probe.h"
 #include "storage_source.h"
 #include "virfile.h"
+#include "virsocket.h"
 #include "virfdstream.h"
 #include "configmake.h"
 #include "virthreadpool.h"
@@ -3653,7 +3658,22 @@ qemuPruneAutoDumpPath(virQEMUDriverConfig *cfg,
         if (g_stat(path, &sb) < 0 || !S_ISREG(sb.st_mode))
             continue;
 
+#ifdef WIN32
+        {
+            /* the space the dump takes on disk, sparse or compressed */
+            g_autofree gunichar2 *wpath = g_utf8_to_utf16(path, -1, NULL, NULL, NULL);
+            DWORD high = 0;
+            DWORD low = wpath ? GetCompressedFileSizeW(wpath, &high)
+                              : INVALID_FILE_SIZE;
+
+            if (low == INVALID_FILE_SIZE && GetLastError() != NO_ERROR)
+                alloc = sb.st_size;
+            else
+                alloc = ((unsigned long long) high << 32) | low;
+        }
+#else
         alloc = (unsigned long long)sb.st_blocks * DEV_BSIZE;
+#endif
         total += alloc;
 
         if (STREQ(path, keep))
@@ -14148,7 +14168,20 @@ qemuDomainOpenConsole(virDomainPtr dom,
         goto cleanup;
     }
 
+#ifdef WIN32
+    /* Windows has no PTY: the console is a UNIX socket QEMU listens on */
+    if (chr->source->type == VIR_DOMAIN_CHR_TYPE_UNIX &&
+        !chr->source->data.nix.listen) {
+        virReportError(VIR_ERR_OPERATION_UNSUPPORTED,
+                       _("character device %1$s is not listening on its UNIX socket"),
+                       dev_name ? dev_name : NULLSTR(chr->info.alias));
+        goto cleanup;
+    }
+    if (chr->source->type != VIR_DOMAIN_CHR_TYPE_PTY &&
+        chr->source->type != VIR_DOMAIN_CHR_TYPE_UNIX) {
+#else
     if (chr->source->type != VIR_DOMAIN_CHR_TYPE_PTY) {
+#endif
         virReportError(VIR_ERR_INTERNAL_ERROR,
                        _("character device %1$s is not using a PTY"),
                        dev_name ? dev_name : NULLSTR(chr->info.alias));
@@ -15414,7 +15447,7 @@ qemuSocketPair(int pair[2],
     if (qemuSecuritySetSocketLabel(mgr, vm) < 0)
         return -1;
 
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair) < 0)
+    if (virSocketPair(pair) < 0)
         return -1;
 
     if (qemuSecurityClearSocketLabel(mgr, vm) < 0)

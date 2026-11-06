@@ -76,7 +76,7 @@ void
 daemonConfigFilePath(bool privileged, char **configfile)
 {
     if (privileged) {
-        *configfile = g_strdup(SYSCONFDIR "/libvirt/" DAEMON_NAME ".conf");
+        *configfile = g_strdup(VIR_INSTALL_PATH(SYSCONFDIR "/libvirt/" DAEMON_NAME ".conf"));
     } else {
         g_autofree char *configdir = NULL;
 

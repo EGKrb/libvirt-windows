@@ -19,6 +19,8 @@
 
 #include <config.h>
 
+#include <gio/gio.h>
+
 #include "virsocket.h"
 #include "virutil.h"
 #include "virfile.h"
@@ -73,7 +75,9 @@ set_errno(void)
         errno = ENOTEMPTY;
         break;
     case WSAEWOULDBLOCK:
-        errno = EWOULDBLOCK;
+        /* EWOULDBLOCK is EAGAIN on POSIX hosts, which callers check for,
+         * but a distinct value in the Windows C runtime */
+        errno = EAGAIN;
         break;
     case WSAEINPROGRESS:
         errno = EINPROGRESS;
@@ -173,6 +177,52 @@ vir_accept(int fd, struct sockaddr *addr, socklen_t *addrlen)
     }
 
     return SK2FD(csk);
+}
+
+
+/*
+ * read() and write() cannot be used on non-blocking sockets on Windows:
+ * they are not files.
+ */
+ssize_t
+vir_recv(int fd, void *buf, size_t len)
+{
+    SOCKET sk = FD2SK(fd);
+    int ret;
+
+    if (sk == INVALID_SOCKET) {
+        errno = EBADF;
+        return -1;
+    }
+
+    ret = recv(sk, buf, MIN(len, INT_MAX), 0);
+    if (ret == SOCKET_ERROR) {
+        set_errno();
+        return -1;
+    }
+
+    return ret;
+}
+
+
+ssize_t
+vir_send(int fd, const void *buf, size_t len)
+{
+    SOCKET sk = FD2SK(fd);
+    int ret;
+
+    if (sk == INVALID_SOCKET) {
+        errno = EBADF;
+        return -1;
+    }
+
+    ret = send(sk, buf, MIN(len, INT_MAX), 0);
+    if (ret == SOCKET_ERROR) {
+        set_errno();
+        return -1;
+    }
+
+    return ret;
 }
 
 
@@ -368,6 +418,150 @@ vir_socket(int domain, int type, int protocol)
 }
 
 #endif /* WIN32 */
+
+
+#ifdef WIN32
+static ssize_t
+virSocketGLibResult(gssize ret, GError *err)
+{
+    if (ret >= 0)
+        return ret;
+    if (g_error_matches(err, G_IO_ERROR, G_IO_ERROR_WOULD_BLOCK))
+        errno = EAGAIN;
+    else if (g_error_matches(err, G_IO_ERROR, G_IO_ERROR_CONNECTION_CLOSED) ||
+             g_error_matches(err, G_IO_ERROR, G_IO_ERROR_BROKEN_PIPE))
+        errno = ECONNRESET;
+    else
+        errno = EIO;
+    return -1;
+}
+
+
+/* recv() through @sock, without blocking; -1 with errno set on failure */
+ssize_t
+virSocketGLibRecv(GSocket *sock, void *buf, size_t len)
+{
+    g_autoptr(GError) err = NULL;
+    gssize ret = g_socket_receive_with_blocking(sock, buf, len, FALSE, NULL, &err);
+
+    return virSocketGLibResult(ret, err);
+}
+
+
+/* send() through @sock, without blocking; -1 with errno set on failure */
+ssize_t
+virSocketGLibSend(GSocket *sock, const void *buf, size_t len)
+{
+    g_autoptr(GError) err = NULL;
+    gssize ret = g_socket_send_with_blocking(sock, buf, len, FALSE, NULL, &err);
+
+    return virSocketGLibResult(ret, err);
+}
+#endif /* WIN32 */
+
+
+/**
+ * virSocketGLibFD:
+ * @fd: a socket
+ *
+ * Returns the fd to give to g_socket_new_from_fd(), which then owns it: on
+ * POSIX @fd itself; on Windows, where GSocket owns a SOCKET handle, a
+ * duplicate of the handle of @fd, so that @fd keeps its own and must still
+ * be closed.  Returns -1 with errno set on failure.
+ */
+int
+virSocketGLibFD(int fd)
+{
+#ifdef WIN32
+    SOCKET sk = FD2SK(fd);
+    HANDLE dup;
+
+    if (sk == INVALID_SOCKET ||
+        !DuplicateHandle(GetCurrentProcess(), (HANDLE) sk, GetCurrentProcess(),
+                         &dup, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+        errno = EBADF;
+        return -1;
+    }
+    return (int) (intptr_t) dup;
+#else
+    return fd;
+#endif
+}
+
+
+/**
+ * virSocketGLibFDFree:
+ * @gfd: a result of virSocketGLibFD() that no GSocket took
+ */
+void
+virSocketGLibFDFree(int gfd G_GNUC_UNUSED)
+{
+#ifdef WIN32
+    if (gfd >= 0)
+        CloseHandle((HANDLE) (intptr_t) gfd);
+#endif
+}
+
+
+/**
+ * virSocketPair:
+ * @fds: filled with two connected sockets
+ *
+ * socketpair(AF_UNIX, SOCK_STREAM), which Windows lacks: there the two
+ * sockets are connected through a listener on a private temporary path,
+ * removed at once.
+ *
+ * Returns 0 on success, -1 with errno set on failure.
+ */
+int
+virSocketPair(int fds[2])
+{
+#ifndef WIN32
+    return socketpair(PF_UNIX, SOCK_STREAM, 0, fds);
+#else
+    static int counter;
+    g_autofree char *path = NULL;
+    struct sockaddr_un addr = { .sun_family = AF_UNIX };
+    int listenfd = -1;
+    int saved;
+
+    fds[0] = fds[1] = -1;
+    path = g_strdup_printf("%s/libvirt-pair-%lld-%d-%u", g_get_tmp_dir(),
+                           (long long) getpid(), g_atomic_int_add(&counter, 1),
+                           g_random_int());
+    if (g_strlcpy(addr.sun_path, path, sizeof(addr.sun_path)) >=
+        sizeof(addr.sun_path)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    if ((listenfd = vir_socket(AF_UNIX, SOCK_STREAM, 0)) < 0 ||
+        vir_bind(listenfd, (struct sockaddr *) &addr, sizeof(addr)) < 0 ||
+        vir_listen(listenfd, 1) < 0 ||
+        (fds[1] = vir_socket(AF_UNIX, SOCK_STREAM, 0)) < 0 ||
+        vir_connect(fds[1], (struct sockaddr *) &addr, sizeof(addr)) < 0 ||
+        (fds[0] = vir_accept(listenfd, NULL, NULL)) < 0)
+        goto error;
+
+    vir_closesocket(listenfd);
+    unlink(path);
+    return 0;
+
+ error:
+    saved = errno;
+    if (listenfd >= 0) {
+        vir_closesocket(listenfd);
+        unlink(path);
+    }
+    if (fds[0] >= 0)
+        vir_closesocket(fds[0]);
+    if (fds[1] >= 0)
+        vir_closesocket(fds[1]);
+    fds[0] = fds[1] = -1;
+    errno = saved;
+    return -1;
+#endif
+}
 
 
 /* The following two methods are derived from GNULIB's

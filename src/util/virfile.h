@@ -36,7 +36,17 @@ typedef enum {
     VIR_FILE_CLOSE_DONT_LOG = 1 << 2,
 } virFileCloseFlags;
 
-#ifdef __APPLE__
+#ifdef WIN32
+int virWin32Symlink(const char *target, const char *linkpath);
+# define symlink(target, linkpath) virWin32Symlink(target, linkpath)
+int virWin32Rename(const char *oldpath, const char *newpath);
+# undef rename
+# define rename(oldpath, newpath) virWin32Rename(oldpath, newpath)
+#endif
+
+#if defined(WIN32)
+# define VIR_FILE_MODULE_EXT ".dll"
+#elif defined(__APPLE__)
 # define VIR_FILE_MODULE_EXT ".dylib"
 #else
 # define VIR_FILE_MODULE_EXT ".so"

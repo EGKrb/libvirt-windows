@@ -358,7 +358,7 @@ virStorageBackendDiskReadPartitions(virStoragePoolObj *pool,
 
     if (!(parthelper_path = virFileFindResource("libvirt_parthelper",
                                                 abs_top_builddir "/src",
-                                                LIBEXECDIR)))
+                                                VIR_INSTALL_PATH(LIBEXECDIR))))
         return -1;
 
     cmd = virCommandNewArgList(parthelper_path,
@@ -412,7 +412,7 @@ virStorageBackendDiskReadGeometry(virStoragePoolObj *pool)
 
     if (!(parthelper_path = virFileFindResource("libvirt_parthelper",
                                                 abs_top_builddir "/src",
-                                                LIBEXECDIR)))
+                                                VIR_INSTALL_PATH(LIBEXECDIR))))
         return -1;
 
     cmd = virCommandNewArgList(parthelper_path,

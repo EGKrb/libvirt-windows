@@ -59,19 +59,19 @@ virBhyveDriverConfigNew(bool privileged)
         return NULL;
 
     if (privileged) {
-        cfg->configBaseDir = g_strdup(SYSCONFDIR "/libvirt");
+        cfg->configBaseDir = g_strdup(VIR_INSTALL_PATH(SYSCONFDIR "/libvirt"));
 
-        cfg->firmwareDir = g_strdup(DATADIR "/uefi-firmware");
-        cfg->libDir = g_strdup_printf("%s/lib/libvirt/bhyve", LOCALSTATEDIR);
+        cfg->firmwareDir = g_strdup(VIR_INSTALL_PATH(DATADIR "/uefi-firmware"));
+        cfg->libDir = g_strdup_printf("%s/lib/libvirt/bhyve", VIR_INSTALL_PATH(LOCALSTATEDIR));
         cfg->nvramDir = g_strdup_printf("%s/nvram", cfg->libDir);
 
-        cfg->ubootPath = g_strdup(DATADIR "/u-boot/u-boot-bhyve-arm64/u-boot.bin");
+        cfg->ubootPath = g_strdup(VIR_INSTALL_PATH(DATADIR "/u-boot/u-boot-bhyve-arm64/u-boot.bin"));
 
         cfg->configDir = g_strdup_printf("%s/bhyve", cfg->configBaseDir);
         cfg->autostartDir = g_strdup_printf("%s/bhyve/autostart", cfg->configBaseDir);
-        cfg->stateDir = g_strdup_printf("%s/libvirt/bhyve", RUNSTATEDIR);
-        cfg->bhyveRunDir = g_strdup(RUNSTATEDIR "/bhyve");
-        cfg->logDir = g_strdup_printf("%s/log/libvirt/bhyve", LOCALSTATEDIR);
+        cfg->stateDir = g_strdup_printf("%s/libvirt/bhyve", VIR_INSTALL_PATH(RUNSTATEDIR));
+        cfg->bhyveRunDir = g_strdup(VIR_INSTALL_PATH(RUNSTATEDIR "/bhyve"));
+        cfg->logDir = g_strdup_printf("%s/log/libvirt/bhyve", VIR_INSTALL_PATH(LOCALSTATEDIR));
     } else {
         g_autofree char *rundir = NULL;
         g_autofree char *cachedir = NULL;
@@ -81,11 +81,11 @@ virBhyveDriverConfigNew(bool privileged)
         cachedir = virGetUserCacheDirectory();
         rundir = virGetUserRuntimeDirectory();
 
-        cfg->firmwareDir = g_strdup(DATADIR "/uefi-firmware");
+        cfg->firmwareDir = g_strdup(VIR_INSTALL_PATH(DATADIR "/uefi-firmware"));
         cfg->libDir = g_strdup_printf("%s/bhyve/lib", cfg->configBaseDir);
         cfg->nvramDir = g_strdup_printf("%s/bhyve/nvram", cfg->configBaseDir);
 
-        cfg->ubootPath = g_strdup(DATADIR "/u-boot/u-boot-bhyve-arm64/u-boot.bin");
+        cfg->ubootPath = g_strdup(VIR_INSTALL_PATH(DATADIR "/u-boot/u-boot-bhyve-arm64/u-boot.bin"));
 
         cfg->configDir = g_strdup_printf("%s/bhyve", cfg->configBaseDir);
         cfg->autostartDir = g_strdup_printf("%s/bhyve/autostart", cfg->configBaseDir);

@@ -118,9 +118,79 @@
 #define CONCAT_(a, b) a ## b
 #define CONCAT(a, b) CONCAT_(a, b)
 
+/*
+ * When the file in a struct stat last changed, to tell an updated binary.
+ * st_ctime on Windows is the creation time, which NTFS even keeps for a
+ * file deleted and created again under the same name within 15 seconds
+ * (as an installation does): its modification time is used instead.
+ */
+#ifdef WIN32
+# define VIR_STAT_CHANGE_TIME(sb) ((sb).st_mtime)
+#else
+# define VIR_STAT_CHANGE_TIME(sb) ((sb).st_ctime)
+#endif
+
 #ifdef WIN32
 # ifndef O_CLOEXEC
 #  define O_CLOEXEC _O_NOINHERIT
+# endif
+
+/*
+ * Signals the C runtime lacks, with their Linux numbers: virProcessKill()
+ * delivers them to libvirt daemons, see virNetDaemonAddSignalHandler().
+ */
+# include <signal.h>
+# ifndef SIGHUP
+#  define SIGHUP 1
+# endif
+# ifndef SIGQUIT
+#  define SIGQUIT 3
+# endif
+# ifndef SIGKILL
+#  define SIGKILL 9
+# endif
+# ifndef SIGUSR1
+#  define SIGUSR1 10
+# endif
+# ifndef SIGUSR2
+#  define SIGUSR2 12
+# endif
+# ifndef SIGPIPE
+#  define SIGPIPE 13
+# endif
+# ifndef SIGALRM
+#  define SIGALRM 14
+# endif
+# ifndef SIGCHLD
+#  define SIGCHLD 17
+# endif
+# ifndef SIGCONT
+#  define SIGCONT 18
+# endif
+# ifndef SIGSTOP
+#  define SIGSTOP 19
+# endif
+
+/* File types and flags the C runtime lacks: stat() never reports them */
+# include <sys/stat.h>
+# ifndef S_IFLNK
+#  define S_IFLNK 0120000
+# endif
+# ifndef S_IFSOCK
+#  define S_IFSOCK 0140000
+# endif
+# ifndef S_ISLNK
+#  define S_ISLNK(mode) (((mode) & S_IFMT) == S_IFLNK)
+# endif
+# ifndef S_ISSOCK
+#  define S_ISSOCK(mode) (((mode) & S_IFMT) == S_IFSOCK)
+# endif
+# ifndef O_NOFOLLOW
+#  define O_NOFOLLOW 0
+# endif
+/* no controlling terminals either */
+# ifndef O_NOCTTY
+#  define O_NOCTTY 0
 # endif
 #endif
 

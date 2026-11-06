@@ -244,26 +244,161 @@ virProcessWait(pid_t pid, int *exitstatus, bool raw)
 
 #else /* WIN32 */
 
+/* Exit code given to TerminateProcess() by virProcessKill(): marker | sig */
+# define VIR_PROCESS_WIN32_SIGNAL_EXIT 0x4c565400
+# define VIR_PROCESS_WIN32_SIGNAL_MASK 0xffffff00
+
+/*
+ * Handles of the children started by virExec(), by pid: unlike a pid, an
+ * open handle keeps the exit code of a child and prevents its pid from
+ * being reused until the child is reaped by virProcessWait().
+ */
+static GHashTable *win32Children;
+static GMutex win32ChildrenLock;
+
+
+void
+virProcessWin32AddChild(pid_t pid, void *handle)
+{
+    g_mutex_lock(&win32ChildrenLock);
+    if (!win32Children)
+        win32Children = g_hash_table_new(g_direct_hash, g_direct_equal);
+    g_hash_table_insert(win32Children, GINT_TO_POINTER(pid), handle);
+    g_mutex_unlock(&win32ChildrenLock);
+}
+
+
+/* Remove the handle of @pid from the children, or open one if not a child */
+static HANDLE
+virProcessWin32TakeHandle(pid_t pid)
+{
+    HANDLE proc = NULL;
+
+    g_mutex_lock(&win32ChildrenLock);
+    if (win32Children &&
+        (proc = g_hash_table_lookup(win32Children, GINT_TO_POINTER(pid))))
+        g_hash_table_remove(win32Children, GINT_TO_POINTER(pid));
+    g_mutex_unlock(&win32ChildrenLock);
+
+    if (!proc)
+        proc = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+                           FALSE, pid);
+    return proc;
+}
+
+
+/* waitpid() status of a process that exited with @code */
+static int
+virProcessWin32Status(DWORD code)
+{
+    if ((code & VIR_PROCESS_WIN32_SIGNAL_MASK) == VIR_PROCESS_WIN32_SIGNAL_EXIT)
+        return code & 0x7f;
+
+    /* Unhandled exceptions end a process with their NTSTATUS */
+    switch (code) {
+    case EXCEPTION_ACCESS_VIOLATION:
+    case EXCEPTION_STACK_OVERFLOW:
+    case EXCEPTION_IN_PAGE_ERROR:
+        return SIGSEGV;
+    case EXCEPTION_ILLEGAL_INSTRUCTION:
+    case EXCEPTION_PRIV_INSTRUCTION:
+        return SIGILL;
+    case EXCEPTION_INT_DIVIDE_BY_ZERO:
+    case EXCEPTION_FLT_DIVIDE_BY_ZERO:
+        return SIGFPE;
+    case STATUS_CONTROL_C_EXIT:
+        return SIGINT;
+    }
+    if (code >= 0xc0000000)
+        return SIGABRT;
+
+    return (code & 0xff) << 8;
+}
+
+
 char *
 virProcessTranslateStatus(int status)
 {
-    return g_strdup_printf(_("invalid value %1$d"), status);
+    if (WIFEXITED(status))
+        return g_strdup_printf(_("exit status %1$d"), WEXITSTATUS(status));
+    return g_strdup_printf(_("fatal signal %1$d"), WTERMSIG(status));
 }
 
 
 void
 virProcessAbort(pid_t pid)
 {
-    /* Not yet ported to mingw.  Any volunteers?  */
-    VIR_DEBUG("failed to reap child %lld, abandoning it", (long long)pid);
+    int saved_errno = errno;
+    HANDLE proc;
+
+    if (pid <= 0)
+        return;
+
+    VIR_DEBUG("aborting child process %d", pid);
+    if (!(proc = virProcessWin32TakeHandle(pid))) {
+        VIR_DEBUG("failed to reap child %lld, abandoning it",
+                  (long long) pid);
+        errno = saved_errno;
+        return;
+    }
+
+    if (WaitForSingleObject(proc, 0) == WAIT_TIMEOUT) {
+        TerminateProcess(proc, VIR_PROCESS_WIN32_SIGNAL_EXIT | SIGABRT);
+        WaitForSingleObject(proc, INFINITE);
+    }
+    CloseHandle(proc);
+    errno = saved_errno;
 }
 
 
 int
-virProcessWait(pid_t pid, int *exitstatus G_GNUC_UNUSED, bool raw G_GNUC_UNUSED)
+virProcessWait(pid_t pid, int *exitstatus, bool raw)
 {
-    virReportSystemError(ENOSYS, _("unable to wait for process %1$lld"),
-                         (long long) pid);
+    HANDLE proc;
+    DWORD code;
+    int status;
+    g_autofree char *st = NULL;
+
+    if (pid <= 0) {
+        if (pid != -1)
+            virReportSystemError(EINVAL, _("unable to wait for process %1$lld"),
+                                 (long long) pid);
+        return -1;
+    }
+
+    if (!(proc = virProcessWin32TakeHandle(pid))) {
+        virReportSystemError(ECHILD, _("unable to wait for process %1$lld"),
+                             (long long) pid);
+        return -1;
+    }
+    if (WaitForSingleObject(proc, INFINITE) != WAIT_OBJECT_0 ||
+        !GetExitCodeProcess(proc, &code)) {
+        virReportSystemError(EINVAL, _("unable to wait for process %1$lld"),
+                             (long long) pid);
+        CloseHandle(proc);
+        return -1;
+    }
+    CloseHandle(proc);
+    status = virProcessWin32Status(code);
+
+    if (exitstatus == NULL) {
+        if (status != 0)
+            goto error;
+    } else if (raw) {
+        *exitstatus = status;
+    } else if (WIFEXITED(status)) {
+        *exitstatus = WEXITSTATUS(status);
+    } else {
+        goto error;
+    }
+
+    return 0;
+
+ error:
+    st = virProcessTranslateStatus(status);
+    virReportError(VIR_ERR_INTERNAL_ERROR,
+                   _("Child process (%1$lld) unexpected %2$s"),
+                   (long long) pid, NULLSTR(st));
     return -1;
 }
 
@@ -279,48 +414,64 @@ int virProcessKill(pid_t pid, int sig)
     }
 
 #ifdef WIN32
-    /* Mingw / Windows don't have many signals (AFAIK) */
-    switch (sig) {
-    case SIGINT:
-        /* This does a Ctrl+C equiv */
-        if (!GenerateConsoleCtrlEvent(CTRL_C_EVENT, pid)) {
-            errno = ESRCH;
-            return -1;
-        }
-        break;
-
-    case SIGTERM:
-        /* Since TerminateProcess is closer to SIG_KILL, we do
-         * a Ctrl+Break equiv which is more pleasant like the
-         * good old unix SIGTERM/HUP
-         */
-        if (!GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid)) {
-            errno = ESRCH;
-            return -1;
-        }
-        break;
-
-    default:
     {
         HANDLE proc;
-        proc = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
-        if (!proc) {
-            errno = ESRCH; /* Not entirely accurate, but close enough */
-            return -1;
-        }
+        DWORD code;
+        int ret = 0;
 
-        /*
-         * TerminateProcess is more or less equiv to SIG_KILL, in that
-         * a process can't trap / block it
-         */
-        if (sig != 0 && !TerminateProcess(proc, sig)) {
+        proc = OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
+                           FALSE, pid);
+        /* an exited process stays openable while someone holds a handle */
+        if (!proc || !GetExitCodeProcess(proc, &code) || code != STILL_ACTIVE) {
+            if (proc)
+                CloseHandle(proc);
             errno = ESRCH;
             return -1;
         }
+
+        if (sig != 0 && sig != SIGKILL) {
+            /* a libvirt daemon handling @sig waits on a named event */
+            g_autofree char *name = VIR_PROCESS_WIN32_SIGNAL_EVENT(pid, sig);
+            HANDLE event = OpenEventA(EVENT_MODIFY_STATE, FALSE, name);
+
+            if (event) {
+                bool sent = SetEvent(event);
+
+                CloseHandle(event);
+                if (sent) {
+                    CloseHandle(proc);
+                    return 0;
+                }
+            }
+        }
+
+        switch (sig) {
+        case 0:
+            break;
+
+        case SIGINT:
+        case SIGTERM:
+            /*
+             * Ctrl+C / Ctrl+Break reach the process group of a child that
+             * shares our console (virExec makes each child a group leader);
+             * a process without one can only be terminated.
+             */
+            if (GenerateConsoleCtrlEvent(sig == SIGINT ? CTRL_C_EVENT
+                                                       : CTRL_BREAK_EVENT,
+                                         pid))
+                break;
+            G_GNUC_FALLTHROUGH;
+
+        default:
+            /* like SIGKILL, TerminateProcess cannot be trapped */
+            if (!TerminateProcess(proc, VIR_PROCESS_WIN32_SIGNAL_EXIT | sig)) {
+                errno = ESRCH;
+                ret = -1;
+            }
+        }
         CloseHandle(proc);
+        return ret;
     }
-    }
-    return 0;
 #else
     return kill(pid, sig);
 #endif
@@ -1197,6 +1348,26 @@ int virProcessGetStartTime(pid_t pid,
 
     return 0;
 
+}
+#elif defined(WIN32)
+int virProcessGetStartTime(pid_t pid,
+                           unsigned long long *timestamp)
+{
+    HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    FILETIME created, exited, kernel, user;
+
+    if (!proc || !GetProcessTimes(proc, &created, &exited, &kernel, &user)) {
+        if (proc)
+            CloseHandle(proc);
+        virReportSystemError(ESRCH, "%s",
+                             _("Unable to query process ID start time"));
+        return -1;
+    }
+    CloseHandle(proc);
+    /* creation time, in 100 ns units: unique for a pid at a time */
+    *timestamp = ((unsigned long long) created.dwHighDateTime << 32) |
+                 created.dwLowDateTime;
+    return 0;
 }
 #else
 int virProcessGetStartTime(pid_t pid,
