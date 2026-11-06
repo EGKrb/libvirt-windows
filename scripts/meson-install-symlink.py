@@ -16,6 +16,10 @@ os.chdir(workdir)
 if os.path.lexists(link):
     os.remove(link)
 
+if os.name == 'nt':
+    # Windows does not resolve a relative link target written with '/'
+    target = target.replace('/', os.sep)
+
 try:
     os.symlink(target, link)
 except OSError:
