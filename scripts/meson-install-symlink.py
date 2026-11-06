@@ -18,7 +18,8 @@ if os.path.lexists(link):
 
 if os.name == 'nt':
     # Windows does not resolve a relative link target written with '/'
-    target = target.replace('/', os.sep)
+    # (and os.sep is '/' in the Python of MSYS2)
+    target = target.replace('/', '\\')
 
 try:
     os.symlink(target, link)
