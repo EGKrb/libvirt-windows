@@ -78,8 +78,10 @@ jobs:
         shell: pwsh
         run: |
           $name = "libvirt-windows-${{ steps.version.outputs.version }}"
-          Expand-Archive "dist\$name.zip" pkgtest
-          $r = "pkgtest\$name"
+          # a short path, as the README says: D: of the runner makes no 8.3
+          # names, and the workspace path leaves no room for the sockets
+          Expand-Archive "dist\$name.zip" C:\lvw
+          $r = "C:\lvw\$name"
           $env:PATH = "C:\Windows\System32;C:\Windows"
           & "$r\bin\virsh.exe" --version
           & "$r\bin\virsh.exe" -c test:///default list --all

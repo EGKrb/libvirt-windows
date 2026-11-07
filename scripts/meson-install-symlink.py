@@ -8,7 +8,10 @@ dirname = sys.argv[1]
 target = sys.argv[2]
 link = sys.argv[3]
 
-workdir = os.path.join(destdir, dirname.strip(os.sep))
+if 'DESTDIR' in os.environ:
+    # a Windows path keeps its drive, which would discard DESTDIR
+    dirname = os.path.splitdrive(dirname)[1]
+workdir = os.path.join(destdir, dirname.lstrip('/\\'))
 
 os.makedirs(workdir, exist_ok=True)
 os.chdir(workdir)
