@@ -113,8 +113,9 @@ jobs:
           $v = "${{ steps.version.outputs.version }}"
           Set-Location dist
           $files = Get-ChildItem "libvirt-windows-$v*.zip" | Select-Object -Expand Name
-          $files | ForEach-Object { "{0}  {1}" -f (Get-FileHash $_ -Algorithm SHA256).Hash.ToLower(), $_ } |
-            Set-Content -Encoding ascii SHA256SUMS.txt
+          # LF line ends: sha256sum -c reads them as they are
+          $sums = $files | ForEach-Object { "{0}  {1}" -f (Get-FileHash $_ -Algorithm SHA256).Hash.ToLower(), $_ }
+          [IO.File]::WriteAllText("$PWD\SHA256SUMS.txt", ($sums -join "`n") + "`n")
           gh release create "v$v" @files SHA256SUMS.txt `
             --title "libvirt for Windows $v (libvirt 12.9.0)" `
             --notes-file ..\windows\release-notes.md
