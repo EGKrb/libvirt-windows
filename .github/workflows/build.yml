@@ -89,7 +89,12 @@ jobs:
           & "$r\bin\virsh.exe" -c qemu:///system net-list --all
           $state = & "$r\bin\virsh.exe" -c qemu:///system net-list | Out-String
           windows\stop-daemons.ps1 $r
-          if ($state -notmatch 'default\s+active') { throw "default network not active" }
+          if ($state -notmatch 'default\s+active') {
+            Get-ChildItem "$r\var" -Recurse | Select-Object -Expand FullName
+            Get-ChildItem "$r\var\log" -Recurse -Filter *.log | ForEach-Object { "== $_"; Get-Content $_.FullName -Tail 30 }
+            & "$r\sbin\virtnetworkd.exe" --timeout 5 2>&1 | Select-Object -First 20
+            throw "default network not active"
+          }
 
       - uses: actions/upload-artifact@v4
         with:
