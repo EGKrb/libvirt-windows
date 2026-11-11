@@ -24,7 +24,9 @@ libvirt tel que téléchargé, le second le portage Windows.
 
 ## État
 
-Testé sous Windows 11 (build 26300) avec des invités Ubuntu 24.04.
+Testé sous Windows 11 (build 26300) avec des invités Ubuntu 24.04 ; TAP et
+Wintun (plus bas) dans une machine virtuelle Windows 11 26300 avec des invités
+Alpine.
 
 | Domaine | Fonctionne et testé | Pas fait ou pas testé |
 | --- | --- | --- |
@@ -32,8 +34,8 @@ Testé sous Windows 11 (build 26300) avec des invités Ubuntu 24.04.
 | Accès distant | sockets UNIX, transport `ext` | transport `ssh` (écrit, non testé), TLS |
 | Secrets | define, set, get, undefine, persistance | |
 | QEMU | type de domaine `whpx` ; define, start, destroy, suspend, resume ; `screenshot` ; `qemu-monitor-command` ; `virsh console` (série sur socket UNIX) ; ajout et retrait de cartes à chaud ; `setmem` (ballon, mémoire rendue à l'hôte avec le [correctif QEMU](windows/qemu)) ; `dommemstat` | save/restore, migration, instantanés, sysinfo SMBIOS |
-| Réseau des invités | `type='user'` (libslirp) ; `type='network'` et `type='bridge'` vers un réseau libvirt | `type='ethernet'` et ponts vers le réseau local de l'hôte (TAP, prévu) |
-| Réseaux virtuels | modes `nat` et isolé ; DHCP et DHCPv6 (plages, réservations par MAC, DUID ou nom) ; DNS (hôtes, TXT, SRV, PTR, redirecteurs, domaine local) ; IPv6 (SLAAC ou DHCPv6) ; `net-update` ; `net-dhcp-leases` ; `domifaddr` ; autostart ; QoS (`domiftune`, floors, bande passante du réseau) ; `domifstat` | modes `route` et `open` (écrits, nécessitent Wintun, non testés) |
+| Réseau des invités | `type='user'` (libslirp) ; `type='network'` et `type='bridge'` vers un réseau libvirt ; `type='ethernet'` sur un adaptateur TAP-Windows (créé, nommé, adressé et supprimé par libvirt ; `domifstat`) | `type='ethernet'` avec `managed='no'` (écrit, non testé) ; ponts vers le réseau local de l'hôte |
+| Réseaux virtuels | modes `nat` et isolé ; DHCP et DHCPv6 (plages, réservations par MAC, DUID ou nom) ; DNS (hôtes, TXT, SRV, PTR, redirecteurs, domaine local) ; IPv6 (SLAAC ou DHCPv6) ; `net-update` ; `net-dhcp-leases` ; `domifaddr` ; autostart ; QoS (`domiftune`, floors, bande passante du réseau) ; `domifstat` ; modes `route` et `open` (Wintun) | |
 | Autres pilotes | | stockage, nodedev, interface, nwfilter, LXC, VirtualBox |
 
 ## Fonctionnement
@@ -142,6 +144,15 @@ La configuration est dans `install\etc\libvirt`, les journaux dans
   `wintun.dll` (amd64) à côté de `install\libexec\libvirt_netswitch.exe`, et
   les droits administrateur. L'hôte a alors une interface `virbr0` avec
   l'adresse de la passerelle, comme sous Linux.
+- `type='ethernet'` nécessite le pilote TAP-Windows6 d'OpenVPN (9.27 ou plus,
+  identifiant matériel `root	ap0901`) dans le magasin de pilotes
+  (`pnputil /add-driver OemVista.inf /install`), et les droits
+  administrateur : libvirt crée un adaptateur au nom de l'interface (`vnet0`),
+  lui donne les adresses et routes de `<source><ip/></source>`, et le supprime
+  avec l'invité.
+- Le pare-feu Windows range ces interfaces TAP et Wintun dans le profil
+  Public : ce qu'un invité ouvre vers l'hôte (ping compris) est bloqué tant
+  qu'une règle ne l'autorise pas.
 
 ## Organisation
 

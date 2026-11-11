@@ -23,7 +23,8 @@ downloaded, the second one is the Windows port.
 
 ## Status
 
-Tested on Windows 11 (build 26300) with Ubuntu 24.04 guests.
+Tested on Windows 11 (build 26300) with Ubuntu 24.04 guests; TAP and Wintun
+(below) in a Windows 11 26300 virtual machine with Alpine guests.
 
 | Area | Works and tested | Not done or not tested |
 | --- | --- | --- |
@@ -31,8 +32,8 @@ Tested on Windows 11 (build 26300) with Ubuntu 24.04 guests.
 | Remote | UNIX sockets, `ext` transport | `ssh` transport (implemented, untested), TLS |
 | Secrets | define, set, get, undefine, persistence | |
 | QEMU | `whpx` domain type; define, start, destroy, suspend, resume; `screenshot`; `qemu-monitor-command`; `virsh console` (serial on a UNIX socket); NIC hotplug; `setmem` (balloon, memory given back to the host with the [QEMU patch](windows/qemu)); `dommemstat` | save/restore, migration, snapshots, SMBIOS sysinfo |
-| Guest networking | `type='user'` (libslirp); `type='network'` and `type='bridge'` to a libvirt network | `type='ethernet'` and bridges to the host LAN (TAP, planned) |
-| Virtual networks | forward mode `nat` and isolated; DHCP and DHCPv6 (ranges, hosts by MAC, DUID or name); DNS (hosts, TXT, SRV, PTR, forwarders, local domain); IPv6 (SLAAC or DHCPv6); `net-update`; `net-dhcp-leases`; `domifaddr`; autostart; QoS (`domiftune`, floors, network bandwidth); `domifstat` | forward modes `route` and `open` (written, need Wintun, untested) |
+| Guest networking | `type='user'` (libslirp); `type='network'` and `type='bridge'` to a libvirt network; `type='ethernet'` on a TAP-Windows adapter (created, named, addressed and deleted by libvirt; `domifstat`) | `type='ethernet'` with `managed='no'` (written, untested); bridges to the host LAN |
+| Virtual networks | forward mode `nat` and isolated; DHCP and DHCPv6 (ranges, hosts by MAC, DUID or name); DNS (hosts, TXT, SRV, PTR, forwarders, local domain); IPv6 (SLAAC or DHCPv6); `net-update`; `net-dhcp-leases`; `domifaddr`; autostart; QoS (`domiftune`, floors, network bandwidth); `domifstat`; forward modes `route` and `open` (Wintun) | |
 | Other drivers | | storage, nodedev, interface, nwfilter, LXC, VirtualBox |
 
 ## How it works
@@ -139,6 +140,15 @@ Configuration is in `install\etc\libvirt`, logs in `install\var\log\libvirt`
   (amd64) beside `install\libexec\libvirt_netswitch.exe`, and administrator
   rights. The host then has a `virbr0` interface with the gateway address, as
   on Linux.
+- `type='ethernet'` needs the TAP-Windows6 driver of OpenVPN (9.27 or later,
+  hardware id `root	ap0901`) in the driver store
+  (`pnputil /add-driver OemVista.inf /install`), and administrator rights:
+  libvirt creates an adapter named after the interface (`vnet0`), gives it
+  the `<source><ip/></source>` addresses and routes, and deletes it with the
+  guest.
+- The Windows firewall puts these TAP and Wintun interfaces in the Public
+  profile: what a guest opens to the host (a ping included) is blocked until
+  a rule allows it.
 
 ## Layout
 

@@ -21,6 +21,10 @@ Requirements
   "Windows Hypervisor Platform" optional feature for hardware acceleration.
 - Forward modes route and open of virtual networks: wintun.dll (amd64,
   https://www.wintun.net) in libexec, and administrator rights.
+- Interfaces type='ethernet': the TAP-Windows6 driver of OpenVPN (9.27 or
+  later) in the driver store, and administrator rights.
+- The Windows firewall puts the TAP and Wintun interfaces in the Public
+  profile: what a guest opens to the host is blocked until a rule allows it.
 
 Start
 -----
