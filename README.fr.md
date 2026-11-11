@@ -50,6 +50,8 @@ Alpine.
 | Consoles PTY | port série QEMU sur socket UNIX, `virsh console` par la console Windows |
 | KVM | WHPX (`<domain type='whpx'>`), sinon TCG |
 | Bridge, TAP, dnsmasq, iptables | `libvirt_netswitch` : un processus par réseau, switch Ethernet sur socket UNIX que QEMU rejoint par `-netdev stream`, libslirp pour le NAT, DHCP/DHCPv6/DNS intégrés, QoS par seaux à jetons |
+| Périphériques TAP de `type='ethernet'` | adaptateurs TAP-Windows6 créés par SetupAPI ; adaptateurs Wintun pour `route` et `open` |
+| Zone firewalld `libvirt` | règles du pare-feu Windows du groupe `libvirt` |
 | `tc` | le switch limite ce que reçoit un invité (file d'attente) et ce qu'il envoie (rejet) |
 | Remplacer des binaires en cours d'exécution | renommés `NOM.busy-HORODATAGE` par l'installation, supprimés par la suivante |
 
@@ -151,8 +153,11 @@ La configuration est dans `install\etc\libvirt`, les journaux dans
   lui donne les adresses et routes de `<source><ip/></source>`, et le supprime
   avec l'invité.
 - Le pare-feu Windows range ces interfaces TAP et Wintun dans le profil
-  Public : ce qu'un invité ouvre vers l'hôte (ping compris) est bloqué tant
-  qu'une règle ne l'autorise pas.
+  Public. Comme la zone firewalld `libvirt` sous Linux, un réseau `route` (ou
+  `open` avec `<bridge zone='libvirt'/>`) reçoit des règles entrantes (groupe
+  `libvirt`, retirées avec le réseau) pour ICMP, ICMPv6, DHCP, DHCPv6, DNS,
+  SSH et TFTP depuis ses sous-réseaux ; le reste demande une règle de votre
+  part, comme les interfaces `type='ethernet'`.
 
 ## Organisation
 

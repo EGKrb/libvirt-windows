@@ -48,6 +48,8 @@ Tested on Windows 11 (build 26300) with Ubuntu 24.04 guests; TAP and Wintun
 | PTY consoles | QEMU serial on a UNIX socket, `virsh console` through the Windows console |
 | KVM | WHPX (`<domain type='whpx'>`), TCG otherwise |
 | Bridge, TAP, dnsmasq, iptables | `libvirt_netswitch`: one process per network, an Ethernet switch on a UNIX socket that QEMU joins with `-netdev stream`, libslirp for NAT, its own DHCP/DHCPv6/DNS, QoS by token buckets |
+| `type='ethernet'` TAP devices | TAP-Windows6 adapters created by SetupAPI; Wintun adapters for `route` and `open` |
+| firewalld zone `libvirt` | Windows firewall rules of the group `libvirt` |
 | `tc` | the switch shapes what a guest receives and polices what it sends |
 | Replacing running binaries | renamed `NAME.busy-STAMP` by the install, removed by the next one |
 
@@ -147,8 +149,11 @@ Configuration is in `install\etc\libvirt`, logs in `install\var\log\libvirt`
   the `<source><ip/></source>` addresses and routes, and deletes it with the
   guest.
 - The Windows firewall puts these TAP and Wintun interfaces in the Public
-  profile: what a guest opens to the host (a ping included) is blocked until
-  a rule allows it.
+  profile. As firewalld's `libvirt` zone on Linux, a `route` network (or
+  `open` with `<bridge zone='libvirt'/>`) gets inbound rules (group
+  `libvirt`, removed with the network) for ICMP, ICMPv6, DHCP, DHCPv6, DNS,
+  SSH and TFTP from its subnets; anything else a guest opens to the host
+  needs a rule of yours, as do `type='ethernet'` interfaces.
 
 ## Layout
 

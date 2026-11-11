@@ -27,4 +27,10 @@ The source of libvirt itself is the repository at this tag (*Source code* below)
 
 ## What works
 
-Daemons (modular and `libvirtd`), secrets, QEMU guests with WHPX (lifecycle, `virsh console`, screenshots, QMP, NIC hotplug, memory balloon), user networking, virtual networks in NAT and isolated modes with DHCP, DHCPv6, DNS, IPv6, QoS and statistics. The [status table](https://github.com/EGKrb/libvirt-windows#status) lists what is not done yet: storage, nodedev, migration, TAP devices, and the route and open forward modes (written, untested).
+Daemons (modular and `libvirtd`), secrets, QEMU guests with WHPX (lifecycle, `virsh console`, screenshots, QMP, NIC hotplug, memory balloon), user networking, virtual networks in NAT and isolated modes with DHCP, DHCPv6, DNS, IPv6, QoS and statistics. The [status table](https://github.com/EGKrb/libvirt-windows#status) lists what is not done yet: storage, nodedev, migration, bridges to the host LAN.
+
+New in 0.2.0, tested in a Windows 11 26300 virtual machine:
+
+- `<interface type='ethernet'>` on TAP-Windows adapters: libvirt creates the adapter, names it after the interface, gives it the `<source><ip/></source>` addresses and routes, and deletes it with the guest. Needs the TAP-Windows6 driver of OpenVPN (9.27 or later) in the driver store, and administrator rights.
+- Forward modes `route` and `open`, through a Wintun adapter: put `wintun.dll` (amd64, https://www.wintun.net) in `libexec`; administrator rights.
+- Windows firewall rules as firewalld's `libvirt` zone: a `route` network (or `open` with `zone='libvirt'`) lets its guests reach the host by ICMP, ICMPv6, DHCP, DHCPv6, DNS, SSH and TFTP; the rules (group `libvirt`) go with the network.

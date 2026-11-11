@@ -24,7 +24,9 @@ Requirements
 - Interfaces type='ethernet': the TAP-Windows6 driver of OpenVPN (9.27 or
   later) in the driver store, and administrator rights.
 - The Windows firewall puts the TAP and Wintun interfaces in the Public
-  profile: what a guest opens to the host is blocked until a rule allows it.
+  profile. A route network (or open with zone='libvirt') gets the rules of
+  firewalld's libvirt zone (ICMP, DHCP, DNS, SSH, TFTP from its subnets,
+  group "libvirt"); anything else needs a rule of yours.
 
 Start
 -----
