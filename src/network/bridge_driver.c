@@ -2518,6 +2518,7 @@ networkStartNetworkVirtual(virNetworkDriverState *driver,
 {
     g_autoptr(virNetworkDriverConfig) cfg = virNetworkDriverGetConfig(driver);
     virNetworkDef *def = virNetworkObjGetDef(obj);
+    virFirewall *fwRemoval = NULL;
 
     if (!def->bridge) {
         /* see the POSIX version: only possible with hand edited files */
@@ -2548,8 +2549,16 @@ networkStartNetworkVirtual(virNetworkDriverState *driver,
     if (networkSetMacMap(cfg, obj) < 0)
         return -1;
 
+    /* the Windows firewall rules of the zone "libvirt" */
+    if (networkAddFirewallRules(def, cfg->firewallBackend, &fwRemoval) < 0) {
+        virNetworkObjUnrefMacMap(obj);
+        return -1;
+    }
+    virNetworkObjSetFwRemoval(obj, fwRemoval);
+
     /* the switch is needed even without addresses: it links the guests */
     if (networkStartDhcpDaemon(driver, obj) < 0) {
+        networkRemoveFirewallRules(obj, true);
         virNetworkObjUnrefMacMap(obj);
         return -1;
     }
@@ -2570,6 +2579,8 @@ networkShutdownNetworkVirtual(virNetworkObj *obj)
     if (pid > 0)
         virProcessKillPainfully(pid, true);
     virNetworkObjSetDnsmasqPid(obj, -1);
+
+    networkRemoveFirewallRules(obj, true);
 
     /* the switch removes it, unless it was killed */
     unlink(sockpath);

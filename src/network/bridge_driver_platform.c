@@ -27,6 +27,8 @@
 # include "bridge_driver_linux.c"
 #elif defined(__FreeBSD__)
 # include "bridge_driver_bsd.c"
+#elif defined(WIN32)
+# include "bridge_driver_win32.c"
 #else
 # include "bridge_driver_nop.c"
 #endif
