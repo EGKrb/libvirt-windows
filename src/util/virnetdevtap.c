@@ -18,6 +18,18 @@
 
 #include <config.h>
 
+/* before configmake.h: objidl.h (setupapi.h) has a type DATADIR */
+#ifdef WIN32
+# define WIN32_LEAN_AND_MEAN
+# include <winsock2.h>
+# include <ws2tcpip.h>
+# include <windows.h>
+# include <setupapi.h>
+# include <objbase.h>
+# include <netcon.h>
+# include <iphlpapi.h>
+#endif
+
 #include "virmacaddr.h"
 #include "virnetdevtap.h"
 #include "virnetdev.h"
@@ -423,6 +435,392 @@ int virNetDevTapDelete(const char *ifname,
     return ret;
 }
 
+#elif defined(WIN32)
+/*
+ * Windows: a TAP device is an adapter of the TAP-Windows6 driver of OpenVPN
+ * (hardware id root\tap0901), named by its connection name, which QEMU opens
+ * by that name (-netdev tap,ifname=NAME) rather than by a file descriptor.
+ * As a TAP device on Linux, a managed one is created for the interface and
+ * named vnetN, then deleted: a root enumerated device of the driver, made
+ * as devcon does, which needs the driver in the driver store
+ * (pnputil /add-driver OemVista.inf /install) and administrator rights.
+ */
+
+# define VIR_TAP_WIN32_CLASS L"SYSTEM\\CurrentControlSet\\Control\\Class\\" \
+                             L"{4D36E972-E325-11CE-BFC1-08002BE10318}"
+# define VIR_TAP_WIN32_NETWORK L"SYSTEM\\CurrentControlSet\\Control\\Network\\" \
+                               L"{4D36E972-E325-11CE-BFC1-08002BE10318}"
+# define VIR_TAP_WIN32_HWID L"root\\tap0901"
+
+static const GUID virNetDevTapWin32NetClass = {
+    0x4d36e972, 0xe325, 0x11ce, { 0xbf, 0xc1, 0x08, 0x00, 0x2b, 0xe1, 0x03, 0x18 }
+};
+
+
+static char *
+virNetDevTapWin32RegString(HKEY key, const wchar_t *subkey, const wchar_t *value)
+{
+    wchar_t buf[512];
+    DWORD size = sizeof(buf) - sizeof(wchar_t);
+    DWORD type;
+    HKEY k;
+    LONG rc;
+
+    if (RegOpenKeyExW(key, subkey, 0, KEY_QUERY_VALUE, &k) != ERROR_SUCCESS)
+        return NULL;
+    rc = RegQueryValueExW(k, value, NULL, &type, (BYTE *)buf, &size);
+    RegCloseKey(k);
+    if (rc != ERROR_SUCCESS || type != REG_SZ)
+        return NULL;
+    buf[size / sizeof(wchar_t)] = 0;
+    return g_utf16_to_utf8((gunichar2 *)buf, -1, NULL, NULL, NULL);
+}
+
+
+/* The connection name of the network adapter @guid */
+static char *
+virNetDevTapWin32ConnectionName(const char *guid)
+{
+    g_autofree char *path = g_strdup_printf("%ls\\%s\\Connection",
+                                            VIR_TAP_WIN32_NETWORK, guid);
+    g_autofree wchar_t *wpath = (wchar_t *)g_utf8_to_utf16(path, -1, NULL, NULL, NULL);
+
+    return wpath ? virNetDevTapWin32RegString(HKEY_LOCAL_MACHINE, wpath, L"Name") : NULL;
+}
+
+
+/*
+ * The TAP-Windows adapter named @name: returns 1 with its NetCfgInstanceId
+ * in @guid (if not NULL), 0 when no TAP adapter has that name
+ */
+static int
+virNetDevTapWin32Find(const char *name, char **guid)
+{
+    HKEY cls;
+    DWORD i;
+    int ret = 0;
+
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, VIR_TAP_WIN32_CLASS, 0,
+                      KEY_ENUMERATE_SUB_KEYS, &cls) != ERROR_SUCCESS)
+        return 0;
+
+    for (i = 0; ret == 0; i++) {
+        wchar_t sub[64];
+        DWORD len = G_N_ELEMENTS(sub);
+        g_autofree char *component = NULL;
+        g_autofree char *id = NULL;
+        g_autofree char *conn = NULL;
+
+        if (RegEnumKeyExW(cls, i, sub, &len, NULL, NULL, NULL, NULL) != ERROR_SUCCESS)
+            break;
+        if (!(component = virNetDevTapWin32RegString(cls, sub, L"ComponentId")) ||
+            (g_ascii_strcasecmp(component, "tap0901") != 0 &&
+             g_ascii_strcasecmp(component, "root\\tap0901") != 0) ||
+            !(id = virNetDevTapWin32RegString(cls, sub, L"NetCfgInstanceId")) ||
+            !(conn = virNetDevTapWin32ConnectionName(id)))
+            continue;
+        if (STREQ(conn, name)) {
+            if (guid)
+                *guid = g_steal_pointer(&id);
+            ret = 1;
+        }
+    }
+    RegCloseKey(cls);
+    return ret;
+}
+
+
+/*
+ * The connection name of an adapter is renamed as Explorer does, by the
+ * network connections manager (writing the registry value is not enough:
+ * Windows keeps its own name).  These GUIDs are in no MinGW library.
+ */
+static const GUID virNetDevTapWin32CLSID_ConnectionManager = {
+    0xba126ad1, 0x2166, 0x11d1, { 0xb1, 0xd0, 0x00, 0x80, 0x5f, 0xc1, 0x27, 0x0e }
+};
+static const GUID virNetDevTapWin32IID_INetConnectionManager = {
+    0xc08956a2, 0x1cd3, 0x11d1, { 0xb1, 0xc5, 0x00, 0x80, 0x5f, 0xc1, 0x27, 0x0e }
+};
+
+
+/* 1 renamed, 0 the connection is not there (yet), -1 error in @hr */
+static int
+virNetDevTapWin32RenameConnection(const GUID *id, const wchar_t *wname, HRESULT *hr)
+{
+    INetConnectionManager *mgr = NULL;
+    IEnumNetConnection *conns = NULL;
+    INetConnection *conn = NULL;
+    ULONG fetched;
+    int ret = 0;
+
+    if (FAILED(*hr = CoCreateInstance(&virNetDevTapWin32CLSID_ConnectionManager, NULL,
+                                      CLSCTX_ALL, &virNetDevTapWin32IID_INetConnectionManager,
+                                      (void **)&mgr)))
+        return -1;
+    if (FAILED(*hr = mgr->lpVtbl->EnumConnections(mgr, NCME_DEFAULT, &conns))) {
+        mgr->lpVtbl->Release(mgr);
+        return -1;
+    }
+    while (ret == 0 && conns->lpVtbl->Next(conns, 1, &conn, &fetched) == S_OK && fetched == 1) {
+        NETCON_PROPERTIES *props = NULL;
+
+        if (SUCCEEDED(conn->lpVtbl->GetProperties(conn, &props)) && props) {
+            if (IsEqualGUID(&props->guidId, id))
+                ret = SUCCEEDED(*hr = conn->lpVtbl->Rename(conn, wname)) ? 1 : -1;
+            CoTaskMemFree(props->pszwName);
+            CoTaskMemFree(props->pszwDeviceName);
+            CoTaskMemFree(props);
+        }
+        conn->lpVtbl->Release(conn);
+    }
+    conns->lpVtbl->Release(conns);
+    mgr->lpVtbl->Release(mgr);
+    return ret;
+}
+
+
+typedef DWORD (WINAPI *virNetDevTapWin32NciSetConnectionNameFunc)(const GUID *, const wchar_t *);
+
+/*
+ * Name the adapter @guid, once Windows has made its connection: by
+ * NciSetConnectionName of nci.dll as Wintun does, else by the network
+ * connections manager as Explorer does
+ */
+static int
+virNetDevTapWin32SetConnectionName(const char *guid, const char *name)
+{
+    g_autofree wchar_t *wguid = (wchar_t *)g_utf8_to_utf16(guid, -1, NULL, NULL, NULL);
+    g_autofree wchar_t *wname = (wchar_t *)g_utf8_to_utf16(name, -1, NULL, NULL, NULL);
+    HMODULE nci = LoadLibraryExW(L"nci.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    virNetDevTapWin32NciSetConnectionNameFunc setName = NULL;
+    HRESULT init = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    DWORD nciErr = ERROR_PROC_NOT_FOUND;
+    HRESULT hr = S_OK;
+    GUID id;
+    size_t i;
+    int rc = 0;
+
+    if (nci)
+        setName = (virNetDevTapWin32NciSetConnectionNameFunc)(void (*)(void))
+            GetProcAddress(nci, "NciSetConnectionName");
+
+    if (!wguid || !wname || FAILED(CLSIDFromString(wguid, &id))) {
+        rc = -1;
+    } else {
+        for (i = 0; i < 100 && rc != 1; i++) {
+            if (setName && (nciErr = setName(&id, wname)) == ERROR_SUCCESS) {
+                rc = 1;
+                break;
+            }
+            if ((rc = virNetDevTapWin32RenameConnection(&id, wname, &hr)) != 1)
+                g_usleep(100 * 1000);
+        }
+    }
+    if (SUCCEEDED(init))
+        CoUninitialize();
+    if (nci)
+        FreeLibrary(nci);
+
+    if (rc != 1) {
+        virReportError(VIR_ERR_SYSTEM_ERROR,
+                       _("Unable to name the TAP adapter %1$s (nci 0x%2$lx, connection manager 0x%3$lx%4$s)"),
+                       name, nciErr, (unsigned long)hr,
+                       rc == 0 ? _(", no connection") : "");
+        return -1;
+    }
+    return 0;
+}
+
+
+static void
+virNetDevTapWin32ReportLastError(const char *what)
+{
+    DWORD err = GetLastError();
+
+    virReportError(VIR_ERR_SYSTEM_ERROR,
+                   _("%1$s: Windows error 0x%2$lx%3$s"), what, err,
+                   err == ERROR_ACCESS_DENIED ?
+                   _(" (TAP devices take administrator rights)") : "");
+}
+
+
+/* A new TAP-Windows device, its NetCfgInstanceId in @guid */
+static int
+virNetDevTapWin32CreateDevice(char **guid)
+{
+    static const wchar_t hwid[] = VIR_TAP_WIN32_HWID L"\0";
+    HDEVINFO set;
+    SP_DEVINFO_DATA dev = { .cbSize = sizeof(dev) };
+    SP_DRVINFO_DATA_W drv = { .cbSize = sizeof(drv) };
+    SP_DRVINFO_DATA_W best = { .cbSize = sizeof(best) };
+    bool found = false;
+    bool registered = false;
+    DWORD i;
+    int ret = -1;
+
+    if ((set = SetupDiCreateDeviceInfoList(&virNetDevTapWin32NetClass, NULL)) ==
+        INVALID_HANDLE_VALUE) {
+        virNetDevTapWin32ReportLastError(_("Unable to create a TAP device"));
+        return -1;
+    }
+
+    if (!SetupDiCreateDeviceInfoW(set, L"Net", &virNetDevTapWin32NetClass, NULL, NULL,
+                                  DICD_GENERATE_ID, &dev) ||
+        !SetupDiSetDeviceRegistryPropertyW(set, &dev, SPDRP_HARDWAREID,
+                                           (const BYTE *)hwid, sizeof(hwid))) {
+        virNetDevTapWin32ReportLastError(_("Unable to create a TAP device"));
+        goto cleanup;
+    }
+
+    /* the newest TAP-Windows driver of the driver store */
+    if (SetupDiBuildDriverInfoList(set, &dev, SPDIT_COMPATDRIVER)) {
+        for (i = 0; SetupDiEnumDriverInfoW(set, &dev, SPDIT_COMPATDRIVER, i, &drv); i++) {
+            if (!found || drv.DriverVersion > best.DriverVersion) {
+                best = drv;
+                found = true;
+            }
+        }
+    }
+    if (!found) {
+        virReportError(VIR_ERR_OPERATION_UNSUPPORTED, "%s",
+                       _("TAP devices need the TAP-Windows6 driver of OpenVPN in the driver store (pnputil /add-driver OemVista.inf /install)"));
+        goto cleanup;
+    }
+
+    if (!SetupDiSetSelectedDriverW(set, &dev, &best) ||
+        !SetupDiCallClassInstaller(DIF_REGISTERDEVICE, set, &dev)) {
+        virNetDevTapWin32ReportLastError(_("Unable to create a TAP device"));
+        goto cleanup;
+    }
+    registered = true;
+    SetupDiCallClassInstaller(DIF_REGISTER_COINSTALLERS, set, &dev);
+    SetupDiCallClassInstaller(DIF_INSTALLINTERFACES, set, &dev);
+    if (!SetupDiCallClassInstaller(DIF_INSTALLDEVICE, set, &dev)) {
+        virNetDevTapWin32ReportLastError(_("Unable to install the TAP device"));
+        goto cleanup;
+    }
+
+    /* its adapter: the class installer writes NetCfgInstanceId */
+    for (i = 0; i < 50 && !*guid; i++) {
+        HKEY k = SetupDiOpenDevRegKey(set, &dev, DICS_FLAG_GLOBAL, 0, DIREG_DRV,
+                                      KEY_QUERY_VALUE);
+
+        if (k != INVALID_HANDLE_VALUE) {
+            *guid = virNetDevTapWin32RegString(k, NULL, L"NetCfgInstanceId");
+            RegCloseKey(k);
+        }
+        if (!*guid)
+            g_usleep(100 * 1000);
+    }
+    if (!*guid) {
+        virReportError(VIR_ERR_INTERNAL_ERROR, "%s",
+                       _("The TAP device got no network adapter"));
+        goto cleanup;
+    }
+    ret = 0;
+
+ cleanup:
+    if (ret < 0 && registered)
+        SetupDiCallClassInstaller(DIF_REMOVE, set, &dev);
+    SetupDiDestroyDeviceInfoList(set);
+    return ret;
+}
+
+
+/* Remove the TAP-Windows device of the adapter @guid */
+static int
+virNetDevTapWin32RemoveDevice(const char *guid)
+{
+    HDEVINFO set = SetupDiGetClassDevsW(&virNetDevTapWin32NetClass, NULL, NULL, 0);
+    SP_DEVINFO_DATA dev = { .cbSize = sizeof(dev) };
+    DWORD i;
+    int ret = -1;
+
+    if (set == INVALID_HANDLE_VALUE) {
+        virNetDevTapWin32ReportLastError(_("Unable to delete the TAP device"));
+        return -1;
+    }
+    for (i = 0; SetupDiEnumDeviceInfo(set, i, &dev); i++) {
+        HKEY k = SetupDiOpenDevRegKey(set, &dev, DICS_FLAG_GLOBAL, 0, DIREG_DRV,
+                                      KEY_QUERY_VALUE);
+        g_autofree char *id = NULL;
+        g_autofree char *component = NULL;
+
+        if (k == INVALID_HANDLE_VALUE)
+            continue;
+        id = virNetDevTapWin32RegString(k, NULL, L"NetCfgInstanceId");
+        component = virNetDevTapWin32RegString(k, NULL, L"ComponentId");
+        RegCloseKey(k);
+        /* only ever a TAP-Windows device */
+        if (!id || g_ascii_strcasecmp(id, guid) != 0 || !component ||
+            (g_ascii_strcasecmp(component, "tap0901") != 0 &&
+             g_ascii_strcasecmp(component, "root\\tap0901") != 0))
+            continue;
+        if (!SetupDiCallClassInstaller(DIF_REMOVE, set, &dev))
+            virNetDevTapWin32ReportLastError(_("Unable to delete the TAP device"));
+        else
+            ret = 0;
+        break;
+    }
+    if (ret < 0 && !virGetLastError())
+        virReportError(VIR_ERR_INTERNAL_ERROR,
+                       _("No TAP device for the adapter %1$s"), guid);
+    SetupDiDestroyDeviceInfoList(set);
+    return ret;
+}
+
+
+int virNetDevTapCreate(char **ifname,
+                       const char *tunpath G_GNUC_UNUSED,
+                       int *tapfd,
+                       size_t tapfdSize,
+                       unsigned int flags)
+{
+    g_autofree char *guid = NULL;
+    size_t i;
+
+    /* QEMU opens the adapter itself, by its name */
+    for (i = 0; i < tapfdSize; i++)
+        tapfd[i] = -1;
+
+    if (*ifname && !strchr(*ifname, '%')) {
+        if (virNetDevTapWin32Find(*ifname, NULL) == 1)
+            return 0;
+        if (flags & VIR_NETDEV_TAP_CREATE_ALLOW_EXISTING) {
+            virReportError(VIR_ERR_OPERATION_INVALID,
+                           _("No TAP-Windows adapter named '%1$s'"), *ifname);
+            return -1;
+        }
+    } else {
+        g_clear_pointer(ifname, g_free);
+        if (virNetDevGenerateName(ifname, VIR_NET_DEV_GEN_NAME_VNET) < 0)
+            return -1;
+    }
+
+    if (virNetDevTapWin32CreateDevice(&guid) < 0)
+        return -1;
+
+    if (virNetDevTapWin32SetConnectionName(guid, *ifname) < 0) {
+        ignore_value(virNetDevTapWin32RemoveDevice(guid));
+        return -1;
+    }
+    VIR_DEBUG("created TAP adapter %s (%s)", *ifname, guid);
+    return 0;
+}
+
+
+int virNetDevTapDelete(const char *ifname,
+                       const char *tunpath G_GNUC_UNUSED)
+{
+    g_autofree char *guid = NULL;
+
+    if (virNetDevTapWin32Find(ifname, &guid) != 1) {
+        virReportError(VIR_ERR_OPERATION_INVALID,
+                       _("No TAP-Windows adapter named '%1$s'"), ifname);
+        return -1;
+    }
+    return virNetDevTapWin32RemoveDevice(guid);
+}
 #else
 int virNetDevTapCreate(char **ifname G_GNUC_UNUSED,
                        const char *tunpath G_GNUC_UNUSED,
@@ -896,6 +1294,46 @@ virNetDevTapInterfaceStats(const char *ifname,
     long long rx[4], tx[4];
     static const char *const keys[] = { "bytes", "packets", "errs", "drop" };
     size_t i;
+    g_autofree char *port = virNetDevBridgeSwitchPortPath(ifname);
+
+    if (!virFileExists(port)) {
+        /* a TAP adapter: its counters, in the host's view */
+        g_autofree wchar_t *alias = (wchar_t *)g_utf8_to_utf16(ifname, -1, NULL, NULL, NULL);
+        MIB_IF_ROW2 row = { 0 };
+
+        if (!alias || ConvertInterfaceAliasToLuid(alias, &row.InterfaceLuid) != NO_ERROR ||
+            GetIfEntry2(&row) != NO_ERROR) {
+            virReportError(VIR_ERR_INTERNAL_ERROR,
+                           _("Interface not found: %1$s"), ifname);
+            return -1;
+        }
+        rx[0] = row.InOctets;
+        rx[1] = row.InUcastPkts + row.InNUcastPkts;
+        rx[2] = row.InErrors;
+        rx[3] = row.InDiscards;
+        tx[0] = row.OutOctets;
+        tx[1] = row.OutUcastPkts + row.OutNUcastPkts;
+        tx[2] = row.OutErrors;
+        tx[3] = row.OutDiscards;
+        /* what the host receives is what the guest sends */
+        if (swapped) {
+            for (i = 0; i < G_N_ELEMENTS(keys); i++) {
+                long long t = rx[i];
+
+                rx[i] = tx[i];
+                tx[i] = t;
+            }
+        }
+        stats->rx_bytes = rx[0];
+        stats->rx_packets = rx[1];
+        stats->rx_errs = rx[2];
+        stats->rx_drop = rx[3];
+        stats->tx_bytes = tx[0];
+        stats->tx_packets = tx[1];
+        stats->tx_errs = tx[2];
+        stats->tx_drop = tx[3];
+        return 0;
+    }
 
     if (virNetDevBridgeSwitchPortGet(ifname, &brname, &mac) < 0)
         return -1;

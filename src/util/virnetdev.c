@@ -366,6 +366,31 @@ virNetDevSetMACInternal(const char *ifname,
 }
 
 
+#elif defined(WIN32)
+
+
+/*
+ * The host side MAC address of a TAP adapter (libvirt gives it fe:...) is a
+ * parameter the TAP-Windows driver reads when the adapter starts: it keeps
+ * its own, which changes nothing for the guest
+ */
+static int
+virNetDevSetMACInternal(const char *ifname,
+                        const virMacAddr *macaddr G_GNUC_UNUSED,
+                        bool quiet)
+{
+    if (virNetDevExists(ifname) == 1) {
+        VIR_DEBUG("%s keeps the MAC address of its driver", ifname);
+        return 0;
+    }
+    if (!quiet)
+        virReportSystemError(ENODEV,
+                             _("Cannot set interface MAC on '%1$s'"),
+                             ifname);
+    return -1;
+}
+
+
 #else
 
 
@@ -660,6 +685,25 @@ virNetDevSetIFFlag(const char *ifname, int flag, bool val)
 
     return 0;
 }
+#elif defined(WIN32)
+/*
+ * The link of a TAP adapter is up when QEMU opens it (it sets the media
+ * status of the TAP-Windows driver): bringing it up is a no-op
+ */
+static int
+virNetDevSetIFFlag(const char *ifname,
+                   int flag,
+                   bool val)
+{
+    if (flag == VIR_IFF_UP && virNetDevExists(ifname) == 1) {
+        VIR_DEBUG("%s is %s with the TAP media status", ifname, val ? "up" : "down");
+        return 0;
+    }
+    virReportSystemError(ENOSYS,
+                         _("Cannot set interface flags on '%1$s'"),
+                         ifname);
+    return -1;
+}
 #else
 static int
 virNetDevSetIFFlag(const char *ifname,
@@ -910,6 +954,23 @@ int virNetDevGetIndex(const char *ifname, int *ifindex)
 # else
     *ifindex = ifreq.ifr_ifindex;
 # endif
+    return 0;
+}
+#elif defined(WIN32)
+int virNetDevGetIndex(const char *ifname, int *ifindex)
+{
+    g_autofree wchar_t *alias = (wchar_t *)g_utf8_to_utf16(ifname, -1, NULL, NULL, NULL);
+    NET_LUID luid;
+    NET_IFINDEX index;
+
+    if (!alias ||
+        ConvertInterfaceAliasToLuid(alias, &luid) != NO_ERROR ||
+        ConvertInterfaceLuidToIndex(&luid, &index) != NO_ERROR) {
+        virReportSystemError(ENODEV,
+                             _("Unable to get index for interface %1$s"), ifname);
+        return -1;
+    }
+    *ifindex = index;
     return 0;
 }
 #else /* ! SIOCGIFINDEX */

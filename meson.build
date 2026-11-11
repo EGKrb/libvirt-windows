@@ -1334,12 +1334,14 @@ if host_machine.system() == 'windows'
   oleaut32_dep = cc.find_library('oleaut32')
   winsock2_dep = cc.find_library('ws2_32')
   iphlpapi_dep = cc.find_library('iphlpapi')
+  setupapi_dep = cc.find_library('setupapi')
   win32_dep = declare_dependency(
     dependencies: [
       ole32_dep,
       oleaut32_dep,
       winsock2_dep,
       iphlpapi_dep,
+      setupapi_dep,
     ],
   )
   if get_option('default_library') == 'static'

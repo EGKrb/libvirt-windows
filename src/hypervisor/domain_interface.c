@@ -80,6 +80,7 @@ virDomainInterfaceEthernetConnect(virDomainDef *def,
     int ret = -1;
     unsigned int tap_create_flags = VIR_NETDEV_TAP_CREATE_IFUP;
     bool template_ifname = false;
+    bool tap_created = false;
     const char *tunpath = "/dev/net/tun";
     const char *auditdev = tunpath;
 
@@ -131,6 +132,7 @@ virDomainInterfaceEthernetConnect(virDomainDef *def,
                                tap_create_flags) < 0) {
             goto cleanup;
         }
+        tap_created = true;
 
         /* The tap device's MAC address cannot match the MAC address
          * used by the guest. This results in "received packet on
@@ -176,6 +178,13 @@ virDomainInterfaceEthernetConnect(virDomainDef *def,
         virDomainAuditNetDevice(def, net, auditdev, false);
         for (i = 0; i < tapfdSize && tapfd[i] >= 0; i++)
             VIR_FORCE_CLOSE(tapfd[i]);
+#ifdef WIN32
+        /* a TAP-Windows adapter does not go with a file descriptor */
+        if (tap_created && net->ifname)
+            ignore_value(virNetDevTapDelete(net->ifname, tunpath));
+#else
+        (void)tap_created;
+#endif
         if (template_ifname)
             VIR_FREE(net->ifname);
     }

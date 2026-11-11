@@ -3937,8 +3937,21 @@ qemuBuildHostNetProps(virDomainObj *vm,
         break;
     }
 #endif
+#ifdef WIN32
+    case VIR_DOMAIN_NET_TYPE_ETHERNET:
+        /* a TAP-Windows adapter, which QEMU opens by its connection name */
+        if (virJSONValueObjectAdd(&netprops,
+                                  "s:type", "tap",
+                                  "s:ifname", net->ifname,
+                                  NULL) < 0)
+            return NULL;
+        break;
+#endif
     case VIR_DOMAIN_NET_TYPE_DIRECT:
-    case VIR_DOMAIN_NET_TYPE_ETHERNET: {
+#ifndef WIN32
+    case VIR_DOMAIN_NET_TYPE_ETHERNET:
+#endif
+    {
         g_auto(virBuffer) buf = VIR_BUFFER_INITIALIZER;
         /* for one tapfd/vhostfd 'fd=' shall be used, for more use 'fds=' */
         const char *tapfd_field = "s:fd";
@@ -8976,7 +8989,10 @@ qemuBuildInterfaceConnect(virDomainObj *vm,
                                               priv->driver->privileged,
                                               tapfd, tapfdSize) < 0)
             return -1;
+#ifndef WIN32
         vhostfd = true;
+#endif
+        /* (Windows: QEMU opens the TAP adapter by its name, no fds) */
         break;
 
     case VIR_DOMAIN_NET_TYPE_VHOSTUSER:

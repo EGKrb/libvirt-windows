@@ -5252,6 +5252,12 @@ qemuDomainRemoveNetDevice(virQEMUDriver *driver,
     } else if (net->type == VIR_DOMAIN_NET_TYPE_ETHERNET) {
         if (net->downscript)
             virNetDevRunEthernetScript(net->ifname, net->downscript);
+#ifdef WIN32
+        /* a TAP-Windows adapter outlives QEMU's handle, unlike a TAP
+         * device: the one libvirt made goes as it would at shutdown */
+        if (net->managed_tap != VIR_TRISTATE_BOOL_NO && net->ifname)
+            ignore_value(virNetDevTapDelete(net->ifname, net->backend.tap));
+#endif
     }
     virDomainNetDefFree(net);
     return 0;

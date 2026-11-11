@@ -34,6 +34,8 @@
 
 #ifndef WIN32
 # include <sys/ioctl.h>
+#else
+# include <iphlpapi.h>
 #endif
 #ifdef WITH_NET_IF_H
 # include <net/if.h>
@@ -358,6 +360,111 @@ virNetDevIPRouteAdd(const char *ifname,
     virReportError(VIR_ERR_INTERNAL_ERROR, "%s",
                    _("allocated netlink buffer is too small"));
     return -1;
+}
+
+
+#elif defined(WIN32)
+/* Windows: the IP Helper API in place of the ip command, on the adapter
+ * whose connection name is @ifname (a TAP adapter of an interface) */
+static int
+virNetDevIPWin32Luid(const char *ifname, NET_LUID *luid)
+{
+    g_autofree wchar_t *alias = (wchar_t *)g_utf8_to_utf16(ifname, -1, NULL, NULL, NULL);
+
+    if (!alias || ConvertInterfaceAliasToLuid(alias, luid) != NO_ERROR) {
+        virReportSystemError(ENODEV, _("Unable to find interface %1$s"), ifname);
+        return -1;
+    }
+    return 0;
+}
+
+
+static void
+virNetDevIPWin32Inet(const virSocketAddr *addr, SOCKADDR_INET *out)
+{
+    memset(out, 0, sizeof(*out));
+    memcpy(out, &addr->data.stor, MIN(addr->len, sizeof(*out)));
+}
+
+
+int
+virNetDevIPAddrAdd(const char *ifname,
+                   virSocketAddr *addr,
+                   virSocketAddr *peer G_GNUC_UNUSED,
+                   unsigned int prefix)
+{
+    MIB_UNICASTIPADDRESS_ROW row;
+    DWORD rc;
+
+    InitializeUnicastIpAddressEntry(&row);
+    if (virNetDevIPWin32Luid(ifname, &row.InterfaceLuid) < 0)
+        return -1;
+    virNetDevIPWin32Inet(addr, &row.Address);
+    row.OnLinkPrefixLength = prefix;
+    row.DadState = IpDadStatePreferred;
+    if ((rc = CreateUnicastIpAddressEntry(&row)) != NO_ERROR &&
+        rc != ERROR_OBJECT_ALREADY_EXISTS) {
+        virReportError(VIR_ERR_SYSTEM_ERROR,
+                       _("Unable to add an address to %1$s: Windows error %2$lu"),
+                       ifname, rc);
+        return -1;
+    }
+    return 0;
+}
+
+
+int
+virNetDevIPAddrDel(const char *ifname,
+                   virSocketAddr *addr,
+                   unsigned int prefix)
+{
+    MIB_UNICASTIPADDRESS_ROW row;
+    DWORD rc;
+
+    InitializeUnicastIpAddressEntry(&row);
+    if (virNetDevIPWin32Luid(ifname, &row.InterfaceLuid) < 0)
+        return -1;
+    virNetDevIPWin32Inet(addr, &row.Address);
+    row.OnLinkPrefixLength = prefix;
+    if ((rc = DeleteUnicastIpAddressEntry(&row)) != NO_ERROR) {
+        virReportError(VIR_ERR_SYSTEM_ERROR,
+                       _("Unable to delete an address of %1$s: Windows error %2$lu"),
+                       ifname, rc);
+        return -1;
+    }
+    return 0;
+}
+
+
+int
+virNetDevIPRouteAdd(const char *ifname,
+                    virSocketAddr *addr,
+                    unsigned int prefix,
+                    virSocketAddr *gateway,
+                    unsigned int metric)
+{
+    MIB_IPFORWARD_ROW2 row;
+    DWORD rc;
+
+    InitializeIpForwardEntry(&row);
+    if (virNetDevIPWin32Luid(ifname, &row.InterfaceLuid) < 0)
+        return -1;
+    if (VIR_SOCKET_ADDR_VALID(addr))
+        virNetDevIPWin32Inet(addr, &row.DestinationPrefix.Prefix);
+    else
+        row.DestinationPrefix.Prefix.si_family = VIR_SOCKET_ADDR_FAMILY(gateway);
+    row.DestinationPrefix.PrefixLength = prefix;
+    virNetDevIPWin32Inet(gateway, &row.NextHop);
+    row.Metric = metric;
+    row.Protocol = MIB_IPPROTO_NETMGMT;
+    if ((rc = CreateIpForwardEntry2(&row)) != NO_ERROR &&
+        rc != ERROR_OBJECT_ALREADY_EXISTS) {
+        virReportError(VIR_ERR_SYSTEM_ERROR,
+                       _("Unable to add a route through %1$s: Windows error %2$lu"),
+                       ifname, rc);
+        return -1;
+    }
+    return 0;
 }
 
 
