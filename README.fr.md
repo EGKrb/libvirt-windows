@@ -34,7 +34,7 @@ Alpine.
 | Accès distant | sockets UNIX, transport `ext` | transport `ssh` (écrit, non testé), TLS |
 | Secrets | define, set, get, undefine, persistance | |
 | QEMU | type de domaine `whpx` ; define, start, destroy, suspend, resume ; `screenshot` ; `qemu-monitor-command` ; `virsh console` (série sur socket UNIX) ; ajout et retrait de cartes à chaud ; `setmem` (ballon, mémoire rendue à l'hôte avec le [correctif QEMU](windows/qemu)) ; `dommemstat` ; `save`, `restore`, `managedsave`, `dump` ; migration à chaud (directe et `--p2p`, entre deux instances de libvirt), avec le correctif QEMU | instantanés, migration avec copie du stockage, sysinfo SMBIOS |
-| Réseau des invités | `type='user'` (libslirp) ; `type='network'` et `type='bridge'` vers un réseau libvirt ; `type='ethernet'` sur un adaptateur TAP-Windows (créé, nommé, adressé et supprimé par libvirt ; `domifstat`) | `type='ethernet'` avec `managed='no'` (écrit, non testé) ; ponts vers le réseau local de l'hôte |
+| Réseau des invités | `type='user'` (libslirp) ; `type='network'` et `type='bridge'` vers un réseau libvirt ; `type='ethernet'` sur un adaptateur TAP-Windows (créé, nommé, adressé et supprimé par libvirt ; `domifstat`), ou un existant avec `managed='no'` ; `type='bridge'` et réseaux `<forward mode='bridge'/>` sur un pont réseau de Windows (le réseau local de l'hôte) | |
 | Réseaux virtuels | modes `nat` et isolé ; DHCP et DHCPv6 (plages, réservations par MAC, DUID ou nom) ; DNS (hôtes, TXT, SRV, PTR, redirecteurs, domaine local) ; IPv6 (SLAAC ou DHCPv6) ; `net-update` ; `net-dhcp-leases` ; `domifaddr` ; autostart ; QoS (`domiftune`, floors, bande passante du réseau) ; `domifstat` ; modes `route` et `open` (Wintun) | |
 | Autres pilotes | | stockage, nodedev, interface, nwfilter, LXC, VirtualBox |
 
@@ -51,6 +51,7 @@ Alpine.
 | KVM | WHPX (`<domain type='whpx'>`), sinon TCG |
 | Bridge, TAP, dnsmasq, iptables | `libvirt_netswitch` : un processus par réseau, switch Ethernet sur socket UNIX que QEMU rejoint par `-netdev stream`, libslirp pour le NAT, DHCP/DHCPv6/DNS intégrés, QoS par seaux à jetons |
 | Périphériques TAP de `type='ethernet'` | adaptateurs TAP-Windows6 créés par SetupAPI ; adaptateurs Wintun pour `route` et `open` |
+| Ponts de l'hôte (`br0`), `brctl`/`ip link` | ponts réseau de Windows, `netsh bridge add`/`remove` |
 | Zone firewalld `libvirt` | règles du pare-feu Windows du groupe `libvirt` |
 | `tc` | le switch limite ce que reçoit un invité (file d'attente) et ce qu'il envoie (rejet) |
 | Descripteurs passés à QEMU (`getfd`, SCM_RIGHTS) | sockets dupliquées pour QEMU (`get-win32-socket`) ; fichiers (save, restore, dump) relayés par un thread de libvirt sur une paire de sockets ; QEMU se connecte lui-même à la destination d'une migration |
@@ -148,11 +149,24 @@ La configuration est dans `install\etc\libvirt`, les journaux dans
   les droits administrateur. L'hôte a alors une interface `virbr0` avec
   l'adresse de la passerelle, comme sous Linux.
 - `type='ethernet'` nécessite le pilote TAP-Windows6 d'OpenVPN (9.27 ou plus,
-  identifiant matériel `root	ap0901`) dans le magasin de pilotes
+  identifiant matériel `root\tap0901`) dans le magasin de pilotes
   (`pnputil /add-driver OemVista.inf /install`), et les droits
   administrateur : libvirt crée un adaptateur au nom de l'interface (`vnet0`),
   lui donne les adresses et routes de `<source><ip/></source>`, et le supprime
-  avec l'invité.
+  avec l'invité. Avec `<target dev='NOM' managed='no'/>`, il utilise un
+  adaptateur existant de ce nom et le laisse en place.
+- Ponts vers le réseau local de l'hôte, comme `br0` sous Linux : un pont
+  réseau de Windows dont le nom de connexion est le nom du pont.
+  `netsh bridge create` demande deux cartes : celle de l'hôte et une autre,
+  par exemple un adaptateur TAP-Windows créé par
+  `devcon install OemVista.inf tap0901` (distribution TAP-Windows6) ; renommer
+  ensuite le pont (`Rename-NetAdapter`). Une
+  `<interface type='bridge'><source bridge='br0'/>`, ou un réseau
+  `<forward mode='bridge'/><bridge name='br0'/>`, reçoit un adaptateur
+  TAP-Windows que libvirt ajoute au pont (`netsh bridge add`) et supprime avec
+  l'invité. Pilote TAP et droits administrateur nécessaires, comme ci-dessus.
+  Un nom de pont qui est celui d'un réseau libvirt (`virbr0`) reste son
+  switch.
 - Le pare-feu Windows range ces interfaces TAP et Wintun dans le profil
   Public. Comme la zone firewalld `libvirt` sous Linux, un réseau `route` (ou
   `open` avec `<bridge zone='libvirt'/>`) reçoit des règles entrantes (groupe

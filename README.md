@@ -32,7 +32,7 @@ Tested on Windows 11 (build 26300) with Ubuntu 24.04 guests; TAP and Wintun
 | Remote | UNIX sockets, `ext` transport | `ssh` transport (implemented, untested), TLS |
 | Secrets | define, set, get, undefine, persistence | |
 | QEMU | `whpx` domain type; define, start, destroy, suspend, resume; `screenshot`; `qemu-monitor-command`; `virsh console` (serial on a UNIX socket); NIC hotplug; `setmem` (balloon, memory given back to the host with the [QEMU patch](windows/qemu)); `dommemstat`; `save`, `restore`, `managedsave`, `dump`; live migration (direct and `--p2p`, between two libvirt instances), all with the QEMU patch | snapshots, migration with storage copy, SMBIOS sysinfo |
-| Guest networking | `type='user'` (libslirp); `type='network'` and `type='bridge'` to a libvirt network; `type='ethernet'` on a TAP-Windows adapter (created, named, addressed and deleted by libvirt; `domifstat`) | `type='ethernet'` with `managed='no'` (written, untested); bridges to the host LAN |
+| Guest networking | `type='user'` (libslirp); `type='network'` and `type='bridge'` to a libvirt network; `type='ethernet'` on a TAP-Windows adapter (created, named, addressed and deleted by libvirt; `domifstat`), or an existing one with `managed='no'`; `type='bridge'` and `<forward mode='bridge'/>` networks on a network bridge of Windows (the host's LAN) | |
 | Virtual networks | forward mode `nat` and isolated; DHCP and DHCPv6 (ranges, hosts by MAC, DUID or name); DNS (hosts, TXT, SRV, PTR, forwarders, local domain); IPv6 (SLAAC or DHCPv6); `net-update`; `net-dhcp-leases`; `domifaddr`; autostart; QoS (`domiftune`, floors, network bandwidth); `domifstat`; forward modes `route` and `open` (Wintun) | |
 | Other drivers | | storage, nodedev, interface, nwfilter, LXC, VirtualBox |
 
@@ -49,6 +49,7 @@ Tested on Windows 11 (build 26300) with Ubuntu 24.04 guests; TAP and Wintun
 | KVM | WHPX (`<domain type='whpx'>`), TCG otherwise |
 | Bridge, TAP, dnsmasq, iptables | `libvirt_netswitch`: one process per network, an Ethernet switch on a UNIX socket that QEMU joins with `-netdev stream`, libslirp for NAT, its own DHCP/DHCPv6/DNS, QoS by token buckets |
 | `type='ethernet'` TAP devices | TAP-Windows6 adapters created by SetupAPI; Wintun adapters for `route` and `open` |
+| Host bridges (`br0`), `brctl`/`ip link` | network bridges of Windows, `netsh bridge add`/`remove` |
 | firewalld zone `libvirt` | Windows firewall rules of the group `libvirt` |
 | `tc` | the switch shapes what a guest receives and polices what it sends |
 | File descriptors given to QEMU (`getfd`, SCM_RIGHTS) | sockets duplicated into QEMU (`get-win32-socket`); files (save, restore, dump) relayed by a thread of libvirt over a socket pair; QEMU connects to the migration destination itself |
@@ -144,11 +145,22 @@ Configuration is in `install\etc\libvirt`, logs in `install\var\log\libvirt`
   rights. The host then has a `virbr0` interface with the gateway address, as
   on Linux.
 - `type='ethernet'` needs the TAP-Windows6 driver of OpenVPN (9.27 or later,
-  hardware id `root	ap0901`) in the driver store
+  hardware id `root\tap0901`) in the driver store
   (`pnputil /add-driver OemVista.inf /install`), and administrator rights:
   libvirt creates an adapter named after the interface (`vnet0`), gives it
   the `<source><ip/></source>` addresses and routes, and deletes it with the
-  guest.
+  guest. With `<target dev='NAME' managed='no'/>` it uses an existing
+  adapter of that name and leaves it.
+- Bridges to the host's LAN, as `br0` on Linux: a network bridge of Windows
+  whose connection name is the bridge name. `netsh bridge create` takes two
+  adapters: the host's NIC and any other one, such as a TAP-Windows adapter
+  made with `devcon install OemVista.inf tap0901` (from the TAP-Windows6
+  distribution); then rename the bridge (`Rename-NetAdapter`). An
+  `<interface type='bridge'><source bridge='br0'/>`, or a network
+  `<forward mode='bridge'/><bridge name='br0'/>`, gets a TAP-Windows adapter
+  that libvirt adds to the bridge (`netsh bridge add`) and deletes with the
+  guest. Needs the TAP driver and administrator rights, as above. A bridge
+  name that is a libvirt network's (`virbr0`) is its switch, as before.
 - The Windows firewall puts these TAP and Wintun interfaces in the Public
   profile. As firewalld's `libvirt` zone on Linux, a `route` network (or
   `open` with `<bridge zone='libvirt'/>`) gets inbound rules (group
