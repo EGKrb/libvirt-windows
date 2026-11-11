@@ -33,7 +33,7 @@ Alpine.
 | Démons | `libvirtd` et les démons modulaires, `--daemon`, rechargement et arrêt (signaux par événements nommés), reprise des invités après un redémarrage | services Windows |
 | Accès distant | sockets UNIX, transport `ext` | transport `ssh` (écrit, non testé), TLS |
 | Secrets | define, set, get, undefine, persistance | |
-| QEMU | type de domaine `whpx` ; define, start, destroy, suspend, resume ; `screenshot` ; `qemu-monitor-command` ; `virsh console` (série sur socket UNIX) ; ajout et retrait de cartes à chaud ; `setmem` (ballon, mémoire rendue à l'hôte avec le [correctif QEMU](windows/qemu)) ; `dommemstat` | save/restore, migration, instantanés, sysinfo SMBIOS |
+| QEMU | type de domaine `whpx` ; define, start, destroy, suspend, resume ; `screenshot` ; `qemu-monitor-command` ; `virsh console` (série sur socket UNIX) ; ajout et retrait de cartes à chaud ; `setmem` (ballon, mémoire rendue à l'hôte avec le [correctif QEMU](windows/qemu)) ; `dommemstat` ; `save`, `restore`, `managedsave`, `dump` ; migration à chaud (directe et `--p2p`, entre deux instances de libvirt), avec le correctif QEMU | instantanés, migration avec copie du stockage, sysinfo SMBIOS |
 | Réseau des invités | `type='user'` (libslirp) ; `type='network'` et `type='bridge'` vers un réseau libvirt ; `type='ethernet'` sur un adaptateur TAP-Windows (créé, nommé, adressé et supprimé par libvirt ; `domifstat`) | `type='ethernet'` avec `managed='no'` (écrit, non testé) ; ponts vers le réseau local de l'hôte |
 | Réseaux virtuels | modes `nat` et isolé ; DHCP et DHCPv6 (plages, réservations par MAC, DUID ou nom) ; DNS (hôtes, TXT, SRV, PTR, redirecteurs, domaine local) ; IPv6 (SLAAC ou DHCPv6) ; `net-update` ; `net-dhcp-leases` ; `domifaddr` ; autostart ; QoS (`domiftune`, floors, bande passante du réseau) ; `domifstat` ; modes `route` et `open` (Wintun) | |
 | Autres pilotes | | stockage, nodedev, interface, nwfilter, LXC, VirtualBox |
@@ -53,6 +53,7 @@ Alpine.
 | Périphériques TAP de `type='ethernet'` | adaptateurs TAP-Windows6 créés par SetupAPI ; adaptateurs Wintun pour `route` et `open` |
 | Zone firewalld `libvirt` | règles du pare-feu Windows du groupe `libvirt` |
 | `tc` | le switch limite ce que reçoit un invité (file d'attente) et ce qu'il envoie (rejet) |
+| Descripteurs passés à QEMU (`getfd`, SCM_RIGHTS) | sockets dupliquées pour QEMU (`get-win32-socket`) ; fichiers (save, restore, dump) relayés par un thread de libvirt sur une paire de sockets ; QEMU se connecte lui-même à la destination d'une migration |
 | Remplacer des binaires en cours d'exécution | renommés `NOM.busy-HORODATAGE` par l'installation, supprimés par la suivante |
 
 ## Prérequis

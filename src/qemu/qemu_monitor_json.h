@@ -219,6 +219,13 @@ qemuMonitorJSONSendFileHandle(qemuMonitor *mon,
                               const char *fdname,
                               int fd);
 
+#ifdef WIN32
+int
+qemuMonitorJSONGetWin32Socket(qemuMonitor *mon,
+                              const char *info,
+                              const char *fdname);
+#endif
+
 int
 qemuMonitorJSONCloseFileHandle(qemuMonitor *mon,
                                const char *fdname);

@@ -31,7 +31,7 @@ Tested on Windows 11 (build 26300) with Ubuntu 24.04 guests; TAP and Wintun
 | Daemons | `libvirtd` and the modular daemons, `--daemon`, reload and stop (signals as named events), reconnection to running guests after a restart | Windows services |
 | Remote | UNIX sockets, `ext` transport | `ssh` transport (implemented, untested), TLS |
 | Secrets | define, set, get, undefine, persistence | |
-| QEMU | `whpx` domain type; define, start, destroy, suspend, resume; `screenshot`; `qemu-monitor-command`; `virsh console` (serial on a UNIX socket); NIC hotplug; `setmem` (balloon, memory given back to the host with the [QEMU patch](windows/qemu)); `dommemstat` | save/restore, migration, snapshots, SMBIOS sysinfo |
+| QEMU | `whpx` domain type; define, start, destroy, suspend, resume; `screenshot`; `qemu-monitor-command`; `virsh console` (serial on a UNIX socket); NIC hotplug; `setmem` (balloon, memory given back to the host with the [QEMU patch](windows/qemu)); `dommemstat`; `save`, `restore`, `managedsave`, `dump`; live migration (direct and `--p2p`, between two libvirt instances), all with the QEMU patch | snapshots, migration with storage copy, SMBIOS sysinfo |
 | Guest networking | `type='user'` (libslirp); `type='network'` and `type='bridge'` to a libvirt network; `type='ethernet'` on a TAP-Windows adapter (created, named, addressed and deleted by libvirt; `domifstat`) | `type='ethernet'` with `managed='no'` (written, untested); bridges to the host LAN |
 | Virtual networks | forward mode `nat` and isolated; DHCP and DHCPv6 (ranges, hosts by MAC, DUID or name); DNS (hosts, TXT, SRV, PTR, forwarders, local domain); IPv6 (SLAAC or DHCPv6); `net-update`; `net-dhcp-leases`; `domifaddr`; autostart; QoS (`domiftune`, floors, network bandwidth); `domifstat`; forward modes `route` and `open` (Wintun) | |
 | Other drivers | | storage, nodedev, interface, nwfilter, LXC, VirtualBox |
@@ -51,6 +51,7 @@ Tested on Windows 11 (build 26300) with Ubuntu 24.04 guests; TAP and Wintun
 | `type='ethernet'` TAP devices | TAP-Windows6 adapters created by SetupAPI; Wintun adapters for `route` and `open` |
 | firewalld zone `libvirt` | Windows firewall rules of the group `libvirt` |
 | `tc` | the switch shapes what a guest receives and polices what it sends |
+| File descriptors given to QEMU (`getfd`, SCM_RIGHTS) | sockets duplicated into QEMU (`get-win32-socket`); files (save, restore, dump) relayed by a thread of libvirt over a socket pair; QEMU connects to the migration destination itself |
 | Replacing running binaries | renamed `NAME.busy-STAMP` by the install, removed by the next one |
 
 ## Requirements

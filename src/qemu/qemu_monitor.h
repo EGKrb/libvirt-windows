@@ -1177,6 +1177,8 @@ qemuMonitorSendFileHandle(qemuMonitor *mon,
 /* This function preserves previous error and only set their own
  * error if no error was set before.
  */
+int qemuMonitorFileHandleRelayWait(qemuMonitor *mon,
+                                   bool abort);
 int
 qemuMonitorCloseFileHandle(qemuMonitor *mon,
                            const char *fdname);

@@ -2520,9 +2520,13 @@ qemuMigrationDstRun(virDomainObj *vm,
         return 0;
     }
 
-    if (qemuMigrationDstWaitForCompletion(vm, asyncJob, false) < 0)
+    if (qemuMigrationDstWaitForCompletion(vm, asyncJob, false) < 0) {
+        ignore_value(qemuMonitorFileHandleRelayWait(priv->mon, true));
         return -1;
+    }
 
+    /* Windows: the file relayed to QEMU, see qemuMonitorMigrateIncoming() */
+    ignore_value(qemuMonitorFileHandleRelayWait(priv->mon, false));
     return 0;
 }
 
@@ -5477,6 +5481,12 @@ qemuMigrationSrcPerformNative(virQEMUDriver *driver,
             spec.destType = MIGRATION_DEST_SOCKET;
         else
             spec.destType = MIGRATION_DEST_CONNECT_SOCKET;
+#ifdef WIN32
+        /* Windows: QEMU uses the main channel from two threads (the return
+         * path); a socket of libvirt, not overlapped, would serialize their
+         * I/O, so QEMU connects with its own */
+        spec.destType = MIGRATION_DEST_SOCKET;
+#endif
 
         spec.dest.socket.path = uribits->path;
     } else {
@@ -5488,6 +5498,10 @@ qemuMigrationSrcPerformNative(virQEMUDriver *driver,
             spec.destType = MIGRATION_DEST_HOST;
         else
             spec.destType = MIGRATION_DEST_CONNECT_HOST;
+#ifdef WIN32
+        /* see the UNIX socket case above */
+        spec.destType = MIGRATION_DEST_HOST;
+#endif
 
         spec.dest.host.protocol = uribits->scheme;
         spec.dest.host.name = uribits->server;
@@ -7363,6 +7377,7 @@ qemuMigrationSrcToFile(virDomainObj *vm,
                        virDomainAsyncJob asyncJob)
 {
     qemuDomainObjPrivate *priv = vm->privateData;
+    qemuMonitor *mon = priv->mon;
     int rc;
     int ret = -1;
     unsigned long saveMigBandwidth = priv->migMaxBandwidth;
@@ -7412,6 +7427,10 @@ qemuMigrationSrcToFile(virDomainObj *vm,
         goto cleanup;
     }
 
+    /* Windows: the end of what QEMU wrote, relayed to the file */
+    if (qemuMonitorFileHandleRelayWait(mon, false) < 0)
+        goto cleanup;
+
     if (compressor && virCommandWait(compressor, NULL) < 0)
         goto cleanup;
 
@@ -7421,6 +7440,8 @@ qemuMigrationSrcToFile(virDomainObj *vm,
  cleanup:
     if (ret < 0 && !orig_err)
         virErrorPreserveLast(&orig_err);
+    if (ret < 0)
+        ignore_value(qemuMonitorFileHandleRelayWait(mon, true));
 
     /* Remove fdset passed to qemu and restore max migration bandwidth */
     if (qemuDomainObjIsActive(vm)) {

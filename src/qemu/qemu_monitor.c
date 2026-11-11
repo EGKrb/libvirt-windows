@@ -782,6 +782,7 @@ qemuMonitorClose(qemuMonitor *mon)
 #ifdef WIN32
         /* the GSocket had its own handle, see virSocketGLibFD() */
         VIR_FORCE_CLOSE(mon->fd);
+        ignore_value(qemuMonitorFileHandleRelayWait(mon, true));
 #endif
         mon->fd = -1;
     }
@@ -2562,6 +2563,227 @@ qemuMonitorQueryFdsets(qemuMonitor *mon,
 }
 
 
+#ifdef WIN32
+/*
+ * QEMU for Windows receives no file descriptor on its monitor, only a
+ * socket duplicated for it (get-win32-socket).  A file, or a pipe, is then
+ * given to QEMU as one end of a socket pair that a thread of libvirt
+ * relays to or from it, until QEMU closes its end.
+ */
+typedef struct _qemuMonitorRelay qemuMonitorRelay;
+struct _qemuMonitorRelay {
+    qemuMonitor *mon;           /* only compared */
+    int fd;                     /* a duplicate of the file's */
+    int sock;                   /* libvirt's end of the pair */
+    bool toQEMU;
+    int finish;                 /* QEMU has written everything (atomic) */
+    int err;                    /* errno of a failed write to the file */
+    GThread *thread;
+};
+
+/* POLLRDNORM of winsock, which gnulib's poll.h may define otherwise */
+#define QEMU_MONITOR_RELAY_POLLRDNORM 0x0100
+
+static GMutex qemuMonitorRelayLock;
+static GPtrArray *qemuMonitorRelays;
+
+
+static gpointer
+qemuMonitorRelayRun(gpointer opaque)
+{
+    qemuMonitorRelay *relay = opaque;
+    g_autofree char *buf = g_new(char, 256 * 1024);
+
+    for (;;) {
+        ssize_t got;
+        ssize_t off;
+
+        if (!relay->toQEMU) {
+            /* QEMU does not close the socket after a migration: once it
+             * reports the end, what it wrote is all there to be read */
+            WSAPOLLFD pfd = { .fd = (SOCKET)_get_osfhandle(relay->sock),
+                              .events = QEMU_MONITOR_RELAY_POLLRDNORM };
+            int ready = WSAPoll(&pfd, 1, 100);
+
+            if (ready < 0)
+                break;
+            if (ready == 0) {
+                if (g_atomic_int_get(&relay->finish))
+                    break;
+                continue;
+            }
+        }
+
+        if (relay->toQEMU)
+            got = saferead(relay->fd, buf, 256 * 1024);
+        else
+            got = virSocketRecv(relay->sock, buf, 256 * 1024);
+        if (got <= 0)
+            break;
+
+        if (!relay->toQEMU) {
+            if (safewrite(relay->fd, buf, got) != got) {
+                relay->err = errno;
+                break;
+            }
+            continue;
+        }
+        /* QEMU closes its end once it has read what it needs */
+        for (off = 0; off < got; ) {
+            ssize_t sent = virSocketSend(relay->sock, buf + off, got - off);
+
+            if (sent <= 0)
+                goto done;
+            off += sent;
+        }
+    }
+
+ done:
+    vir_closesocket(relay->sock);
+    relay->sock = -1;
+    VIR_FORCE_CLOSE(relay->fd);
+    return NULL;
+}
+
+
+static int
+qemuMonitorSendWin32Socket(qemuMonitor *mon,
+                           const char *fdname,
+                           int sock)
+{
+    WSAPROTOCOL_INFOW info;
+    g_autofree char *b64 = NULL;
+
+    if (!mon->vm || mon->vm->pid <= 0) {
+        virReportError(VIR_ERR_OPERATION_INVALID, "%s",
+                       _("no QEMU process to give the socket to"));
+        return -1;
+    }
+    if (WSADuplicateSocketW((SOCKET)_get_osfhandle(sock), mon->vm->pid, &info) != 0) {
+        virReportError(VIR_ERR_SYSTEM_ERROR,
+                       _("Unable to duplicate a socket for QEMU: error %1$d"),
+                       WSAGetLastError());
+        return -1;
+    }
+    b64 = g_base64_encode((const guchar *)&info, sizeof(info));
+
+    return qemuMonitorJSONGetWin32Socket(mon, b64, fdname);
+}
+
+
+static bool
+qemuMonitorFDIsSocket(int fd)
+{
+    int type;
+    socklen_t len = sizeof(type);
+
+    return getsockopt(fd, SOL_SOCKET, SO_TYPE, (char *)&type, &len) == 0;
+}
+
+
+/* @fd for QEMU named @fdname: a socket is duplicated for QEMU, anything
+ * else relayed, @toQEMU telling the way */
+static int
+qemuMonitorSendFileHandleWin32(qemuMonitor *mon,
+                               const char *fdname,
+                               int fd,
+                               bool toQEMU)
+{
+    int pair[2] = { -1, -1 };
+    qemuMonitorRelay *relay;
+    int dupfd;
+
+    if (qemuMonitorFDIsSocket(fd))
+        return qemuMonitorSendWin32Socket(mon, fdname, fd);
+
+    if ((dupfd = dup(fd)) < 0) {
+        virReportSystemError(errno, "%s", _("Unable to duplicate a file descriptor"));
+        return -1;
+    }
+    if (virSocketPair(pair) < 0) {
+        virReportSystemError(errno, "%s", _("Unable to create a socket pair"));
+        VIR_FORCE_CLOSE(dupfd);
+        return -1;
+    }
+    if (qemuMonitorSendWin32Socket(mon, fdname, pair[1]) < 0) {
+        vir_closesocket(pair[0]);
+        vir_closesocket(pair[1]);
+        VIR_FORCE_CLOSE(dupfd);
+        return -1;
+    }
+    /* QEMU has its own copy now */
+    vir_closesocket(pair[1]);
+
+    relay = g_new0(qemuMonitorRelay, 1);
+    relay->mon = mon;
+    relay->fd = dupfd;
+    relay->sock = pair[0];
+    relay->toQEMU = toQEMU;
+    relay->thread = g_thread_new("qemu-fd-relay", qemuMonitorRelayRun, relay);
+
+    g_mutex_lock(&qemuMonitorRelayLock);
+    if (!qemuMonitorRelays)
+        qemuMonitorRelays = g_ptr_array_new();
+    g_ptr_array_add(qemuMonitorRelays, relay);
+    g_mutex_unlock(&qemuMonitorRelayLock);
+    return 0;
+}
+#endif /* WIN32 */
+
+
+/**
+ * qemuMonitorFileHandleRelayWait:
+ * @mon: monitor object
+ * @abort: end the relays rather than wait until QEMU closes them
+ *
+ * On Windows, waits until the files given to QEMU by @mon are relayed
+ * entirely: after QEMU has finished with them, or when it is gone.  Does not
+ * need the monitor lock.
+ *
+ * Returns -1 if writing to one of them failed, else 0.
+ */
+int
+qemuMonitorFileHandleRelayWait(qemuMonitor *mon G_GNUC_UNUSED,
+                               bool abort G_GNUC_UNUSED)
+{
+    int ret = 0;
+#ifdef WIN32
+    for (;;) {
+        qemuMonitorRelay *relay = NULL;
+        size_t i;
+
+        g_mutex_lock(&qemuMonitorRelayLock);
+        for (i = 0; qemuMonitorRelays && i < qemuMonitorRelays->len; i++) {
+            qemuMonitorRelay *r = g_ptr_array_index(qemuMonitorRelays, i);
+
+            if (r->mon == mon) {
+                relay = g_ptr_array_steal_index(qemuMonitorRelays, i);
+                break;
+            }
+        }
+        g_mutex_unlock(&qemuMonitorRelayLock);
+        if (!relay)
+            break;
+
+        /* the thread closes the socket: a shutdown only ends its wait.
+         * QEMU is done with what it reads, and has written what it writes */
+        if ((abort || relay->toQEMU) && relay->sock >= 0)
+            shutdown((SOCKET)_get_osfhandle(relay->sock), SD_BOTH);
+        else
+            g_atomic_int_set(&relay->finish, 1);
+        g_thread_join(relay->thread);
+        if (relay->err && !abort) {
+            virReportSystemError(relay->err, "%s",
+                                 _("Unable to write what QEMU sent"));
+            ret = -1;
+        }
+        g_free(relay);
+    }
+#endif
+    return ret;
+}
+
+
 int
 qemuMonitorSendFileHandle(qemuMonitor *mon,
                           const char *fdname,
@@ -2577,7 +2799,13 @@ qemuMonitorSendFileHandle(qemuMonitor *mon,
         return -1;
     }
 
+#ifdef WIN32
+    /* the way of a file is unknown here: QEMU writes it, as for migrate
+     * and dump; incoming migrations name theirs in qemuMonitorMigrateIncoming */
+    return qemuMonitorSendFileHandleWin32(mon, fdname, fd, false);
+#else
     return qemuMonitorJSONSendFileHandle(mon, fdname, fd);
+#endif
 }
 
 
@@ -3857,6 +4085,19 @@ qemuMonitorMigrateIncoming(qemuMonitor *mon,
 
     QEMU_CHECK_MONITOR(mon);
 
+#ifdef WIN32
+    {
+        /* "fd:N", N a file of libvirt: relayed to QEMU, see
+         * qemuMonitorSendFileHandleWin32() */
+        int fd;
+
+        if (STRPREFIX(uri, "fd:") && virStrToLong_i(uri + 3, NULL, 10, &fd) == 0) {
+            if (qemuMonitorSendFileHandleWin32(mon, "migrate-incoming", fd, true) < 0)
+                return -1;
+            return qemuMonitorJSONMigrateIncoming(mon, "fd:migrate-incoming", exitOnError);
+        }
+    }
+#endif
     return qemuMonitorJSONMigrateIncoming(mon, uri, exitOnError);
 }
 

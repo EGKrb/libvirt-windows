@@ -487,14 +487,25 @@ virFileWrapperFdNew(int *fd, const char *name, unsigned int flags)
     return NULL;
 }
 #else /* WIN32 */
+/* QEMU's files are relayed by threads of libvirt on Windows (see
+ * qemuMonitorSendFileHandle): the I/O does not block a monitor or a client,
+ * and the fd is used as it is */
 virFileWrapperFd *
 virFileWrapperFdNew(int *fd G_GNUC_UNUSED,
                     const char *name G_GNUC_UNUSED,
-                    unsigned int fdflags G_GNUC_UNUSED)
+                    unsigned int flags)
 {
-    virReportError(VIR_ERR_INTERNAL_ERROR, "%s",
-                   _("virFileWrapperFd unsupported on this platform"));
-    return NULL;
+    if (!flags) {
+        virReportError(VIR_ERR_INTERNAL_ERROR, "%s",
+                       _("invalid use with no flags"));
+        return NULL;
+    }
+    if (flags & VIR_FILE_WRAPPER_BYPASS_CACHE) {
+        virReportError(VIR_ERR_OPERATION_UNSUPPORTED, "%s",
+                       _("bypassing the file system cache is not supported on this platform"));
+        return NULL;
+    }
+    return g_new0(virFileWrapperFd, 1);
 }
 #endif /* WIN32 */
 
@@ -519,6 +530,12 @@ virFileWrapperFdClose(virFileWrapperFd *wfd)
 
     if (!wfd || wfd->closed)
         return 0;
+
+    /* Windows: no child, see virFileWrapperFdNew() */
+    if (!wfd->cmd) {
+        wfd->closed = true;
+        return 0;
+    }
 
     ret = virCommandWait(wfd->cmd, NULL);
 

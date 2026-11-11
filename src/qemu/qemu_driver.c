@@ -3173,7 +3173,11 @@ qemuDumpToFd(virQEMUDriver *driver,
     if (rc < 0)
         return -1;
 
-    return qemuDumpWaitForCompletion(vm);
+    rc = qemuDumpWaitForCompletion(vm);
+    /* Windows: the end of what QEMU wrote, relayed to the file */
+    if (qemuMonitorFileHandleRelayWait(priv->mon, rc < 0) < 0)
+        rc = -1;
+    return rc;
 }
 
 

@@ -3862,6 +3862,29 @@ qemuMonitorJSONSendFileHandle(qemuMonitor *mon,
 }
 
 
+#ifdef WIN32
+int
+qemuMonitorJSONGetWin32Socket(qemuMonitor *mon,
+                              const char *info,
+                              const char *fdname)
+{
+    g_autoptr(virJSONValue) cmd = qemuMonitorJSONMakeCommand("get-win32-socket",
+                                                             "s:info", info,
+                                                             "s:fdname", fdname,
+                                                             NULL);
+    g_autoptr(virJSONValue) reply = NULL;
+
+    if (!cmd)
+        return -1;
+
+    if (qemuMonitorJSONCommand(mon, cmd, &reply) < 0)
+        return -1;
+
+    return qemuMonitorJSONCheckError(cmd, reply);
+}
+
+
+#endif
 int
 qemuMonitorJSONCloseFileHandle(qemuMonitor *mon,
                                const char *fdname)

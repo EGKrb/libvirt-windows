@@ -8437,8 +8437,11 @@ qemuProcessLaunch(virConnectPtr conn,
         goto cleanup;
 
     if (incoming) {
+#ifndef WIN32
+        /* Windows: relayed, see qemuMonitorMigrateIncoming() */
         if (incoming->fd != -1)
             virCommandPassFD(cmd, incoming->fd, 0);
+#endif
         qemuFDPassTransferCommand(incoming->fdPassMigrate, cmd);
     }
 

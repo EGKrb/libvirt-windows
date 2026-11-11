@@ -5,13 +5,351 @@ with: patch -p1 < qemu-for-libvirt-windows.patch).
   libvirt uses to probe QEMU's capabilities.
 - system/physmem.c: RAM discard on Windows, so that the memory a virtio
   balloon takes from the guest goes back to the host.
+- Migration with WHPX (virsh save, restore, managedsave, dump, migrate):
+  - accel/whpx: dirty page tracking (WHvMapGpaRangeFlagTrackDirtyPages,
+    WHvQueryGpaRangeDirtyBitmap) for live migration, and no migration
+    blocker; QEMU_WHPX_NO_DIRTY_TRACKING=1 turns the tracking off.
+  - target/i386/whpx: the vCPU state a migration needs: XSAVE area of the
+    size the hypervisor asks for, XSS, TSC_AUX, the Hyper-V MSRs of the
+    guest (guest OS id, hypercall page, VP assist page, reference TSC page,
+    SynIC), the partition's reference time; local APIC registers the
+    hypervisor refuses (x2APIC LDR and DFR) are kept.  The Hyper-V
+    synthetic timers, whose state this API cannot read, are no longer
+    offered (guests use the local APIC timer): QEMU_WHPX_SYNTHETIC_TIMERS=1
+    offers them again, with a migration blocker.
+  - monitor/fds.c: get-win32-socket makes an overlapped socket, as socket()
+    does.
 
 Like QEMU, GPL-2.0-or-later.  Written with an AI assistant: QEMU's policy
 (docs/devel/code-provenance.rst) forbids submitting it upstream.
 
 --- a/target/i386/whpx/whpx-all.c
 +++ b/target/i386/whpx/whpx-all.c
-@@ -3044,10 +3044,13 @@
+@@ -32,6 +32,7 @@
+ #include "qapi/qapi-types-common.h"
+ #include "qapi/qapi-visit-common.h"
+ #include "migration/blocker.h"
++#include "migration/vmstate.h"
+ #include "host-cpu.h"
+ #include "accel/accel-cpu-target.h"
+ #include <winerror.h>
+@@ -513,6 +514,8 @@
+     }
+ }
+ 
++static void whpx_set_migration_registers(CPUState *cpu);
++
+ void whpx_set_registers(CPUState *cpu, WHPXStateLevel level)
+ {
+     struct whpx_state *whpx = &whpx_global;
+@@ -534,6 +537,8 @@
+      */
+     if (level >= WHPX_LEVEL_RESET_STATE) {
+         whpx_set_tsc(cpu);
++        /* XSS before the XSAVE area, whose compaction depends on it */
++        whpx_set_migration_registers(cpu);
+     }
+ 
+     memset(&vcxt, 0, sizeof(struct whpx_register_set));
+@@ -707,6 +712,128 @@
+     cpu_env(cpu)->xcr0 = xcr0.Reg64;
+ }
+ 
++/*
++ * State the hypervisor keeps that a migration needs (machine.c sends it):
++ * the Hyper-V MSRs of the guest, XSS and TSC_AUX.  The synthetic timers
++ * have no register here, so they are not offered (see whpx_accel_init).
++ * The guest OS id goes first: the hypercall page needs it.
++ */
++static const WHV_REGISTER_NAME whpx_hv_register_names[] = {
++    WHvRegisterGuestOsId,
++    WHvX64RegisterHypercall,
++    WHvRegisterVpAssistPage,
++    WHvRegisterReferenceTsc,
++    WHvRegisterScontrol,
++    WHvRegisterSiefp,
++    WHvRegisterSimp,
++    WHvRegisterSint0, WHvRegisterSint1, WHvRegisterSint2, WHvRegisterSint3,
++    WHvRegisterSint4, WHvRegisterSint5, WHvRegisterSint6, WHvRegisterSint7,
++    WHvRegisterSint8, WHvRegisterSint9, WHvRegisterSint10, WHvRegisterSint11,
++    WHvRegisterSint12, WHvRegisterSint13, WHvRegisterSint14, WHvRegisterSint15,
++};
++
++static const WHV_REGISTER_NAME whpx_msr_register_names[] = {
++    WHvX64RegisterXss,
++    WHvX64RegisterTscAux,
++};
++
++static void whpx_get_migration_registers(CPUState *cpu)
++{
++    struct whpx_state *whpx = &whpx_global;
++    CPUX86State *env = cpu_env(cpu);
++    WHV_REGISTER_VALUE hv[RTL_NUMBER_OF(whpx_hv_register_names)];
++    WHV_REGISTER_VALUE msr[RTL_NUMBER_OF(whpx_msr_register_names)];
++    HRESULT hr;
++    int i, idx = 0;
++
++    hr = whp_dispatch.WHvGetVirtualProcessorRegisters(
++        whpx->partition, cpu->cpu_index, whpx_msr_register_names,
++        RTL_NUMBER_OF(whpx_msr_register_names), msr);
++    if (FAILED(hr)) {
++        error_report("WHPX: Failed to get XSS and TSC_AUX, hr=%08lx", hr);
++    } else {
++        env->xss = msr[0].Reg64;
++        env->tsc_aux = msr[1].Reg64;
++    }
++
++    if (!whpx->hyperv_enlightenments_enabled) {
++        return;
++    }
++    hr = whp_dispatch.WHvGetVirtualProcessorRegisters(
++        whpx->partition, cpu->cpu_index, whpx_hv_register_names,
++        RTL_NUMBER_OF(whpx_hv_register_names), hv);
++    if (FAILED(hr)) {
++        error_report("WHPX: Failed to get Hyper-V registers, hr=%08lx", hr);
++        return;
++    }
++    env->msr_hv_guest_os_id = hv[idx++].Reg64;
++    env->msr_hv_hypercall = hv[idx++].Reg64;
++    env->msr_hv_vapic = hv[idx++].Reg64;
++    env->msr_hv_tsc = hv[idx++].Reg64;
++    env->msr_hv_synic_control = hv[idx++].Reg64;
++    env->msr_hv_synic_evt_page = hv[idx++].Reg64;
++    env->msr_hv_synic_msg_page = hv[idx++].Reg64;
++    for (i = 0; i < HV_SINT_COUNT; i++) {
++        env->msr_hv_synic_sint[i] = hv[idx++].Reg64;
++    }
++}
++
++static void whpx_set_migration_registers(CPUState *cpu)
++{
++    struct whpx_state *whpx = &whpx_global;
++    CPUX86State *env = cpu_env(cpu);
++    WHV_REGISTER_VALUE hv[RTL_NUMBER_OF(whpx_hv_register_names)];
++    WHV_REGISTER_VALUE msr[RTL_NUMBER_OF(whpx_msr_register_names)];
++    HRESULT hr;
++    int i, idx = 0;
++
++    msr[0].Reg64 = env->xss;
++    msr[1].Reg64 = env->tsc_aux;
++    hr = whp_dispatch.WHvSetVirtualProcessorRegisters(
++        whpx->partition, cpu->cpu_index, whpx_msr_register_names,
++        RTL_NUMBER_OF(whpx_msr_register_names), msr);
++    if (FAILED(hr)) {
++        error_report("WHPX: Failed to set XSS and TSC_AUX, hr=%08lx", hr);
++    }
++
++    if (!whpx->hyperv_enlightenments_enabled) {
++        return;
++    }
++    hv[idx++].Reg64 = env->msr_hv_guest_os_id;
++    hv[idx++].Reg64 = env->msr_hv_hypercall;
++    hv[idx++].Reg64 = env->msr_hv_vapic;
++    hv[idx++].Reg64 = env->msr_hv_tsc;
++    hv[idx++].Reg64 = env->msr_hv_synic_control;
++    hv[idx++].Reg64 = env->msr_hv_synic_evt_page;
++    hv[idx++].Reg64 = env->msr_hv_synic_msg_page;
++    for (i = 0; i < HV_SINT_COUNT; i++) {
++        uint64_t sint = env->msr_hv_synic_sint[i];
++
++        /* after a reset QEMU has 0, an unmasked vector 0 the hypervisor
++         * refuses: its own reset value is masked */
++        if (!(sint & HV_SINT_MASKED) && (sint & 0xff) < 16) {
++            sint = HV_SINT_MASKED;
++        }
++        hv[idx++].Reg64 = sint;
++    }
++    hr = whp_dispatch.WHvSetVirtualProcessorRegisters(
++        whpx->partition, cpu->cpu_index, whpx_hv_register_names,
++        RTL_NUMBER_OF(whpx_hv_register_names), hv);
++    if (FAILED(hr)) {
++        /* one by one: the others still apply */
++        for (i = 0; i < RTL_NUMBER_OF(whpx_hv_register_names); i++) {
++            hr = whp_dispatch.WHvSetVirtualProcessorRegisters(
++                whpx->partition, cpu->cpu_index, &whpx_hv_register_names[i],
++                1, &hv[i]);
++            if (FAILED(hr)) {
++                warn_report("WHPX: Hyper-V register 0x%x: 0x%" PRIx64
++                            " refused, hr=%08lx", whpx_hv_register_names[i],
++                            hv[i].Reg64, hr);
++            }
++        }
++    }
++}
++
+ static void whpx_get_registers_for_vmexit(CPUState *cpu, WHPXStateLevel level)
+ {
+     struct whpx_state *whpx = &whpx_global;
+@@ -821,24 +948,38 @@
+     size_t xsavec_buf_len = whpx_get_xsave_max_len();
+     UINT32 bytes_written;
+ 
+-    xsavec_buf = qemu_memalign(page, xsavec_buf_len);
+-    memset(xsavec_buf, 0, xsavec_buf_len);
+-
+-    if (!whpx_is_legacy_os()) {
+-        hr = whp_dispatch.WHvGetVirtualProcessorState(
+-            whpx->partition, cpu->cpu_index,
+-            WHvVirtualProcessorStateTypeXsaveState,
+-            xsavec_buf,
+-            xsavec_buf_len, &bytes_written);
+-    } else {
+-        hr = whp_dispatch.WHvGetVirtualProcessorXsaveState(
+-            whpx->partition, cpu->cpu_index,
+-            xsavec_buf,
+-            xsavec_buf_len, &bytes_written);
++    /*
++     * The hypervisor's compacted area can be larger than CPUID.(0xd,0):ECX
++     * (supervisor states): it then tells the size it needs
++     */
++    for (;;) {
++        xsavec_buf = qemu_memalign(page, xsavec_buf_len);
++        memset(xsavec_buf, 0, xsavec_buf_len);
++        bytes_written = 0;
++
++        if (!whpx_is_legacy_os()) {
++            hr = whp_dispatch.WHvGetVirtualProcessorState(
++                whpx->partition, cpu->cpu_index,
++                WHvVirtualProcessorStateTypeXsaveState,
++                xsavec_buf,
++                xsavec_buf_len, &bytes_written);
++        } else {
++            hr = whp_dispatch.WHvGetVirtualProcessorXsaveState(
++                whpx->partition, cpu->cpu_index,
++                xsavec_buf,
++                xsavec_buf_len, &bytes_written);
++        }
++        if (hr != WHV_E_INSUFFICIENT_BUFFER || bytes_written <= xsavec_buf_len) {
++            break;
++        }
++        qemu_vfree(xsavec_buf);
++        xsavec_buf_len = bytes_written;
+     }
+     if (FAILED(hr) || bytes_written == 0) {
+-        error_report("failed to get xsave state: %s", strerror(errno));
+-        return -errno;
++        error_report("failed to get xsave state: hr=%08lx, %u of %zu bytes",
++                     hr, bytes_written, xsavec_buf_len);
++        qemu_vfree(xsavec_buf);
++        return -EINVAL;
+     }
+ 
+     ret = decompact_xsave_area(xsavec_buf, xsavec_buf_len, env);
+@@ -983,6 +1124,8 @@
+ 
+     assert(idx == RTL_NUMBER_OF(whpx_register_names));
+ 
++    whpx_get_migration_registers(cpu);
++
+     if (whpx_irqchip_in_kernel()) {
+         whpx_apic_get(x86_cpu->apic_state);
+     }
+@@ -2729,8 +2872,6 @@
+  * Vcpu support.
+  */
+ 
+-static Error *whpx_migration_blocker;
+-
+ static void whpx_cpu_update_state(void *opaque, bool running, RunState state)
+ {
+     CPUX86State *env = opaque;
+@@ -2745,7 +2886,6 @@
+     HRESULT hr;
+     struct whpx_state *whpx = &whpx_global;
+     AccelCPUState *vcpu = NULL;
+-    Error *local_error = NULL;
+     X86CPU *x86_cpu = X86_CPU(cpu);
+     CPUX86State *env = &x86_cpu->env;
+     X86XSaveHeader *header;
+@@ -2754,20 +2894,11 @@
+     UINT64 freq = 0;
+     int ret;
+ 
+-    /* Add migration blockers for all unsupported features of the
+-     * Windows Hypervisor Platform
++    /*
++     * No migration blocker: the state of the vCPUs (registers, XSAVE, TSC,
++     * local APIC) is read and written whole, and the RAM is tracked (see
++     * whpx_log_sync).
+      */
+-    if (whpx_migration_blocker == NULL) {
+-        error_setg(&whpx_migration_blocker,
+-               "State blocked due to missing dirty memory tracking support,"
+-               "And some system register/state save-restore ");
+-
+-        if (migrate_add_blocker(&whpx_migration_blocker, &local_error) < 0) {
+-            error_report_err(local_error);
+-            ret = -EINVAL;
+-            goto error;
+-        }
+-    }
+ 
+     vcpu = g_new0(AccelCPUState, 1);
+ 
+@@ -3027,9 +3158,62 @@
+         "Separate security domain");
+ }
+ 
++static Error *whpx_stimer_migration_blocker;
++
++/*
++ * The partition's reference time (the Hyper-V clock of the guest, and its
++ * TSC page) starts at 0 with a partition: a migrated guest goes on with its
++ * own
++ */
++static int whpx_reference_time_pre_save(void *opaque)
++{
++    struct whpx_state *whpx = opaque;
++    HRESULT hr;
++
++    whpx->reference_time = 0;
++    hr = whp_dispatch.WHvGetPartitionProperty(
++        whpx->partition, WHvPartitionPropertyCodeReferenceTime,
++        &whpx->reference_time, sizeof(whpx->reference_time), NULL);
++    if (FAILED(hr)) {
++        warn_report("WHPX: cannot read the reference time, hr=%08lx", hr);
++    }
++    return 0;
++}
++
++static int whpx_reference_time_post_load(void *opaque, int version_id)
++{
++    struct whpx_state *whpx = opaque;
++    HRESULT hr;
++
++    if (!whpx->reference_time) {
++        return 0;
++    }
++    hr = whp_dispatch.WHvSetPartitionProperty(
++        whpx->partition, WHvPartitionPropertyCodeReferenceTime,
++        &whpx->reference_time, sizeof(whpx->reference_time));
++    if (FAILED(hr)) {
++        error_report("WHPX: cannot set the reference time, hr=%08lx", hr);
++        return -EINVAL;
++    }
++    return 0;
++}
++
++static const VMStateDescription vmstate_whpx_reference_time = {
++    .name = "whpx-reference-time",
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .pre_save = whpx_reference_time_pre_save,
++    .post_load = whpx_reference_time_post_load,
++    .fields = (const VMStateField[]) {
++        VMSTATE_UINT64(reference_time, struct whpx_state),
++        VMSTATE_END_OF_LIST()
++    }
++};
++
+ int whpx_accel_init(AccelState *as, MachineState *ms)
+ {
+     struct whpx_state *whpx;
++    Error *local_error = NULL;
+     int ret;
+     HRESULT hr;
+     WHV_CAPABILITY whpx_cap;
+@@ -3044,10 +3228,13 @@
          0x80000002, 0x80000003, 0x80000004, 0x80000007, 0x80000008,
          0x8000000A, 0x80000021, 0x80000022, 0xC0000000, 0xC0000001};
  
@@ -27,6 +365,228 @@ Like QEMU, GPL-2.0-or-later.  Written with an AI assistant: QEMU's policy
          pic_enabled = true;
      }
  
+@@ -3275,12 +3462,28 @@
+ 
+     if (whpx_irqchip_in_kernel()) {
+         synthetic_features.Bank0.AccessSynicRegs = 1;
+-        synthetic_features.Bank0.AccessSyntheticTimerRegs = 1;
+         synthetic_features.Bank0.AccessIntrCtrlRegs = 1;
+         synthetic_features.Bank0.SyntheticClusterIpi = 1;
+-        synthetic_features.Bank0.DirectSyntheticTimers = 1;
+         synthetic_features.Bank0.AccessGuestIdleReg = 1;
+         /*
++         * The state of the synthetic timers cannot be read or written
++         * through this API: guests use the local APIC timer instead,
++         * which migrates, unless QEMU_WHPX_SYNTHETIC_TIMERS asks for them
++         */
++        if (getenv("QEMU_WHPX_SYNTHETIC_TIMERS")) {
++            synthetic_features.Bank0.AccessSyntheticTimerRegs = 1;
++            synthetic_features.Bank0.DirectSyntheticTimers = 1;
++            error_setg(&whpx_stimer_migration_blocker,
++                       "WHPX: the state of the Hyper-V synthetic timers "
++                       "cannot be saved");
++            if (migrate_add_blocker(&whpx_stimer_migration_blocker,
++                                    &local_error) < 0) {
++                error_report_err(local_error);
++                ret = -EINVAL;
++                goto error;
++            }
++        }
++        /*
+          * These technically work without the Hyper-V LAPIC
+          * but behave oddly for multi-core VMs.
+          */
+@@ -3356,6 +3559,7 @@
+ 
+     whpx_memory_init();
+     whpx_init_emu();
++    vmstate_register(NULL, 0, &vmstate_whpx_reference_time, whpx);
+ 
+     as->gdbstub.sstep_flags = SSTEP_ENABLE;
+ 
+--- a/target/i386/whpx/whpx-apic.c
++++ b/target/i386/whpx/whpx-apic.c
+@@ -206,12 +206,49 @@
+     whpx_put_apic_base(CPU(s->cpu), s->apicbase);
+     whpx_put_apic_state(s, &kapic);
+ 
++    /* x2APIC: the LDR is read-only (derived from the APIC id), the DFR gone */
++    if (s->apicbase & MSR_IA32_APICBASE_EXTD) {
++        struct whpx_lapic_state cur;
++
++        if (SUCCEEDED(whp_dispatch.WHvGetVirtualProcessorInterruptControllerState2(
++                whpx_global.partition, cs->cpu_index, &cur, sizeof(cur), NULL))) {
++            kapic.fields[0xd].data = cur.fields[0xd].data;
++            kapic.fields[0xe].data = cur.fields[0xe].data;
++        }
++    }
++
+     hr = whp_dispatch.WHvSetVirtualProcessorInterruptControllerState2(
+         whpx_global.partition,
+         cs->cpu_index,
+         &kapic,
+         sizeof(kapic));
+     if (FAILED(hr)) {
++        /*
++         * The hypervisor refuses some value (after a migration): the
++         * registers one by one over its current state, keeping those it
++         * takes
++         */
++        struct whpx_lapic_state cur;
++        int i;
++
++        hr = whp_dispatch.WHvGetVirtualProcessorInterruptControllerState2(
++            whpx_global.partition, cs->cpu_index, &cur, sizeof(cur), NULL);
++        for (i = 0; SUCCEEDED(hr) && i < 256; i++) {
++            uint32_t old = cur.fields[i].data;
++
++            if (old == kapic.fields[i].data) {
++                continue;
++            }
++            cur.fields[i].data = kapic.fields[i].data;
++            if (FAILED(whp_dispatch.WHvSetVirtualProcessorInterruptControllerState2(
++                    whpx_global.partition, cs->cpu_index, &cur, sizeof(cur)))) {
++                warn_report("WHPX: local APIC register 0x%x: 0x%x refused, "
++                            "0x%x kept", i * 16, kapic.fields[i].data, old);
++                cur.fields[i].data = old;
++            }
++        }
++    }
++    if (FAILED(hr)) {
+         fprintf(stderr,
+             "WHvSetVirtualProcessorInterruptControllerState failed: %08lx\n",
+              hr);
+--- a/accel/whpx/whpx-common.c
++++ b/accel/whpx/whpx-common.c
+@@ -13,6 +13,7 @@
+ #include "qemu/accel.h"
+ #include "accel/accel-ops.h"
+ #include "system/memory.h"
++#include "system/physmem.h"
+ #include "system/whpx.h"
+ #include "system/cpus.h"
+ #include "system/runstate.h"
+@@ -324,6 +325,18 @@
+      | (writable ? WHvMapGpaRangeFlagWrite : 0);
+     mem = memory_region_get_ram_ptr(area) + section->offset_within_region;
+ 
++    /* the pages the guest writes, for migration (see whpx_log_sync) */
++    if (writable && memory_region_is_ram(area) && whpx->dirty_tracking) {
++        hr = whp_dispatch.WHvMapGpaRange(whpx->partition, mem, gva, size,
++                                         flags | WHvMapGpaRangeFlagTrackDirtyPages);
++        if (SUCCEEDED(hr)) {
++            return;
++        }
++        warn_report("WHPX: no dirty page tracking (hr=%08lx): migration "
++                    "sends the whole RAM at each pass", hr);
++        whpx->dirty_tracking = false;
++    }
++
+     hr = whp_dispatch.WHvMapGpaRange(whpx->partition,
+          mem, gva, size, flags);
+     if (FAILED(hr)) {
+@@ -355,13 +368,40 @@
+ static void whpx_log_sync(MemoryListener *listener,
+                          MemoryRegionSection *section)
+ {
++    struct whpx_state *whpx = &whpx_global;
+     MemoryRegion *mr = section->mr;
++    uint64_t page_size = qemu_real_host_page_size();
++    uint64_t gpa = section->offset_within_address_space;
++    uint64_t size = int128_get64(section->size);
++    uint64_t pages = size / page_size;
++    g_autofree uint64_t *bitmap = NULL;
++    size_t bitmap_len;
++    HRESULT hr;
+ 
+     if (!memory_region_is_ram(mr)) {
+         return;
+     }
+ 
+-    memory_region_set_dirty(mr, 0, int128_get64(section->size));
++    /*
++     * The pages the guest wrote since the last query, which clears them;
++     * QEMU marks those it writes itself.  Without tracking, all of them.
++     */
++    if (whpx->dirty_tracking && !mr->readonly && !mr->rom_device &&
++        QEMU_IS_ALIGNED(size, page_size) && QEMU_IS_ALIGNED(gpa, page_size)) {
++        bitmap_len = ROUND_UP(pages, 64) / 8;
++        bitmap = g_malloc0(bitmap_len);
++        hr = whp_dispatch.WHvQueryGpaRangeDirtyBitmap(whpx->partition, gpa,
++                                                      size, bitmap, bitmap_len);
++        if (SUCCEEDED(hr)) {
++            physical_memory_set_dirty_lebitmap((unsigned long *)bitmap,
++                memory_region_get_ram_addr(mr) + section->offset_within_region,
++                pages);
++            return;
++        }
++        warn_report_once("WHPX: cannot query dirty pages (hr=%08lx)", hr);
++    }
++
++    memory_region_set_dirty(mr, section->offset_within_region, size);
+ }
+ 
+ static MemoryListener whpx_memory_listener = {
+@@ -376,6 +416,8 @@
+ 
+ void whpx_memory_init(void)
+ {
++    whpx_global.dirty_tracking = whp_dispatch.WHvQueryGpaRangeDirtyBitmap != NULL &&
++                                 !getenv("QEMU_WHPX_NO_DIRTY_TRACKING");
+     memory_listener_register(&whpx_memory_listener, &address_space_memory);
+ }
+ 
+--- a/include/system/whpx-internal.h
++++ b/include/system/whpx-internal.h
+@@ -51,12 +51,19 @@
+ 
+     bool ignore_unknown_msr;
+     bool intercept_msr_gp;
++
++    /* RAM is mapped with WHvMapGpaRangeFlagTrackDirtyPages */
++    bool dirty_tracking;
++
++    /* the partition's reference time, migrated */
++    uint64_t reference_time;
+ };
+ 
+ extern struct whpx_state whpx_global;
+ void whpx_apic_get(APICCommonState *s);
+ 
+ #define WHV_E_UNKNOWN_CAPABILITY 0x80370300L
++#define WHV_E_INSUFFICIENT_BUFFER 0x80370301L
+ 
+ /* This should eventually come from the Windows SDK */
+ #define WHV_E_UNKNOWN_PROPERTY 0x80370302
+@@ -118,6 +125,9 @@
+         (WHV_PARTITION_HANDLE Partition, UINT32 VpIndex, \
+         WHV_VIRTUAL_PROCESSOR_STATE_TYPE StateType, PVOID Buffer, \
+         UINT32 BufferSizeInBytes)) \
++  X(HRESULT, WHvQueryGpaRangeDirtyBitmap, \
++        (WHV_PARTITION_HANDLE Partition, WHV_GUEST_PHYSICAL_ADDRESS GuestAddress, \
++        UINT64 RangeSizeInBytes, UINT64 *Bitmap, UINT32 BitmapSizeInBytes)) \
+   LIST_WINHVPLATFORM_FUNCTIONS_SUPPLEMENTAL_ARCH(X)
+ 
+ #define WHP_DEFINE_TYPE(return_type, function_name, signature) \
+--- a/monitor/fds.c
++++ b/monitor/fds.c
+@@ -243,10 +243,15 @@
+         return;
+     }
+ 
++    /*
++     * Overlapped, as socket() makes them: without it Windows serializes the
++     * I/O of the handle, and a blocking recv() (the return path of a
++     * migration) holds a send() on the same socket forever
++     */
+     sk = WSASocketW(FROM_PROTOCOL_INFO,
+                     FROM_PROTOCOL_INFO,
+                     FROM_PROTOCOL_INFO,
+-                    info, 0, 0);
++                    info, 0, WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT);
+     if (sk == INVALID_SOCKET) {
+         error_setg_win32(errp, WSAGetLastError(), "Couldn't import socket");
+         return;
 --- a/system/physmem.c
 +++ b/system/physmem.c
 @@ -4244,6 +4244,31 @@
