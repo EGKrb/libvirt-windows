@@ -33,7 +33,7 @@ Alpine.
 | Démons | `libvirtd` et les démons modulaires, `--daemon`, rechargement et arrêt (signaux par événements nommés), reprise des invités après un redémarrage | services Windows |
 | Accès distant | sockets UNIX, transport `ext` | transport `ssh` (écrit, non testé), TLS |
 | Secrets | define, set, get, undefine, persistance | |
-| QEMU | type de domaine `whpx` ; define, start, destroy, suspend, resume ; `screenshot` ; `qemu-monitor-command` ; `virsh console` (série sur socket UNIX) ; ajout et retrait de cartes à chaud ; `setmem` (ballon, mémoire rendue à l'hôte avec le [correctif QEMU](windows/qemu)) ; `dommemstat` ; `save`, `restore`, `managedsave`, `dump` ; migration à chaud (directe et `--p2p`, entre deux instances de libvirt), avec le correctif QEMU | instantanés, migration avec copie du stockage, sysinfo SMBIOS |
+| QEMU | type de domaine `whpx` ; define, start, destroy, suspend, resume ; `screenshot` ; `qemu-monitor-command` ; `virsh console` (série sur socket UNIX) ; ajout et retrait de cartes à chaud ; `setmem` (ballon, mémoire rendue à l'hôte avec le [correctif QEMU](windows/qemu)) ; `dommemstat` ; `save`, `restore`, `managedsave`, `dump` ; migration à chaud (directe et `--p2p`, entre deux instances de libvirt, aussi avec `--copy-storage-all`), instantanés (internes et externes, avec ou sans mémoire, retour, suppression), avec le correctif QEMU ; `virsh sysinfo`, `<smbios mode='host'/>` et `<sysinfo>`, UUID de l'hôte tiré du SMBIOS | le disque de destination de `--copy-storage-all` est à créer d'avance (pas de pilote de stockage) |
 | Réseau des invités | `type='user'` (libslirp) ; `type='network'` et `type='bridge'` vers un réseau libvirt ; `type='ethernet'` sur un adaptateur TAP-Windows (créé, nommé, adressé et supprimé par libvirt ; `domifstat`), ou un existant avec `managed='no'` ; `type='bridge'` et réseaux `<forward mode='bridge'/>` sur un pont réseau de Windows (le réseau local de l'hôte) | |
 | Réseaux virtuels | modes `nat` et isolé ; DHCP et DHCPv6 (plages, réservations par MAC, DUID ou nom) ; DNS (hôtes, TXT, SRV, PTR, redirecteurs, domaine local) ; IPv6 (SLAAC ou DHCPv6) ; `net-update` ; `net-dhcp-leases` ; `domifaddr` ; autostart ; QoS (`domiftune`, floors, bande passante du réseau) ; `domifstat` ; modes `route` et `open` (Wintun) | |
 | Autres pilotes | | stockage, nodedev, interface, nwfilter, LXC, VirtualBox |
@@ -49,6 +49,7 @@ Alpine.
 | Liens symboliques | liens symboliques, ou sans le privilège fichiers système comme ceux de Cygwin/MSYS2 |
 | Consoles PTY | port série QEMU sur socket UNIX, `virsh console` par la console Windows |
 | KVM | WHPX (`<domain type='whpx'>`), sinon TCG |
+| `dmidecode`, `/sys/class/dmi` | la table SMBIOS du micrologiciel (`GetSystemFirmwareTable`), écrite comme dmidecode l'écrit |
 | Bridge, TAP, dnsmasq, iptables | `libvirt_netswitch` : un processus par réseau, switch Ethernet sur socket UNIX que QEMU rejoint par `-netdev stream`, libslirp pour le NAT, DHCP/DHCPv6/DNS intégrés, QoS par seaux à jetons |
 | Périphériques TAP de `type='ethernet'` | adaptateurs TAP-Windows6 créés par SetupAPI ; adaptateurs Wintun pour `route` et `open` |
 | Ponts de l'hôte (`br0`), `brctl`/`ip link` | ponts réseau de Windows, `netsh bridge add`/`remove` |

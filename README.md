@@ -31,7 +31,7 @@ Tested on Windows 11 (build 26300) with Ubuntu 24.04 guests; TAP and Wintun
 | Daemons | `libvirtd` and the modular daemons, `--daemon`, reload and stop (signals as named events), reconnection to running guests after a restart | Windows services |
 | Remote | UNIX sockets, `ext` transport | `ssh` transport (implemented, untested), TLS |
 | Secrets | define, set, get, undefine, persistence | |
-| QEMU | `whpx` domain type; define, start, destroy, suspend, resume; `screenshot`; `qemu-monitor-command`; `virsh console` (serial on a UNIX socket); NIC hotplug; `setmem` (balloon, memory given back to the host with the [QEMU patch](windows/qemu)); `dommemstat`; `save`, `restore`, `managedsave`, `dump`; live migration (direct and `--p2p`, between two libvirt instances), all with the QEMU patch | snapshots, migration with storage copy, SMBIOS sysinfo |
+| QEMU | `whpx` domain type; define, start, destroy, suspend, resume; `screenshot`; `qemu-monitor-command`; `virsh console` (serial on a UNIX socket); NIC hotplug; `setmem` (balloon, memory given back to the host with the [QEMU patch](windows/qemu)); `dommemstat`; `save`, `restore`, `managedsave`, `dump`; live migration (direct and `--p2p`, between two libvirt instances, also with `--copy-storage-all`), snapshots (internal and external, with or without memory, revert, delete), all with the QEMU patch; `virsh sysinfo`, `<smbios mode='host'/>` and `<sysinfo>`, the host UUID from SMBIOS | the destination disk of `--copy-storage-all` is to be made beforehand (no storage driver) |
 | Guest networking | `type='user'` (libslirp); `type='network'` and `type='bridge'` to a libvirt network; `type='ethernet'` on a TAP-Windows adapter (created, named, addressed and deleted by libvirt; `domifstat`), or an existing one with `managed='no'`; `type='bridge'` and `<forward mode='bridge'/>` networks on a network bridge of Windows (the host's LAN) | |
 | Virtual networks | forward mode `nat` and isolated; DHCP and DHCPv6 (ranges, hosts by MAC, DUID or name); DNS (hosts, TXT, SRV, PTR, forwarders, local domain); IPv6 (SLAAC or DHCPv6); `net-update`; `net-dhcp-leases`; `domifaddr`; autostart; QoS (`domiftune`, floors, network bandwidth); `domifstat`; forward modes `route` and `open` (Wintun) | |
 | Other drivers | | storage, nodedev, interface, nwfilter, LXC, VirtualBox |
@@ -47,6 +47,7 @@ Tested on Windows 11 (build 26300) with Ubuntu 24.04 guests; TAP and Wintun
 | Symbolic links | symbolic links, or without the privilege system files as Cygwin/MSYS2 make them |
 | PTY consoles | QEMU serial on a UNIX socket, `virsh console` through the Windows console |
 | KVM | WHPX (`<domain type='whpx'>`), TCG otherwise |
+| `dmidecode`, `/sys/class/dmi` | the SMBIOS table of the firmware (`GetSystemFirmwareTable`), written as dmidecode writes it |
 | Bridge, TAP, dnsmasq, iptables | `libvirt_netswitch`: one process per network, an Ethernet switch on a UNIX socket that QEMU joins with `-netdev stream`, libslirp for NAT, its own DHCP/DHCPv6/DNS, QoS by token buckets |
 | `type='ethernet'` TAP devices | TAP-Windows6 adapters created by SetupAPI; Wintun adapters for `route` and `open` |
 | Host bridges (`br0`), `brctl`/`ip link` | network bridges of Windows, `netsh bridge add`/`remove` |
