@@ -31,6 +31,9 @@
 #include "virlog.h"
 #include "virfile.h"
 #include "virrandom.h"
+#include "virsysinfo.h"
+#include "virerror.h"
+#include "virstring.h"
 
 VIR_LOG_INIT("util.uuid");
 
@@ -183,6 +186,23 @@ virUUIDIsValid(const unsigned char *uuid)
 }
 
 
+#ifdef WIN32
+/* no /sys: the system UUID of the SMBIOS table */
+static int
+getDMISystemUUID(char *uuid, int len)
+{
+    g_autoptr(virSysinfoDef) sysinfo = virSysinfoRead();
+
+    if (!sysinfo) {
+        virResetLastError();
+        return -1;
+    }
+    if (!sysinfo->system || !sysinfo->system->uuid ||
+        virStrcpy(uuid, sysinfo->system->uuid, len) < 0)
+        return -1;
+    return 0;
+}
+#else
 static int
 getDMISystemUUID(char *uuid, int len)
 {
@@ -201,6 +221,7 @@ getDMISystemUUID(char *uuid, int len)
 
     return -1;
 }
+#endif /* WIN32 */
 
 
 /**

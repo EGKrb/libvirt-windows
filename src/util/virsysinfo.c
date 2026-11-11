@@ -34,6 +34,11 @@
 #include "virstring.h"
 #include "virxml.h"
 
+#ifdef WIN32
+# define WIN32_LEAN_AND_MEAN
+# include <windows.h>
+#endif
+
 #define LIBVIRT_VIRSYSINFOPRIV_H_ALLOW
 #include "virsysinfopriv.h"
 
@@ -1192,17 +1197,326 @@ virSysinfoParseX86Memory(const char *base, virSysinfoDef *ret)
     }
 }
 
+#ifdef WIN32
+/*
+ * Windows has no dmidecode: the SMBIOS table, from the firmware tables of
+ * Windows, written as "dmidecode -q -t 0,1,2,3,4,11,17" would write it, for
+ * the parsers above.
+ */
+
+/* RawSMBIOSData of GetSystemFirmwareTable('RSMB') */
+typedef struct {
+    BYTE used20CallingMethod;
+    BYTE majorVersion;
+    BYTE minorVersion;
+    BYTE dmiRevision;
+    DWORD length;
+    BYTE data[];
+} virSysinfoWin32RawSMBIOS;
+
+/* string @n of the structure at @s (0: none) */
+static const char *
+virSysinfoWin32String(const BYTE *s, const BYTE *end, BYTE n)
+{
+    const char *str = (const char *)s + s[1];
+
+    if (n == 0)
+        return "Not Specified";
+    while (--n > 0 && (const BYTE *)str < end && *str)
+        str += strlen(str) + 1;
+    if ((const BYTE *)str >= end || !*str)
+        return "<BAD INDEX>";
+    return str;
+}
+
+#define DMI_BYTE(s, o) ((s)[1] > (o) ? (s)[o] : 0)
+#define DMI_WORD(s, o) ((s)[1] > (o) + 1 ? (unsigned)((s)[o] | ((s)[(o) + 1] << 8)) : 0)
+#define DMI_DWORD(s, o) ((s)[1] > (o) + 3 ? (unsigned)((s)[o] | ((s)[(o) + 1] << 8) | \
+                                                       ((s)[(o) + 2] << 16) | ((unsigned)(s)[(o) + 3] << 24)) : 0)
+#define DMI_STR(s, o) virSysinfoWin32String(s, end, DMI_BYTE(s, o))
+
+static void
+virSysinfoWin32Size(virBuffer *buf, const char *what, unsigned long long mb)
+{
+    if (mb && mb % (1024 * 1024) == 0)
+        virBufferAsprintf(buf, "\t%s: %llu TB\n", what, mb / (1024 * 1024));
+    else if (mb && mb % 1024 == 0)
+        virBufferAsprintf(buf, "\t%s: %llu GB\n", what, mb / 1024);
+    else
+        virBufferAsprintf(buf, "\t%s: %llu MB\n", what, mb);
+}
+
+static void
+virSysinfoWin32Struct(virBuffer *buf, const BYTE *s, const BYTE *end,
+                      const virSysinfoWin32RawSMBIOS *raw)
+{
+    static const char *formFactors[] = {
+        NULL, "Other", "Unknown", "SIMM", "SIP", "Chip", "DIP", "ZIP",
+        "Proprietary Card", "DIMM", "TSOP", "Row Of Chips", "RIMM",
+        "SODIMM", "SRIMM", "FB-DIMM", "Die",
+    };
+    static const char *memTypes[] = {
+        NULL, "Other", "Unknown", "DRAM", "EDRAM", "VRAM", "SRAM", "RAM",
+        "ROM", "Flash", "EEPROM", "FEPROM", "EPROM", "CDRAM", "3DRAM",
+        "SDRAM", "SGRAM", "RDRAM", "DDR", "DDR2", "DDR2 FB-DIMM", NULL,
+        NULL, NULL, "DDR3", "FBD2", "DDR4", "LPDDR", "LPDDR2", "LPDDR3",
+        "LPDDR4", "Logical non-volatile device", "HBM", "HBM2", "DDR5",
+        "LPDDR5", "HBM3",
+    };
+    static const char *typeDetails[] = {
+        NULL, "Other", "Unknown", "Fast-paged", "Static Column",
+        "Pseudo-static", "RAMBus", "Synchronous", "CMOS", "EDO",
+        "Window DRAM", "Cache DRAM", "Non-Volatile", "Registered (Buffered)",
+        "Unbuffered (Unregistered)", "LRDIMM",
+    };
+    static const char *cpuStatus[] = {
+        "Unknown", "Enabled", "Disabled By User", "Disabled By BIOS", "Idle",
+        NULL, NULL, "Other",
+    };
+    size_t i;
+
+    switch (s[0]) {
+    case 0:
+        virBufferAddLit(buf, "BIOS Information\n");
+        virBufferAsprintf(buf, "\tVendor: %s\n", DMI_STR(s, 0x04));
+        virBufferAsprintf(buf, "\tVersion: %s\n", DMI_STR(s, 0x05));
+        virBufferAsprintf(buf, "\tRelease Date: %s\n", DMI_STR(s, 0x08));
+        if (s[1] >= 0x18 && s[0x14] != 0xFF && s[0x15] != 0xFF)
+            virBufferAsprintf(buf, "\tBIOS Revision: %u.%u\n", s[0x14], s[0x15]);
+        break;
+
+    case 1:
+        virBufferAddLit(buf, "System Information\n");
+        virBufferAsprintf(buf, "\tManufacturer: %s\n", DMI_STR(s, 0x04));
+        virBufferAsprintf(buf, "\tProduct Name: %s\n", DMI_STR(s, 0x05));
+        virBufferAsprintf(buf, "\tVersion: %s\n", DMI_STR(s, 0x06));
+        virBufferAsprintf(buf, "\tSerial Number: %s\n", DMI_STR(s, 0x07));
+        if (s[1] >= 0x19) {
+            const BYTE *u = s + 0x08;
+            bool ff = true, zero = true;
+
+            for (i = 0; i < 16; i++) {
+                ff &= u[i] == 0xFF;
+                zero &= u[i] == 0;
+            }
+            if (ff) {
+                virBufferAddLit(buf, "\tUUID: Not Present\n");
+            } else if (zero) {
+                virBufferAddLit(buf, "\tUUID: Not Settable\n");
+            } else if (raw->majorVersion > 2 ||
+                       (raw->majorVersion == 2 && raw->minorVersion >= 6)) {
+                /* little-endian time fields since SMBIOS 2.6 */
+                virBufferAsprintf(buf,
+                                  "\tUUID: %02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x\n",
+                                  u[3], u[2], u[1], u[0], u[5], u[4], u[7], u[6],
+                                  u[8], u[9], u[10], u[11], u[12], u[13], u[14], u[15]);
+            } else {
+                virBufferAsprintf(buf,
+                                  "\tUUID: %02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x\n",
+                                  u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7],
+                                  u[8], u[9], u[10], u[11], u[12], u[13], u[14], u[15]);
+            }
+        }
+        if (s[1] >= 0x1B) {
+            virBufferAsprintf(buf, "\tSKU Number: %s\n", DMI_STR(s, 0x19));
+            virBufferAsprintf(buf, "\tFamily: %s\n", DMI_STR(s, 0x1A));
+        }
+        break;
+
+    case 2:
+        virBufferAddLit(buf, "Base Board Information\n");
+        virBufferAsprintf(buf, "\tManufacturer: %s\n", DMI_STR(s, 0x04));
+        virBufferAsprintf(buf, "\tProduct Name: %s\n", DMI_STR(s, 0x05));
+        virBufferAsprintf(buf, "\tVersion: %s\n", DMI_STR(s, 0x06));
+        virBufferAsprintf(buf, "\tSerial Number: %s\n", DMI_STR(s, 0x07));
+        virBufferAsprintf(buf, "\tAsset Tag: %s\n", DMI_STR(s, 0x08));
+        if (s[1] > 0x0A)
+            virBufferAsprintf(buf, "\tLocation In Chassis: %s\n", DMI_STR(s, 0x0A));
+        break;
+
+    case 3: {
+        unsigned n = DMI_BYTE(s, 0x13), m = DMI_BYTE(s, 0x14);
+
+        virBufferAddLit(buf, "Chassis Information\n");
+        virBufferAsprintf(buf, "\tManufacturer: %s\n", DMI_STR(s, 0x04));
+        virBufferAsprintf(buf, "\tVersion: %s\n", DMI_STR(s, 0x06));
+        virBufferAsprintf(buf, "\tSerial Number: %s\n", DMI_STR(s, 0x07));
+        virBufferAsprintf(buf, "\tAsset Tag: %s\n", DMI_STR(s, 0x08));
+        if (s[1] > 0x15 + n * m)
+            virBufferAsprintf(buf, "\tSKU Number: %s\n", DMI_STR(s, 0x15 + n * m));
+        break;
+    }
+
+    case 4: {
+        unsigned eax = DMI_DWORD(s, 0x08);
+        unsigned family = (eax >> 8) & 0xF, model = (eax >> 4) & 0xF;
+        unsigned status = DMI_BYTE(s, 0x18);
+        unsigned clock = DMI_WORD(s, 0x12), speed = DMI_WORD(s, 0x14);
+
+        if (family == 0xF)
+            family += (eax >> 20) & 0xFF;
+        if (family == 0x6 || family >= 0xF)
+            model += ((eax >> 16) & 0xF) << 4;
+
+        virBufferAddLit(buf, "Processor Information\n");
+        virBufferAsprintf(buf, "\tSocket Designation: %s\n", DMI_STR(s, 0x04));
+        virBufferAsprintf(buf, "\tType: %s\n",
+                          DMI_BYTE(s, 0x05) == 3 ? "Central Processor" : "Other");
+        if (DMI_BYTE(s, 0x06) == 0xFE)
+            virBufferAsprintf(buf, "\tFamily: 0x%x\n", DMI_WORD(s, 0x28));
+        else
+            virBufferAsprintf(buf, "\tFamily: 0x%x\n", DMI_BYTE(s, 0x06));
+        virBufferAsprintf(buf, "\tManufacturer: %s\n", DMI_STR(s, 0x07));
+        virBufferAsprintf(buf, "\tSignature: Type %u, Family %u, Model %u, Stepping %u\n",
+                          (eax >> 12) & 0x3, family, model, eax & 0xF);
+        virBufferAsprintf(buf, "\tVersion: %s\n", DMI_STR(s, 0x10));
+        if (clock)
+            virBufferAsprintf(buf, "\tExternal Clock: %u MHz\n", clock);
+        else
+            virBufferAddLit(buf, "\tExternal Clock: Unknown\n");
+        if (speed)
+            virBufferAsprintf(buf, "\tMax Speed: %u MHz\n", speed);
+        else
+            virBufferAddLit(buf, "\tMax Speed: Unknown\n");
+        if (!(status & 0x40))
+            virBufferAddLit(buf, "\tStatus: Unpopulated\n");
+        else
+            virBufferAsprintf(buf, "\tStatus: Populated, %s\n",
+                              NULLSTR_EMPTY(cpuStatus[status & 0x7]));
+        if (s[1] > 0x22) {
+            virBufferAsprintf(buf, "\tSerial Number: %s\n", DMI_STR(s, 0x20));
+            virBufferAsprintf(buf, "\tPart Number: %s\n", DMI_STR(s, 0x22));
+        }
+        break;
+    }
+
+    case 11: {
+        BYTE count = DMI_BYTE(s, 0x04);
+
+        virBufferAddLit(buf, "OEM Strings\n");
+        for (i = 1; i <= count; i++)
+            virBufferAsprintf(buf, "\tString %zu: %s\n", i,
+                              virSysinfoWin32String(s, end, i));
+        break;
+    }
+
+    case 17: {
+        unsigned size = DMI_WORD(s, 0x0C);
+        unsigned speed = DMI_WORD(s, 0x15);
+        unsigned detail = DMI_WORD(s, 0x13);
+        BYTE ff = DMI_BYTE(s, 0x0E), type = DMI_BYTE(s, 0x12);
+        g_auto(virBuffer) details = VIR_BUFFER_INITIALIZER;
+
+        virBufferAddLit(buf, "Memory Device\n");
+        if (size == 0)
+            virBufferAddLit(buf, "\tSize: No Module Installed\n");
+        else if (size == 0xFFFF)
+            virBufferAddLit(buf, "\tSize: Unknown\n");
+        else if (size == 0x7FFF)
+            virSysinfoWin32Size(buf, "Size", DMI_DWORD(s, 0x1C) & 0x7FFFFFFF);
+        else if (size & 0x8000)
+            virBufferAsprintf(buf, "\tSize: %u kB\n", size & 0x7FFF);
+        else
+            virSysinfoWin32Size(buf, "Size", size);
+        virBufferAsprintf(buf, "\tForm Factor: %s\n",
+                          ff < G_N_ELEMENTS(formFactors) && formFactors[ff] ?
+                          formFactors[ff] : "Unknown");
+        virBufferAsprintf(buf, "\tLocator: %s\n", DMI_STR(s, 0x10));
+        virBufferAsprintf(buf, "\tBank Locator: %s\n", DMI_STR(s, 0x11));
+        virBufferAsprintf(buf, "\tType: %s\n",
+                          type < G_N_ELEMENTS(memTypes) && memTypes[type] ?
+                          memTypes[type] : "Unknown");
+        for (i = 1; i < G_N_ELEMENTS(typeDetails); i++) {
+            if (detail & (1u << i))
+                virBufferAsprintf(&details, "%s ", typeDetails[i]);
+        }
+        virBufferTrim(&details, " ");
+        virBufferAsprintf(buf, "\tType Detail: %s\n",
+                          virBufferUse(&details) ? virBufferCurrentContent(&details) : "None");
+        if (speed)
+            virBufferAsprintf(buf, "\tSpeed: %u MT/s\n", speed);
+        else
+            virBufferAddLit(buf, "\tSpeed: Unknown\n");
+        if (s[1] > 0x1A) {
+            virBufferAsprintf(buf, "\tManufacturer: %s\n", DMI_STR(s, 0x17));
+            virBufferAsprintf(buf, "\tSerial Number: %s\n", DMI_STR(s, 0x18));
+            virBufferAsprintf(buf, "\tPart Number: %s\n", DMI_STR(s, 0x1A));
+        }
+        break;
+    }
+    }
+    virBufferAddLit(buf, "\n");
+}
+
+#undef DMI_BYTE
+#undef DMI_WORD
+#undef DMI_DWORD
+#undef DMI_STR
+
+static char *
+virSysinfoWin32DMI(void)
+{
+    static const BYTE types[] = { 0, 1, 2, 3, 4, 11, 17 };
+    g_auto(virBuffer) buf = VIR_BUFFER_INITIALIZER;
+    g_autofree virSysinfoWin32RawSMBIOS *raw = NULL;
+    UINT size;
+    size_t t;
+
+    if ((size = GetSystemFirmwareTable('RSMB', 0, NULL, 0)) == 0) {
+        virReportError(VIR_ERR_INTERNAL_ERROR,
+                       _("Unable to read the SMBIOS table: Windows error %1$lu"),
+                       GetLastError());
+        return NULL;
+    }
+    raw = g_malloc0(size);
+    if (GetSystemFirmwareTable('RSMB', 0, raw, size) != size ||
+        size < sizeof(*raw) || raw->length > size - sizeof(*raw)) {
+        virReportError(VIR_ERR_INTERNAL_ERROR, "%s",
+                       _("Unable to read the SMBIOS table"));
+        return NULL;
+    }
+
+    /* by type, in the order of dmidecode -t */
+    for (t = 0; t < G_N_ELEMENTS(types); t++) {
+        const BYTE *s = raw->data;
+        const BYTE *end = raw->data + raw->length;
+
+        while (s + 4 <= end && s[1] >= 4 && s + s[1] <= end) {
+            const BYTE *next = s + s[1];
+
+            /* the strings, up to a double NUL */
+            while (next + 1 < end && (next[0] || next[1]))
+                next++;
+            next += 2;
+            if (s[0] == types[t])
+                virSysinfoWin32Struct(&buf, s, MIN(next, end), raw);
+            if (s[0] == 127)
+                break;
+            s = next;
+        }
+    }
+    return virBufferContentAndReset(&buf);
+}
+#endif /* WIN32 */
+
+
 virSysinfoDef *
 virSysinfoReadDMI(void)
 {
     g_autoptr(virSysinfoDef) ret = NULL;
     g_autofree char *outbuf = NULL;
+
+#ifdef WIN32
+    if (!(outbuf = virSysinfoWin32DMI()))
+        return NULL;
+#else
     g_autoptr(virCommand) cmd = NULL;
 
     cmd = virCommandNewArgList("dmidecode", "-q", "-t", "0,1,2,3,4,11,17", NULL);
     virCommandSetOutputBuffer(cmd, &outbuf);
     if (virCommandRun(cmd, NULL) < 0)
         return NULL;
+#endif
 
     ret = g_new0(virSysinfoDef, 1);
 
@@ -1250,23 +1564,18 @@ virSysinfoRead(void)
     return virSysinfoReadARM();
 #elif defined(__s390__) || defined(__s390x__)
     return virSysinfoReadS390();
-#elif !defined(WIN32) && \
-    (defined(__x86_64__) || \
+#elif (defined(__x86_64__) || \
      defined(__i386__) || \
      defined(__amd64__) || \
      defined(__riscv) || \
      defined(__mips__) || \
      defined(__loongarch__))
     return virSysinfoReadDMI();
-#else /* WIN32 || not supported arch */
-    /*
-     * this can probably be extracted from Windows using API or registry
-     * https://www.microsoft.com/whdc/system/platform/firmware/SMBIOS.mspx
-     */
+#else /* not supported arch */
     virReportSystemError(ENOSYS, "%s",
                          _("Host sysinfo extraction not supported on this platform"));
     return NULL;
-#endif /* WIN32 || not supported arch */
+#endif /* not supported arch */
 }
 
 
