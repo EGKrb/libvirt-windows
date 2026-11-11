@@ -451,9 +451,17 @@ virDomainInterfaceDeleteDevice(virDomainDef *def,
     case VIR_DOMAIN_NET_TYPE_BRIDGE:
     case VIR_DOMAIN_NET_TYPE_NETWORK: {
 #ifdef WIN32
-        /* the port of the switch (see qemuBuildInterfaceConnect) */
-        if (net->ifname)
-            virNetDevBridgeSwitchPortRemove(net->ifname);
+        /* the port of the switch (see qemuBuildInterfaceConnect), or the
+         * TAP-Windows adapter libvirt put in a network bridge of Windows,
+         * which outlives QEMU's handle */
+        if (net->ifname) {
+            g_autofree char *port = virNetDevBridgeSwitchPortPath(net->ifname);
+
+            if (virFileExists(port))
+                virNetDevBridgeSwitchPortRemove(net->ifname);
+            else if (net->managed_tap != VIR_TRISTATE_BOOL_NO)
+                ignore_value(virNetDevTapDelete(net->ifname, net->backend.tap));
+        }
 #endif
 #ifdef VIR_NETDEV_TAP_REQUIRE_MANUAL_CLEANUP
         const virNetDevVPortProfile *vport = virDomainNetGetActualVirtPortProfile(net);

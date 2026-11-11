@@ -3919,6 +3919,17 @@ qemuBuildHostNetProps(virDomainObj *vm,
         g_autoptr(virJSONValue) addrprops = NULL;
         qemuDomainObjPrivate *priv = vm->privateData;
 
+        /* a network bridge of Windows: the TAP-Windows adapter libvirt put
+         * in it (qemuBuildInterfaceConnect), as for type='ethernet' */
+        if (!virFileExists(path)) {
+            if (virJSONValueObjectAdd(&netprops,
+                                      "s:type", "tap",
+                                      "s:ifname", net->ifname,
+                                      NULL) < 0)
+                return NULL;
+            break;
+        }
+
         if (virJSONValueObjectAdd(&addrprops,
                                   "s:type", "unix",
                                   "s:path", path,
@@ -8945,15 +8956,31 @@ qemuBuildInterfaceConnect(virDomainObj *vm,
     case VIR_DOMAIN_NET_TYPE_BRIDGE:
 #ifdef WIN32
     {
-        /* no TAP device to add to the bridge: QEMU connects to its switch
-         * (qemuBuildHostNetProps), which must exist as a bridge must */
+        /* the bridge of a libvirt network: no TAP device, QEMU connects to
+         * its switch (qemuBuildHostNetProps) */
         const char *brname = virDomainNetGetActualBridgeName(net);
         g_autofree char *path = brname ? virNetDevBridgeSwitchSocketPath(brname) : NULL;
 
-        if (!path || !virFileExists(path)) {
-            virReportError(VIR_ERR_OPERATION_INVALID,
-                           _("bridge '%1$s' does not exist"), NULLSTR(brname));
+        if (!path) {
+            virReportError(VIR_ERR_INTERNAL_ERROR, "%s", _("Missing bridge name"));
             return -1;
+        }
+        if (!virFileExists(path)) {
+            /* a network bridge of Windows: a TAP-Windows adapter in it, as a
+             * TAP device in a bridge of Linux; QEMU opens it by its name */
+            if (virNetDevExists(brname) != 1) {
+                virReportError(VIR_ERR_OPERATION_INVALID,
+                               _("bridge '%1$s' does not exist"), brname);
+                return -1;
+            }
+            if (virDomainInterfaceBridgeConnect(vm->def, net,
+                                                tapfd, &tapfdSize,
+                                                priv->driver->privileged,
+                                                priv->driver->ebtables,
+                                                priv->driver->config->macFilter,
+                                                cfg->bridgeHelperName) < 0)
+                return -1;
+            break;
         }
         /* the port has the name a TAP device would have, for the QoS,
          * domiftune and domifstat of the interface */

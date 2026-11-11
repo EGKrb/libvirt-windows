@@ -223,37 +223,21 @@ int virNetDevExists(const char *ifname)
 }
 #elif defined(WIN32)
 /* A device is a switch of a libvirt network (its bridge) or an adapter of
- * the host, by its name in the Network Connections of Windows */
+ * the host, by its name in the Network Connections of Windows (those in a
+ * network bridge included: they have no IP, GetAdaptersAddresses skips them) */
 int virNetDevExists(const char *ifname)
 {
     g_autofree char *sock = virNetDevBridgeSwitchSocketPath(ifname);
-    g_autofree wchar_t *wname = g_utf8_to_utf16(ifname, -1, NULL, NULL, NULL);
-    g_autofree IP_ADAPTER_ADDRESSES *addrs = NULL;
-    IP_ADAPTER_ADDRESSES *a;
-    ULONG size = 16 * 1024;
-    ULONG rc;
+    g_autofree wchar_t *wname = (wchar_t *)g_utf8_to_utf16(ifname, -1, NULL, NULL, NULL);
+    NET_LUID luid;
 
     if (virFileExists(sock))
         return 1;
-
-    do {
-        g_free(addrs);
-        addrs = g_malloc(size);
-        rc = GetAdaptersAddresses(AF_UNSPEC,
-                                  GAA_FLAG_SKIP_UNICAST | GAA_FLAG_SKIP_ANYCAST |
-                                  GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER,
-                                  NULL, addrs, &size);
-    } while (rc == ERROR_BUFFER_OVERFLOW);
-
-    if (rc != NO_ERROR) {
-        virReportSystemError(EIO, _("Unable to check interface %1$s"), ifname);
+    if (!wname) {
+        virReportSystemError(EINVAL, _("Unable to check interface %1$s"), ifname);
         return -1;
     }
-    for (a = addrs; a; a = a->Next) {
-        if (wname && a->FriendlyName && wcscmp(a->FriendlyName, wname) == 0)
-            return 1;
-    }
-    return 0;
+    return ConvertInterfaceAliasToLuid(wname, &luid) == NO_ERROR ? 1 : 0;
 }
 #else
 int virNetDevExists(const char *ifname)
@@ -485,6 +469,23 @@ int virNetDevGetMTU(const char *ifname)
 
     return ifr.ifr_mtu;
 }
+#elif defined(WIN32)
+int virNetDevGetMTU(const char *ifname)
+{
+    MIB_IF_ROW2 row = { 0 };
+    int ifindex;
+
+    if (virNetDevGetIndex(ifname, &ifindex) < 0)
+        return -1;
+    row.InterfaceIndex = ifindex;
+    if (GetIfEntry2(&row) != NO_ERROR) {
+        virReportSystemError(ENODEV,
+                             _("Cannot get interface MTU on '%1$s'"),
+                             ifname);
+        return -1;
+    }
+    return row.Mtu;
+}
 #else
 int virNetDevGetMTU(const char *ifname)
 {
@@ -524,6 +525,42 @@ int virNetDevSetMTU(const char *ifname, int mtu)
         return -1;
     }
 
+    return 0;
+}
+#elif defined(WIN32)
+/* the IP MTU of the interface (an adapter in a bridge has no IP: its
+ * MTU is then left as it is when it already has the one asked for) */
+int virNetDevSetMTU(const char *ifname, int mtu)
+{
+    MIB_IPINTERFACE_ROW row;
+    int ifindex;
+    int cur;
+
+    if ((cur = virNetDevGetMTU(ifname)) < 0)
+        return -1;
+    if (cur == mtu)
+        return 0;
+    if (virNetDevGetIndex(ifname, &ifindex) < 0)
+        return -1;
+
+    InitializeIpInterfaceEntry(&row);
+    row.Family = AF_INET;
+    row.InterfaceIndex = ifindex;
+    if (GetIpInterfaceEntry(&row) != NO_ERROR) {
+        virReportSystemError(ENODEV,
+                             _("Cannot set interface MTU on '%1$s'"),
+                             ifname);
+        return -1;
+    }
+    row.NlMtu = mtu;
+    /* SitePrefixLength must be 0 when setting an IPv4 interface */
+    row.SitePrefixLength = 0;
+    if (SetIpInterfaceEntry(&row) != NO_ERROR) {
+        virReportSystemError(EACCES,
+                             _("Cannot set interface MTU on '%1$s'"),
+                             ifname);
+        return -1;
+    }
     return 0;
 }
 #else

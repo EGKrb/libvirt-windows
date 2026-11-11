@@ -18,18 +18,23 @@
 
 #include <config.h>
 
+/* before configmake.h, whose DATADIR the Windows headers use */
+#ifdef WIN32
+# define WIN32_LEAN_AND_MEAN
+# include <winsock2.h>
+# include <windows.h>
+# include <iphlpapi.h>
+#endif
+
 #include "virnetdevbridge.h"
 #include "virnetdev.h"
 #include "virerror.h"
 #include "virfile.h"
+#include "vircommand.h"
 #include "virlog.h"
 #include "virstring.h"
 #include "configmake.h"
 
-#ifdef WIN32
-# define WIN32_LEAN_AND_MEAN
-# include <windows.h>
-#endif
 
 #ifdef WITH_NET_IF_H
 # include <net/if.h>
@@ -854,6 +859,75 @@ int virNetDevBridgeAddPort(const char *brname,
 
     return 0;
 }
+#elif defined(WIN32)
+/*
+ * A network bridge of Windows (MAC bridge), managed with "netsh bridge" as
+ * a bridge of Linux is with ip(8).  netsh names a bridge by its GUID: that
+ * of its adapter ("Microsoft Network Adapter Multiplexor Driver"), whose
+ * connection name is the bridge name for libvirt.
+ */
+static int
+virNetDevBridgeWin32Guid(const char *brname, char **guid)
+{
+    g_autofree wchar_t *alias = (wchar_t *)g_utf8_to_utf16(brname, -1, NULL, NULL, NULL);
+    NET_LUID luid;
+    GUID id;
+
+    if (!alias ||
+        ConvertInterfaceAliasToLuid(alias, &luid) != NO_ERROR ||
+        ConvertInterfaceLuidToGuid(&luid, &id) != NO_ERROR) {
+        virReportError(VIR_ERR_OPERATION_INVALID,
+                       _("No network bridge named '%1$s'"), brname);
+        return -1;
+    }
+    *guid = g_strdup_printf("{%08lX-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}",
+                            (unsigned long)id.Data1, id.Data2, id.Data3,
+                            id.Data4[0], id.Data4[1], id.Data4[2], id.Data4[3],
+                            id.Data4[4], id.Data4[5], id.Data4[6], id.Data4[7]);
+    return 0;
+}
+
+
+/* netsh bridge @verb @ifname @prep the bridge @brname */
+static int
+virNetDevBridgeWin32Port(const char *brname,
+                         const char *ifname,
+                         const char *verb,
+                         const char *prep)
+{
+    g_autofree char *guid = NULL;
+    g_autofree char *out = NULL;
+    g_autoptr(virCommand) cmd = NULL;
+    int status;
+
+    if (virNetDevBridgeWin32Guid(brname, &guid) < 0)
+        return -1;
+
+    cmd = virCommandNewArgList("netsh", "bridge", verb, ifname, prep, guid, NULL);
+    virCommandSetOutputBuffer(cmd, &out);
+    if (virCommandRun(cmd, &status) < 0)
+        return -1;
+    if (status != 0) {
+        virReportError(VIR_ERR_SYSTEM_ERROR,
+                       _("Unable to %1$s bridge %2$s port %3$s: %4$s"),
+                       verb, brname, ifname, g_strstrip(out));
+        return -1;
+    }
+    return 0;
+}
+
+
+int virNetDevBridgeAddPort(const char *brname,
+                           const char *ifname,
+                           const virNetDevVlan *virtVlan)
+{
+    if (virtVlan && virtVlan->nTags > 0) {
+        virReportError(VIR_ERR_CONFIG_UNSUPPORTED, "%s",
+                       _("VLAN tags are not supported on a network bridge of Windows"));
+        return -1;
+    }
+    return virNetDevBridgeWin32Port(brname, ifname, "add", "to");
+}
 #else
 int virNetDevBridgeAddPort(const char *brname,
                            const char *ifname,
@@ -919,6 +993,12 @@ int virNetDevBridgeRemovePort(const char *brname,
     }
 
     return 0;
+}
+#elif defined(WIN32)
+int virNetDevBridgeRemovePort(const char *brname,
+                              const char *ifname)
+{
+    return virNetDevBridgeWin32Port(brname, ifname, "remove", "from");
 }
 #else
 int virNetDevBridgeRemovePort(const char *brname,

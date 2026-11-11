@@ -1094,7 +1094,8 @@ int virNetDevTapCreateInBridgePort(const char *brname,
     for (i = 0; i < tapfdSize && tapfd[i] >= 0; i++)
         VIR_FORCE_CLOSE(tapfd[i]);
 
-#if defined(VIR_NETDEV_TAP_REQUIRE_MANUAL_CLEANUP)
+#if defined(VIR_NETDEV_TAP_REQUIRE_MANUAL_CLEANUP) || defined(WIN32)
+    /* (Windows: a TAP-Windows adapter outlives its handles) */
     if (!(flags & VIR_NETDEV_TAP_CREATE_ALLOW_EXISTING)) {
         virErrorPtr err;
 
@@ -1102,7 +1103,7 @@ int virNetDevTapCreateInBridgePort(const char *brname,
         ignore_value(virNetDevTapDelete(*ifname, tunpath));
         virErrorRestore(&err);
     }
-#endif /* VIR_NETDEV_TAP_REQUIRE_MANUAL_CLEANUP */
+#endif /* VIR_NETDEV_TAP_REQUIRE_MANUAL_CLEANUP || WIN32 */
 
     return -1;
 }
