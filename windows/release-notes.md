@@ -27,10 +27,12 @@ The source of libvirt itself is the repository at this tag (*Source code* below)
 
 ## What works
 
-Daemons (modular and `libvirtd`), secrets, QEMU guests with WHPX (lifecycle, `virsh console`, screenshots, QMP, NIC hotplug, memory balloon), user networking, virtual networks in NAT and isolated modes with DHCP, DHCPv6, DNS, IPv6, QoS and statistics. The [status table](https://github.com/EGKrb/libvirt-windows#status) lists what is not done yet: storage, nodedev, migration, bridges to the host LAN.
+Daemons (modular and `libvirtd`), secrets, QEMU guests with WHPX (lifecycle, `virsh console`, screenshots, QMP, NIC hotplug, memory balloon, save/restore, dump, live migration), user networking, virtual networks (NAT, isolated, `route` and `open` through Wintun) with DHCP, DHCPv6, DNS, IPv6, QoS, statistics and Windows firewall rules, TAP-Windows interfaces and bridges to the host's LAN. The [status table](https://github.com/EGKrb/libvirt-windows#status) lists what is not done yet: storage, nodedev, snapshots, migration with storage copy.
 
-New in 0.2.0, tested in a Windows 11 26300 virtual machine:
+New in 0.3.0, tested on Windows 11 26300:
 
-- `<interface type='ethernet'>` on TAP-Windows adapters: libvirt creates the adapter, names it after the interface, gives it the `<source><ip/></source>` addresses and routes, and deletes it with the guest. Needs the TAP-Windows6 driver of OpenVPN (9.27 or later) in the driver store, and administrator rights.
-- Forward modes `route` and `open`, through a Wintun adapter: put `wintun.dll` (amd64, https://www.wintun.net) in `libexec`; administrator rights.
-- Windows firewall rules as firewalld's `libvirt` zone: a `route` network (or `open` with `zone='libvirt'`) lets its guests reach the host by ICMP, ICMPv6, DHCP, DHCPv6, DNS, SSH and TFTP; the rules (group `libvirt`) go with the network.
+- `virsh save`, `restore`, `managedsave` and `dump`, and live migration (`virsh migrate --live`, direct or `--p2p`) between libvirt instances. They need the updated [QEMU patch](https://github.com/EGKrb/libvirt-windows/tree/main/windows/qemu), which adds to WHPX what migration needs (dirty page tracking, the guest's Hyper-V and CPU state, the partition's clock). With it, guests use the local APIC timer rather than Hyper-V's synthetic timers, whose state cannot be saved.
+- Bridges to the host's LAN: an `<interface type='bridge'>`, or a network `<forward mode='bridge'/>`, on a network bridge of Windows named as the bridge (`br0`) gets a TAP-Windows adapter that libvirt adds to the bridge and deletes with the guest. See the README for making the bridge.
+- `<interface type='ethernet'>` with `<target dev='NAME' managed='no'/>`: an existing TAP-Windows adapter, used as it is and left after the guest.
+
+Since 0.2.0: TAP-Windows interfaces, forward modes `route` and `open` through Wintun (`wintun.dll` in `libexec`), and Windows firewall rules as firewalld's `libvirt` zone. TAP-Windows and Wintun need the TAP-Windows6 driver of OpenVPN (9.27 or later) or `wintun.dll`, and administrator rights.
