@@ -1152,7 +1152,13 @@ virNetSSHSessionConnect(virNetSSHSession *sess,
         goto error;
 
     /* open session */
+#ifdef WIN32
+    /* libssh2 takes the SOCKET of Winsock, not a C runtime fd */
+    ret = libssh2_session_handshake(sess->session,
+                                    (libssh2_socket_t)_get_osfhandle(sock));
+#else
     ret = libssh2_session_handshake(sess->session, sock);
+#endif
     /* libssh2 is in blocking mode, so EAGAIN will never happen */
     if (ret < 0) {
         libssh2_session_last_error(sess->session, &errmsg, NULL, 0);

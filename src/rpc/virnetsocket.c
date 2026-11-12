@@ -801,34 +801,121 @@ int virNetSocketNewConnectCommand(virCommand *cmd,
     return -1;
 }
 #else /* WIN32 */
-/* The child uses its end of the pair as a plain file for stdin and stdout */
+/*
+ * The child (ssh, of Windows or of MSYS2) gets plain pipes for its stdin
+ * and stdout: few programs take a socket for them on Windows.  Two threads
+ * relay them to the end of a socket pair, the other end being libvirt's.
+ */
+typedef struct _virNetSocketCommandRelay virNetSocketCommandRelay;
+struct _virNetSocketCommandRelay {
+    int sock;                   /* the end of the pair for the child */
+    int toChild;                /* write end of the child's stdin */
+    int fromChild;              /* read end of the child's stdout */
+    int refs;                   /* threads still relaying (atomic) */
+};
+
+
+static void
+virNetSocketCommandRelayUnref(virNetSocketCommandRelay *relay)
+{
+    if (!g_atomic_int_dec_and_test(&relay->refs))
+        return;
+    vir_closesocket(relay->sock);
+    g_free(relay);
+}
+
+
+/* what libvirt sends, to the child's stdin */
+static gpointer
+virNetSocketCommandRelayIn(gpointer opaque)
+{
+    virNetSocketCommandRelay *relay = opaque;
+    g_autofree char *buf = g_new(char, 16384);
+    ssize_t got;
+
+    while ((got = virSocketRecv(relay->sock, buf, 16384)) > 0) {
+        if (safewrite(relay->toChild, buf, got) != got)
+            break;
+    }
+    /* the child sees the end of its input */
+    VIR_FORCE_CLOSE(relay->toChild);
+    virNetSocketCommandRelayUnref(relay);
+    return NULL;
+}
+
+
+/* what the child writes, to libvirt */
+static gpointer
+virNetSocketCommandRelayOut(gpointer opaque)
+{
+    virNetSocketCommandRelay *relay = opaque;
+    g_autofree char *buf = g_new(char, 16384);
+    ssize_t got;
+
+    /* what is there, not a full buffer (saferead): a dialogue */
+    while ((got = read(relay->fromChild, buf, 16384)) > 0 ||
+           (got < 0 && errno == EINTR)) {
+        ssize_t off = 0;
+
+        if (got < 0)
+            continue;
+        while (off < got) {
+            ssize_t sent = virSocketSend(relay->sock, buf + off, got - off);
+
+            if (sent <= 0)
+                goto done;
+            off += sent;
+        }
+    }
+ done:
+    VIR_FORCE_CLOSE(relay->fromChild);
+    /* libvirt sees the end of the stream */
+    shutdown((SOCKET)_get_osfhandle(relay->sock), SD_SEND);
+    virNetSocketCommandRelayUnref(relay);
+    return NULL;
+}
+
+
 int virNetSocketNewConnectCommand(virCommand *cmd,
                                   virNetSocket **retsock)
 {
     pid_t pid = 0;
     int sv[2] = { -1, -1 };
     int errfd[2] = { -1, -1 };
+    int infd[2] = { -1, -1 };
+    int outfd[2] = { -1, -1 };
+    virNetSocketCommandRelay *relay;
 
     *retsock = NULL;
 
-    if (virSocketPair(sv) < 0) {
+    if (virSocketPairRelay(sv) < 0) {
         virReportSystemError(errno, "%s",
                              _("unable to create socket pair"));
         goto error;
     }
 
-    if (virPipe(errfd) < 0)
+    if (virPipe(errfd) < 0 || virPipe(infd) < 0 || virPipe(outfd) < 0)
         goto error;
 
-    virCommandSetInputFD(cmd, sv[1]);
-    virCommandSetOutputFD(cmd, &sv[1]);
+    virCommandSetInputFD(cmd, infd[0]);
+    virCommandSetOutputFD(cmd, &outfd[1]);
     virCommandSetErrorFD(cmd, &errfd[1]);
 
     if (virCommandRunAsync(cmd, &pid) < 0)
         goto error;
 
-    VIR_FORCE_CLOSE(sv[1]);
+    VIR_FORCE_CLOSE(infd[0]);
+    VIR_FORCE_CLOSE(outfd[1]);
     VIR_FORCE_CLOSE(errfd[1]);
+
+    relay = g_new0(virNetSocketCommandRelay, 1);
+    relay->sock = sv[1];
+    relay->toChild = infd[1];
+    relay->fromChild = outfd[0];
+    relay->refs = 2;
+    sv[1] = infd[1] = outfd[0] = -1;
+    g_thread_unref(g_thread_new("command-in", virNetSocketCommandRelayIn, relay));
+    g_thread_unref(g_thread_new("command-out", virNetSocketCommandRelayOut, relay));
 
     if (!(*retsock = virNetSocketNew(NULL, NULL, true, sv[0], errfd[0], pid, false)))
         goto error;
@@ -837,9 +924,14 @@ int virNetSocketNewConnectCommand(virCommand *cmd,
 
  error:
     VIR_FORCE_CLOSE(sv[0]);
-    VIR_FORCE_CLOSE(sv[1]);
+    if (sv[1] >= 0)
+        vir_closesocket(sv[1]);
     VIR_FORCE_CLOSE(errfd[0]);
     VIR_FORCE_CLOSE(errfd[1]);
+    VIR_FORCE_CLOSE(infd[0]);
+    VIR_FORCE_CLOSE(infd[1]);
+    VIR_FORCE_CLOSE(outfd[0]);
+    VIR_FORCE_CLOSE(outfd[1]);
 
     virCommandAbort(cmd);
 

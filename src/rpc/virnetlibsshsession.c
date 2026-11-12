@@ -1062,8 +1062,18 @@ virNetLibsshSessionConnect(virNetLibsshSession *sess,
         goto error;
 
     /* set the socket FD for the libssh session */
+#ifdef WIN32
+    {
+        /* libssh takes the SOCKET of Winsock, not a C runtime fd */
+        socket_t winsock = (socket_t)_get_osfhandle(sock);
+
+        if ((ret = ssh_options_set(sess->session, SSH_OPTIONS_FD, &winsock)) < 0)
+            goto error;
+    }
+#else
     if ((ret = ssh_options_set(sess->session, SSH_OPTIONS_FD, &sock)) < 0)
         goto error;
+#endif
 
     /* open session */
     ret = ssh_connect(sess->session);

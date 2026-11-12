@@ -417,6 +417,22 @@ vir_socket(int domain, int type, int protocol)
     return SK2FD(sk);
 }
 
+
+/* An overlapped socket: several threads can send and receive on it at
+ * once, which the sockets of vir_socket serialize; for recv and send only */
+static int
+vir_socket_overlapped(int domain, int type, int protocol)
+{
+    SOCKET sk = WSASocket(domain, type, protocol, NULL, 0, WSA_FLAG_OVERLAPPED);
+
+    if (sk == INVALID_SOCKET) {
+        set_errno();
+        return -1;
+    }
+
+    return SK2FD(sk);
+}
+
 #endif /* WIN32 */
 
 
@@ -503,6 +519,59 @@ virSocketGLibFDFree(int gfd G_GNUC_UNUSED)
 }
 
 
+#ifdef WIN32
+/* Two connected TCP sockets of 127.0.0.1, through a listener on a port
+ * Windows picks; the accepted one must come from the connecting one */
+static int
+virSocketPairLoopback(int fds[2], bool overlapped)
+{
+    struct sockaddr_in addr = { .sin_family = AF_INET };
+    struct sockaddr_in peer;
+    struct sockaddr_in local;
+    socklen_t len = sizeof(addr);
+    int listenfd = -1;
+    int saved;
+
+    fds[0] = fds[1] = -1;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+
+    if ((listenfd = vir_socket(AF_INET, SOCK_STREAM, 0)) < 0 ||
+        vir_bind(listenfd, (struct sockaddr *) &addr, sizeof(addr)) < 0 ||
+        vir_getsockname(listenfd, (struct sockaddr *) &addr, &len) < 0 ||
+        vir_listen(listenfd, 1) < 0 ||
+        (fds[1] = (overlapped ? vir_socket_overlapped : vir_socket)(AF_INET, SOCK_STREAM, 0)) < 0 ||
+        vir_connect(fds[1], (struct sockaddr *) &addr, sizeof(addr)) < 0)
+        goto error;
+
+    len = sizeof(peer);
+    if ((fds[0] = vir_accept(listenfd, (struct sockaddr *) &peer, &len)) < 0)
+        goto error;
+    len = sizeof(local);
+    if (vir_getsockname(fds[1], (struct sockaddr *) &local, &len) < 0 ||
+        peer.sin_port != local.sin_port) {
+        errno = EACCES;
+        goto error;
+    }
+
+    vir_closesocket(listenfd);
+    return 0;
+
+ error:
+    saved = errno;
+    if (listenfd >= 0)
+        vir_closesocket(listenfd);
+    if (fds[0] >= 0)
+        vir_closesocket(fds[0]);
+    if (fds[1] >= 0)
+        vir_closesocket(fds[1]);
+    fds[0] = fds[1] = -1;
+    errno = saved;
+    return -1;
+}
+#endif
+
+
 /**
  * virSocketPair:
  * @fds: filled with two connected sockets
@@ -513,12 +582,10 @@ virSocketGLibFDFree(int gfd G_GNUC_UNUSED)
  *
  * Returns 0 on success, -1 with errno set on failure.
  */
-int
-virSocketPair(int fds[2])
+#ifdef WIN32
+static int
+virSocketPairFull(int fds[2], bool overlapped)
 {
-#ifndef WIN32
-    return socketpair(PF_UNIX, SOCK_STREAM, 0, fds);
-#else
     static int counter;
     g_autofree char *path = NULL;
     struct sockaddr_un addr = { .sun_family = AF_UNIX };
@@ -538,7 +605,7 @@ virSocketPair(int fds[2])
     if ((listenfd = vir_socket(AF_UNIX, SOCK_STREAM, 0)) < 0 ||
         vir_bind(listenfd, (struct sockaddr *) &addr, sizeof(addr)) < 0 ||
         vir_listen(listenfd, 1) < 0 ||
-        (fds[1] = vir_socket(AF_UNIX, SOCK_STREAM, 0)) < 0 ||
+        (fds[1] = (overlapped ? vir_socket_overlapped : vir_socket)(AF_UNIX, SOCK_STREAM, 0)) < 0 ||
         vir_connect(fds[1], (struct sockaddr *) &addr, sizeof(addr)) < 0 ||
         (fds[0] = vir_accept(listenfd, NULL, NULL)) < 0)
         goto error;
@@ -558,8 +625,42 @@ virSocketPair(int fds[2])
     if (fds[1] >= 0)
         vir_closesocket(fds[1]);
     fds[0] = fds[1] = -1;
+
+    /* the temporary folder of some sessions (sshd of MSYS2) cannot hold a
+     * UNIX socket: the loopback, which needs no folder */
+    if (virSocketPairLoopback(fds, overlapped) == 0)
+        return 0;
     errno = saved;
     return -1;
+}
+
+
+/**
+ * virSocketPairRelay:
+ * @fds: filled with two connected sockets
+ *
+ * virSocketPair, but @fds[1] is overlapped, for the threads that relay a
+ * pipe to it (Windows serializes the I/O of a socket that is not: a thread
+ * blocked in recv holds the send of another).  @fds[1] is for recv, send
+ * and shutdown only.
+ *
+ * Returns 0 on success, -1 with errno set on failure.
+ */
+int
+virSocketPairRelay(int fds[2])
+{
+    return virSocketPairFull(fds, true);
+}
+#endif /* WIN32 */
+
+
+int
+virSocketPair(int fds[2])
+{
+#ifndef WIN32
+    return socketpair(PF_UNIX, SOCK_STREAM, 0, fds);
+#else
+    return virSocketPairFull(fds, false);
 #endif
 }
 

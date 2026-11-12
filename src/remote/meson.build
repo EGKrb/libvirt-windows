@@ -318,6 +318,9 @@ if conf.has('WITH_REMOTE')
       'sources': [
         virt_ssh_helper_sources
       ],
+      'deps': [
+        win32_dep,
+      ],
       'install_dir': bindir,
     }
   endif

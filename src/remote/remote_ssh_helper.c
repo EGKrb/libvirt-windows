@@ -21,8 +21,10 @@
 #include <config.h>
 
 #include <unistd.h>
+#include <fcntl.h>
 
 #include "rpc/virnetsocket.h"
+#include "virsocket.h"
 #include "viralloc.h"
 #include "virlog.h"
 #include "virgettext.h"
@@ -287,10 +289,116 @@ virRemoteSSHHelperEventOnStdout(int watch G_GNUC_UNUSED,
 }
 
 
+#ifdef WIN32
+/*
+ * The event loop of Windows watches sockets only: stdin and stdout that are
+ * pipes (as sshd and ssh.exe give them) are relayed by two threads to the
+ * end of a socket pair, the other end of which is watched instead.
+ */
+typedef struct {
+    int sock;
+    int refs;                   /* threads still relaying (atomic) */
+} virRemoteSSHHelperRelay;
+
+
+static void
+virRemoteSSHHelperRelayUnref(virRemoteSSHHelperRelay *relay)
+{
+    if (!g_atomic_int_dec_and_test(&relay->refs))
+        return;
+    vir_closesocket(relay->sock);
+    g_free(relay);
+}
+
+
+static gpointer
+virRemoteSSHHelperRelayIn(gpointer opaque)
+{
+    virRemoteSSHHelperRelay *relay = opaque;
+    g_autofree char *buf = g_new(char, SSH_BUF_SIZE);
+    ssize_t got;
+
+    /* what is there, not a full buffer (saferead): a dialogue */
+    while ((got = read(STDIN_FILENO, buf, SSH_BUF_SIZE)) > 0 ||
+           (got < 0 && errno == EINTR)) {
+        ssize_t off = 0;
+
+        if (got < 0)
+            continue;
+        while (off < got) {
+            ssize_t sent = virSocketSend(relay->sock, buf + off, got - off);
+
+            if (sent <= 0)
+                goto done;
+            off += sent;
+        }
+    }
+ done:
+    shutdown((SOCKET)_get_osfhandle(relay->sock), SD_SEND);
+    virRemoteSSHHelperRelayUnref(relay);
+    return NULL;
+}
+
+
+static gpointer
+virRemoteSSHHelperRelayOut(gpointer opaque)
+{
+    virRemoteSSHHelperRelay *relay = opaque;
+    g_autofree char *buf = g_new(char, SSH_BUF_SIZE);
+    ssize_t got;
+
+    while ((got = virSocketRecv(relay->sock, buf, SSH_BUF_SIZE)) > 0) {
+        if (safewrite(STDOUT_FILENO, buf, got) != got)
+            break;
+    }
+    close(STDOUT_FILENO);
+    virRemoteSSHHelperRelayUnref(relay);
+    return NULL;
+}
+
+
+/* the fd to watch for stdin and stdout: themselves if a socket */
+static int
+virRemoteSSHHelperStdio(void)
+{
+    virRemoteSSHHelperRelay *relay;
+    int type;
+    socklen_t len = sizeof(type);
+    int sv[2];
+
+    if (getsockopt(STDIN_FILENO, SOL_SOCKET, SO_TYPE, (char *)&type, &len) == 0)
+        return STDIN_FILENO;
+
+    /* the C runtime opens them in text mode, which would translate the
+     * line ends of the binary stream */
+    _setmode(STDIN_FILENO, _O_BINARY);
+    _setmode(STDOUT_FILENO, _O_BINARY);
+
+    if (virSocketPairRelay(sv) < 0) {
+        virReportSystemError(errno, "%s", _("unable to create socket pair"));
+        return -1;
+    }
+    relay = g_new0(virRemoteSSHHelperRelay, 1);
+    relay->sock = sv[1];
+    relay->refs = 2;
+    g_thread_unref(g_thread_new("stdin-relay", virRemoteSSHHelperRelayIn, relay));
+    g_thread_unref(g_thread_new("stdout-relay", virRemoteSSHHelperRelayOut, relay));
+    return sv[0];
+}
+#endif /* WIN32 */
+
+
 static int
 virRemoteSSHHelperRun(virNetSocket *sock)
 {
     int ret = -1;
+#ifdef WIN32
+    int stdinFD;
+    int stdoutFD;
+#else
+    int stdinFD = STDIN_FILENO;
+    int stdoutFD = STDOUT_FILENO;
+#endif
     virRemoteSSHHelper proxy = {
         .sock = sock,
         .sockEvents = VIR_EVENT_HANDLE_READABLE,
@@ -312,7 +420,21 @@ virRemoteSSHHelperRun(virNetSocket *sock)
 
     virEventRegisterDefaultImpl();
 
-    if ((proxy.stdinWatch = virEventAddHandle(STDIN_FILENO,
+#ifdef WIN32
+    if ((stdinFD = virRemoteSSHHelperStdio()) < 0)
+        goto cleanup;
+    /* stdin and stdout are the same socket, or the pair relaying them;
+     * the event loop takes one watch by fd: a second fd of that socket, as
+     * a child has for a socket it gets as stdin and stdout */
+    if (stdinFD == STDIN_FILENO) {
+        stdoutFD = STDOUT_FILENO;
+    } else if ((stdoutFD = _open_osfhandle(_get_osfhandle(stdinFD), 0)) < 0) {
+        virReportSystemError(errno, "%s", _("Unable to watch the relayed stdout"));
+        goto cleanup;
+    }
+#endif
+
+    if ((proxy.stdinWatch = virEventAddHandle(stdinFD,
                                               VIR_EVENT_HANDLE_READABLE,
                                               virRemoteSSHHelperEventOnStdin,
                                               &proxy,
@@ -322,7 +444,7 @@ virRemoteSSHHelperRun(virNetSocket *sock)
         goto cleanup;
     }
 
-    if ((proxy.stdoutWatch = virEventAddHandle(STDOUT_FILENO,
+    if ((proxy.stdoutWatch = virEventAddHandle(stdoutFD,
                                                0,
                                                virRemoteSSHHelperEventOnStdout,
                                                &proxy,

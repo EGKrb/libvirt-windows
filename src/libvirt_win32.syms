@@ -21,6 +21,7 @@ vir_recv;
 vir_send;
 vir_setsockopt;
 vir_socket;
+virSocketPairRelay;
 
 # util/virutsname.h
 virWin32Uname;

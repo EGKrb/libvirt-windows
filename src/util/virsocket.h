@@ -21,6 +21,9 @@
 #include "internal.h"
 
 int virSocketPair(int fds[2]);
+#ifdef WIN32
+int virSocketPairRelay(int fds[2]);
+#endif
 int virSocketGLibFD(int fd);
 void virSocketGLibFDFree(int gfd);
 
