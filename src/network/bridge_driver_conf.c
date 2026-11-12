@@ -137,6 +137,10 @@ virNetworkLoadDriverConfig(virNetworkDriverConfig *cfg G_GNUC_UNUSED,
             break;
         }
 
+        case VIR_FIREWALL_BACKEND_NETSWITCH:
+            /* the firewall of nwfilter on Windows, not of networks */
+            break;
+
         case VIR_FIREWALL_BACKEND_LAST:
             virReportEnumRangeError(virFirewallBackend, fwBackends[i]);
             return -1;

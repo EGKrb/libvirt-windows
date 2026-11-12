@@ -1110,7 +1110,12 @@ libparted_version = '1.8.0'
 libparted_dep = dependency('libparted', version: '>=' + libparted_version, required: get_option('storage_disk'))
 
 libpcap_version = '1.5.0'
-if not get_option('libpcap').disabled()
+if host_machine.system() == 'windows' and not get_option('libpcap').disabled()
+  # nwfilter captures on the monitor sockets of the network switch
+  # (src/nwfilter/nwfilter_win32_pcap.c)
+  libpcap_dep = dependency('', required: false)
+  conf.set('WITH_LIBPCAP', 1)
+elif not get_option('libpcap').disabled()
   libpcap_dep = dependency('pcap', version: '>=' + libpcap_version, required: get_option('libpcap'))
   if libpcap_dep.found()
     conf.set('WITH_LIBPCAP', 1)
@@ -1337,6 +1342,7 @@ if host_machine.system() == 'windows'
   iphlpapi_dep = cc.find_library('iphlpapi')
   setupapi_dep = cc.find_library('setupapi')
   cfgmgr32_dep = cc.find_library('cfgmgr32')
+  netapi32_dep = cc.find_library('netapi32')
   win32_dep = declare_dependency(
     dependencies: [
       ole32_dep,
@@ -1345,6 +1351,7 @@ if host_machine.system() == 'windows'
       iphlpapi_dep,
       setupapi_dep,
       cfgmgr32_dep,
+      netapi32_dep,
     ],
   )
   if get_option('default_library') == 'static'
@@ -1831,7 +1838,8 @@ if not get_option('driver_storage').disabled() and conf.has('WITH_LIBVIRTD')
       fs_enable = false
     endif
 
-    if fs_enable and not cc.check_header('mntent.h')
+    # on Windows: symbolic links to shares and volume mount points
+    if fs_enable and host_machine.system() != 'windows' and not cc.check_header('mntent.h')
       if get_option('storage_fs').enabled()
         error('<mntent.h> is required for the FS storage driver')
       else
@@ -2033,13 +2041,13 @@ endif
 
 # nwfilter should only be compiled for linux, and only if the
 # libvirt daemon is also being compiled
-if not get_option('driver_nwfilter').disabled() and conf.has('WITH_LIBVIRTD') and host_machine.system() == 'linux'
+if not get_option('driver_nwfilter').disabled() and conf.has('WITH_LIBVIRTD') and host_machine.system() in ['linux', 'windows']
   conf.set('WITH_NWFILTER', 1)
 elif get_option('driver_nwfilter').enabled()
   if not conf.has('WITH_LIBVIRTD')
     error('libvirtd must be enabled to build the network driver')
   else
-    error('linux host is required to build the nwfilter driver')
+    error('linux or windows host is required to build the nwfilter driver')
   endif
 endif
 
@@ -2050,6 +2058,10 @@ if conf.has('WITH_NWFILTER') or conf.has('WITH_NETWORK')
           firewall_backend_priority = ['nftables', 'iptables']
       elif host_machine.system() == 'freebsd'
           firewall_backend_priority = ['pf']
+      elif host_machine.system() == 'windows'
+          # networks: their switch does the firewall ('none'); nwfilter:
+          # the switch applies the filters ('netswitch')
+          firewall_backend_priority = ['netswitch', 'none']
       else
           # No firewall impl on non-Linux so far, so force 'none'
           # as placeholder

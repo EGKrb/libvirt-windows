@@ -3930,6 +3930,16 @@ qemuBuildHostNetProps(virDomainObj *vm,
             break;
         }
 
+        /* the socket of the interface, if the switch made it */
+        if (net->ifname) {
+            g_autofree char *portpath = virNetDevBridgeSwitchPortSocketPath(net->ifname);
+
+            if (virFileExists(portpath)) {
+                g_free(path);
+                path = g_steal_pointer(&portpath);
+            }
+        }
+
         if (virJSONValueObjectAdd(&addrprops,
                                   "s:type", "unix",
                                   "s:path", path,
@@ -8989,6 +8999,13 @@ qemuBuildInterfaceConnect(virDomainObj *vm,
             return -1;
         if (virNetDevBridgeSwitchPortAdd(brname, net->ifname, &net->mac) < 0)
             return -1;
+        /* its network filter, which the switch applies to the port */
+        if (net->filter &&
+            virDomainConfNWFilterInstantiate(vm->def->name, vm->def->uuid,
+                                             net, false) < 0) {
+            virNetDevBridgeSwitchPortRemove(net->ifname);
+            return -1;
+        }
         break;
     }
 #endif

@@ -123,6 +123,12 @@ virNWFilterLoadDriverConfig(virNWFilterDriverConfig *cfg,
             return -1;
         }
 
+        case VIR_FIREWALL_BACKEND_NETSWITCH:
+#ifdef WIN32
+            fwBackendSelected = true;
+#endif
+            break;
+
         case VIR_FIREWALL_BACKEND_LAST:
             virReportEnumRangeError(virFirewallBackend, fwBackends[i]);
             return -1;

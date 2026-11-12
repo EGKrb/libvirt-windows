@@ -72,9 +72,10 @@ if [ ! -f "$BUILD/build.ninja" ]; then
         -Ddriver_secret=enabled \
         -Ddriver_nodedev=enabled \
         -Ddriver_interface=enabled \
+        -Ddriver_nwfilter=enabled \
         -Ddriver_storage=enabled \
         -Dstorage_dir=enabled \
-        -Dstorage_fs=disabled \
+        -Dstorage_fs=enabled \
         -Dstorage_disk=disabled \
         -Dstorage_gluster=disabled \
         -Dstorage_iscsi=disabled \

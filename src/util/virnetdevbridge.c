@@ -1463,6 +1463,15 @@ virNetDevBridgeSwitchPortPath(const char *ifname)
 }
 
 
+char *
+virNetDevBridgeSwitchPortSocketPath(const char *ifname)
+{
+    return g_strdup_printf("%s/ports/%s.sock",
+                           VIR_INSTALL_PATH(RUNSTATEDIR "/libvirt/network"),
+                           ifname);
+}
+
+
 int
 virNetDevBridgeSwitchPortAdd(const char *brname,
                              const char *ifname,
@@ -1487,6 +1496,16 @@ virNetDevBridgeSwitchPortAdd(const char *brname,
         return -1;
     }
     virNetDevBridgeSwitchNotify(brname);
+
+    /* the switch makes the socket of the interface: wait for it, so that
+     * QEMU connects there (a switch older than that never makes it) */
+    {
+        g_autofree char *sock = virNetDevBridgeSwitchPortSocketPath(ifname);
+        int i;
+
+        for (i = 0; i < 40 && !virFileExists(sock); i++)
+            g_usleep(50 * 1000);
+    }
     return 0;
 }
 
@@ -1498,8 +1517,10 @@ virNetDevBridgeSwitchPortRemove(const char *ifname)
     g_autofree char *brname = NULL;
     virMacAddr mac;
 
-    if (virNetDevBridgeSwitchPortGet(ifname, &brname, &mac) < 0)
+    if (virNetDevBridgeSwitchPortGet(ifname, &brname, &mac) < 0) {
+        virResetLastError();
         return;
+    }
     unlink(path);
     virNetDevBridgeSwitchNotify(brname);
 }

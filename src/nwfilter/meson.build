@@ -9,6 +9,13 @@ nwfilter_driver_sources = [
   'nwfilter_nftables_driver.c',
 ]
 
+if host_machine.system() == 'windows'
+  nwfilter_driver_sources += [
+    'nwfilter_netswitch_driver.c',
+    'nwfilter_win32_pcap.c',
+  ]
+endif
+
 driver_source_files += files(nwfilter_driver_sources)
 stateful_driver_source_files += files(nwfilter_driver_sources)
 

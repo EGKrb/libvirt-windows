@@ -101,7 +101,7 @@ if conf.has('WITH_NETWORK')
     virt_helpers += {
       'name': 'libvirt_netswitch',
       'sources': [
-        files('netswitch.c'),
+        files('netswitch.c', 'netswitch_filter.c'),
       ],
       'include': [
         conf_inc_dir,

@@ -24,15 +24,25 @@
 #include <config.h>
 
 #ifdef WITH_LIBPCAP
-# include <pcap.h>
+# ifdef WIN32
+#  include "nwfilter_win32_pcap.h"
+# else
+#  include <pcap.h>
+# endif
 #endif
 
 #include <fcntl.h>
-#include <sys/ioctl.h>
-#include <poll.h>
+#ifndef WIN32
+# include <sys/ioctl.h>
+# include <poll.h>
+#endif
 
-#include <net/ethernet.h>
-#include <net/if_arp.h>
+#ifndef WIN32
+# include <net/ethernet.h>
+# include <net/if_arp.h>
+#else
+# include "nwfilter_win32_compat.h"
+#endif
 
 #include "internal.h"
 

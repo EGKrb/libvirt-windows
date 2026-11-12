@@ -40,7 +40,8 @@ VIR_ENUM_IMPL(virFirewallBackend,
               "none",
               "iptables",
               "nftables",
-              "pf");
+              "pf",
+              "netswitch");
 
 VIR_ENUM_DECL(virFirewallLayer);
 VIR_ENUM_IMPL(virFirewallLayer,
@@ -844,6 +845,7 @@ virFirewallApplyCmd(virFirewall *firewall,
         break;
 
     case VIR_FIREWALL_BACKEND_PF:
+    case VIR_FIREWALL_BACKEND_NETSWITCH:
     case VIR_FIREWALL_BACKEND_LAST:
     default:
         virReportEnumRangeError(virFirewallBackend,

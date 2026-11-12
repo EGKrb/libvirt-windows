@@ -59,6 +59,7 @@ networkFirewallSetupPrivateChains(virFirewallBackend backend,
         return nftablesSetupPrivateChains(layer);
 
     case VIR_FIREWALL_BACKEND_PF:
+    case VIR_FIREWALL_BACKEND_NETSWITCH:
     case VIR_FIREWALL_BACKEND_LAST:
         virReportEnumRangeError(virFirewallBackend, backend);
         return -1;
@@ -439,6 +440,7 @@ networkAddFirewallRules(virNetworkDef *def,
             return nftablesAddFirewallRules(def, fwRemoval);
 
         case VIR_FIREWALL_BACKEND_PF:
+        case VIR_FIREWALL_BACKEND_NETSWITCH:
         case VIR_FIREWALL_BACKEND_LAST:
             virReportEnumRangeError(virFirewallBackend, firewallBackend);
             return -1;

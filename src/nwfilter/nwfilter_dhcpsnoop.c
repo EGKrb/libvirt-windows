@@ -37,13 +37,20 @@
 #include <config.h>
 
 #ifdef WITH_LIBPCAP
-# include <pcap.h>
+# ifdef WIN32
+#  include "nwfilter_win32_pcap.h"
+# else
+#  include <pcap.h>
+# endif
 #endif
 
 #include <fcntl.h>
-#include <poll.h>
-
-#include <net/if.h>
+#ifndef WIN32
+# include <poll.h>
+# include <net/if.h>
+#else
+# include "nwfilter_win32_compat.h"
+#endif
 
 #include "virlog.h"
 #include "datatypes.h"

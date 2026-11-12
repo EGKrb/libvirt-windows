@@ -34,6 +34,7 @@
 #include "virprocess.h"
 #include "virstring.h"
 #include "network_conf.h"
+#include "netswitch_filter.h"
 
 #include <iphlpapi.h>
 
@@ -91,9 +92,12 @@ struct _nsPort {
     GByteArray *wbuf;
     bool dead;
 
-    /* the guest behind the port: its first source MAC address */
+    /* the guest behind the port: the MAC address of its port file when it
+     * joined by the socket of its interface, else its first source MAC */
     bool hasMac;
     virMacAddr mac;
+    char *ifname;               /* the interface (vnetN), NULL on the
+                                 * socket of the bridge */
 
     /* QoS of the interface (its port file) and its floor on the network */
     nsBucket inAvg, inPeak;     /* to the guest: shaped (queue) */
@@ -155,6 +159,34 @@ struct _nsDnsQuery {
     gint64 deadline;            /* ms */
 };
 
+/* The socket of an interface of the bridge (its port file): the port of a
+ * guest that connects there is that interface's, whatever MAC address it
+ * uses, so that its QoS and network filters cannot be escaped */
+typedef struct _nsPortListener nsPortListener;
+struct _nsPortListener {
+    SOCKET sock;
+    char *ifname;
+    char *path;
+    virMacAddr mac;
+    bool seen;
+
+    /* the monitor of the interface (ports/NAME.mon): a copy of the frames
+     * to and from its guest, for the IP address learning and the DHCP
+     * snooping of nwfilter, which capture on the TAP device on Linux */
+    SOCKET mon;
+    char *monPath;
+    GPtrArray *monitors;        /* nsMonitor */
+};
+
+typedef struct _nsMonitor nsMonitor;
+struct _nsMonitor {
+    SOCKET sock;
+    GByteArray *wbuf;
+    bool dead;
+};
+
+#define NS_MONITOR_BACKLOG (1024 * 1024)
+
 typedef struct _nsSwitch nsSwitch;
 struct _nsSwitch {
     char *configFile;
@@ -163,6 +195,11 @@ struct _nsSwitch {
     virNetworkDef *def;
 
     SOCKET listener;
+    GPtrArray *portListeners;   /* nsPortListener: one per interface */
+    GHashTable *filters;        /* ifname -> nsFilter (nwfilter) */
+    size_t nmonitors;           /* clients of the monitors of interfaces */
+    nsConntrack *ct;
+    bool ctNeeded;
     GPtrArray *ports;           /* nsPort */
     GHashTable *macs;           /* uint64 MAC -> nsMacEntry */
 
@@ -534,6 +571,7 @@ nsPortFlush(nsPort *port)
 static void
 nsPortFree(nsPort *port)
 {
+    g_free(port->ifname);
     closesocket(port->sock);
     g_free(port->rbuf);
     g_byte_array_unref(port->wbuf);
@@ -558,14 +596,74 @@ static void nsGatewayInput(nsSwitch *sw, const uint8_t *frame, size_t len);
  * multicasts: libslirp would NAT to the host network any IP packet it is
  * given, those between two guests included.
  */
+static const nsFilter *
+nsPortFilter(nsSwitch *sw, nsPort *port)
+{
+    return port->ifname ? g_hash_table_lookup(sw->filters, port->ifname) : NULL;
+}
+
+
+static void nsDeliver(nsSwitch *sw, nsPort *src, const uint8_t *frame, size_t len);
+static void nsMonitorCopy(nsSwitch *sw, nsPort *port, bool toGuest,
+                          const uint8_t *frame, size_t len);
+
+/* reject: the ICMP error goes back to the sender, the gateway or a port,
+ * without passing the filters again */
+static void
+nsFilterReject(nsSwitch *sw, nsPort *src, const nsPkt *pk)
+{
+    uint8_t out[14 + 40 + 8 + 1280];
+    size_t n = nsFilterRejectFrame(pk, out, sizeof(out));
+
+    if (!n)
+        return;
+    if (src)
+        nsPortSendCounted(sw, src, out, n);
+    else
+        nsGatewayInput(sw, out, n);
+}
+
+
+/* A frame for @port, if the network filter of its interface lets it in */
+static bool
+nsPortOfferFiltered(nsSwitch *sw, nsPort *port, nsPort *src, const nsPkt *pk,
+                    const uint8_t *frame, size_t len)
+{
+    const nsFilter *f = nsPortFilter(sw, port);
+
+    if (f) {
+        nsFilterVerdict v = nsFilterRun(f, true, pk, sw->ct);
+
+        if (v != NS_FILTER_ACCEPT) {
+            if (v == NS_FILTER_REJECT)
+                nsFilterReject(sw, src, pk);
+            port->rxDrop++;
+            sw->statsDirty = true;
+            return false;
+        }
+    }
+    nsMonitorCopy(sw, port, true, frame, len);
+    nsPortOffer(sw, port, frame, len, !src);
+    return true;
+}
+
+
 static void
 nsDeliver(nsSwitch *sw, nsPort *src, const uint8_t *frame, size_t len)
 {
     const uint8_t *dst = frame;
+    nsPkt pk;
+    bool delivered = false;
     size_t i;
 
     if (len < NS_ETH_HLEN)
         return;
+
+    nsPktParse(&pk, frame, len);
+    if (sw->ctNeeded)
+        nsConntrackLookup(sw->ct, &pk);
+    if (src)
+        nsMonitorCopy(sw, src, false, frame, len);
 
     if (src && !(frame[6] & 1)) {
         uint64_t key = nsMacKey(frame + 6);
@@ -591,6 +689,7 @@ nsDeliver(nsSwitch *sw, nsPort *src, const uint8_t *frame, size_t len)
 
     if (src) {
         gint64 now = g_get_monotonic_time();
+        const nsFilter *f;
 
         /* what the guest sends is policed: the excess is dropped */
         if (!(nsBucketReady(&src->outAvg, now) & nsBucketReady(&src->outPeak, now)) ||
@@ -600,6 +699,20 @@ nsDeliver(nsSwitch *sw, nsPort *src, const uint8_t *frame, size_t len)
             sw->statsDirty = true;
             return;
         }
+
+        /* the network filter of the interface, on what leaves the guest */
+        if ((f = nsPortFilter(sw, src))) {
+            nsFilterVerdict v = nsFilterRun(f, false, &pk, sw->ct);
+
+            if (v != NS_FILTER_ACCEPT) {
+                if (v == NS_FILTER_REJECT)
+                    nsFilterReject(sw, src, &pk);
+                src->txDrop++;
+                sw->statsDirty = true;
+                return;
+            }
+        }
+
         nsBucketTake(&src->outAvg, len);
         nsBucketTake(&src->outPeak, len);
         if (nsIsGatewayMac(sw, dst)) {
@@ -616,17 +729,21 @@ nsDeliver(nsSwitch *sw, nsPort *src, const uint8_t *frame, size_t len)
             nsPort *port = g_ptr_array_index(sw->ports, i);
 
             if (port != src)
-                nsPortOffer(sw, port, frame, len, !src);
+                delivered |= nsPortOfferFiltered(sw, port, src, &pk, frame, len);
         }
-        if (src)
+        if (src) {
             nsGatewayInput(sw, frame, len);
-        return;
+            delivered = true;
+        }
+        goto done;
     }
 
     if (nsIsGatewayMac(sw, dst)) {
-        if (src)
+        if (src) {
             nsGatewayInput(sw, frame, len);
-        return;
+            delivered = true;
+        }
+        goto done;
     }
 
     {
@@ -635,8 +752,8 @@ nsDeliver(nsSwitch *sw, nsPort *src, const uint8_t *frame, size_t len)
 
         if (ent && ent->port) {
             if (ent->port != src)
-                nsPortOffer(sw, ent->port, frame, len, !src);
-            return;
+                delivered = nsPortOfferFiltered(sw, ent->port, src, &pk, frame, len);
+            goto done;
         }
     }
 
@@ -645,8 +762,13 @@ nsDeliver(nsSwitch *sw, nsPort *src, const uint8_t *frame, size_t len)
         nsPort *port = g_ptr_array_index(sw->ports, i);
 
         if (port != src)
-            nsPortOffer(sw, port, frame, len, !src);
+            delivered |= nsPortOfferFiltered(sw, port, src, &pk, frame, len);
     }
+
+ done:
+    /* the connection is tracked once the frame went through */
+    if (sw->ctNeeded && delivered)
+        nsConntrackConfirm(sw->ct, &pk);
 }
 
 
@@ -705,10 +827,10 @@ nsForgetPort(nsSwitch *sw, nsPort *port)
 
 
 static void
-nsAccept(nsSwitch *sw)
+nsAccept(nsSwitch *sw, SOCKET listener, nsPortListener *pl)
 {
     for (;;) {
-        SOCKET s = accept(sw->listener, NULL, NULL);
+        SOCKET s = accept(listener, NULL, NULL);
         u_long nonblock = 1;
         nsPort *port;
 
@@ -721,8 +843,231 @@ nsAccept(nsSwitch *sw)
         port->rbuf = g_new(uint8_t, 4 + NS_FRAME_MAX);
         port->wbuf = g_byte_array_new();
         port->queue = g_queue_new();
+        if (pl) {
+            /* the port of an interface: its MAC address is the one of
+             * its port file, not what the guest sends */
+            port->ifname = g_strdup(pl->ifname);
+            port->mac = pl->mac;
+            port->hasMac = true;
+            nsPortApplyQos(sw, port);
+        }
         g_ptr_array_add(sw->ports, port);
-        nsLog("guest port %p connected (%u ports)", (void *)port, sw->ports->len);
+        nsLog("guest port %p%s%s connected (%u ports)", (void *)port,
+              pl ? " of " : "", pl ? pl->ifname : "", sw->ports->len);
+    }
+}
+
+
+static void
+nsMonitorFree(void *data)
+{
+    nsMonitor *m = data;
+
+    closesocket(m->sock);
+    g_byte_array_unref(m->wbuf);
+    g_free(m);
+}
+
+
+static void
+nsMonitorFlush(nsMonitor *m)
+{
+    while (m->wbuf->len && !m->dead) {
+        int n = send(m->sock, (const char *)m->wbuf->data, m->wbuf->len, 0);
+
+        if (n == SOCKET_ERROR) {
+            if (WSAGetLastError() != WSAEWOULDBLOCK)
+                m->dead = true;
+            return;
+        }
+        g_byte_array_remove_range(m->wbuf, 0, n);
+    }
+}
+
+
+static void
+nsMonitorAccept(nsSwitch *sw, nsPortListener *pl)
+{
+    for (;;) {
+        SOCKET s = accept(pl->mon, NULL, NULL);
+        u_long nonblock = 1;
+        nsMonitor *m;
+
+        if (s == INVALID_SOCKET)
+            return;
+        ioctlsocket(s, FIONBIO, &nonblock);
+        m = g_new0(nsMonitor, 1);
+        m->sock = s;
+        m->wbuf = g_byte_array_new();
+        g_ptr_array_add(pl->monitors, m);
+        sw->nmonitors++;
+        nsLog("interface %s: monitor connected", pl->ifname);
+    }
+}
+
+
+/* A copy of a frame to (@toGuest) or from the guest of @port for the
+ * monitors of its interface: 4 bytes of length, 1 of direction, the frame;
+ * dropped when a monitor is behind, as by a full capture buffer */
+static void
+nsMonitorCopy(nsSwitch *sw, nsPort *port, bool toGuest,
+              const uint8_t *frame, size_t len)
+{
+    size_t i;
+
+    if (!sw->nmonitors || !port || !port->ifname)
+        return;
+    for (i = 0; i < sw->portListeners->len; i++) {
+        nsPortListener *pl = g_ptr_array_index(sw->portListeners, i);
+        size_t j;
+
+        if (STRNEQ(pl->ifname, port->ifname))
+            continue;
+        for (j = 0; j < pl->monitors->len; j++) {
+            nsMonitor *m = g_ptr_array_index(pl->monitors, j);
+            uint8_t hdr[5];
+
+            if (m->dead || m->wbuf->len + len + 5 > NS_MONITOR_BACKLOG)
+                continue;
+            nsPut32(hdr, len);
+            hdr[4] = toGuest ? 1 : 0;
+            g_byte_array_append(m->wbuf, hdr, 5);
+            g_byte_array_append(m->wbuf, frame, len);
+            nsMonitorFlush(m);
+        }
+        return;
+    }
+}
+
+
+/* the monitors: what they still have to get, and those gone */
+static void
+nsMonitorsService(nsSwitch *sw)
+{
+    size_t i;
+
+    if (!sw->nmonitors)
+        return;
+    for (i = 0; i < sw->portListeners->len; i++) {
+        nsPortListener *pl = g_ptr_array_index(sw->portListeners, i);
+        size_t j;
+
+        for (j = 0; j < pl->monitors->len;) {
+            nsMonitor *m = g_ptr_array_index(pl->monitors, j);
+            char c;
+
+            nsMonitorFlush(m);
+            /* a monitor sends nothing: readable means closed */
+            if (!m->dead && recv(m->sock, &c, 1, 0) != SOCKET_ERROR)
+                m->dead = true;
+            if (m->dead) {
+                nsLog("interface %s: monitor disconnected", pl->ifname);
+                g_ptr_array_remove_index(pl->monitors, j);
+                sw->nmonitors--;
+                continue;
+            }
+            j++;
+        }
+    }
+}
+
+
+static void
+nsPortListenerFree(void *data)
+{
+    nsPortListener *pl = data;
+
+    closesocket(pl->sock);
+    DeleteFileA(pl->path);
+    if (pl->mon != INVALID_SOCKET) {
+        closesocket(pl->mon);
+        DeleteFileA(pl->monPath);
+    }
+    g_ptr_array_unref(pl->monitors);
+    g_free(pl->ifname);
+    g_free(pl->path);
+    g_free(pl->monPath);
+    g_free(pl);
+}
+
+
+static SOCKET
+nsListenUnix(const char *path)
+{
+    struct sockaddr_un un = { .sun_family = AF_UNIX };
+    u_long nonblock = 1;
+    SOCKET s;
+
+    if (strlen(path) >= sizeof(un.sun_path)) {
+        nsLog("socket path too long: %s", path);
+        return INVALID_SOCKET;
+    }
+    g_strlcpy(un.sun_path, path, sizeof(un.sun_path));
+    DeleteFileA(path);
+
+    if ((s = socket(AF_UNIX, SOCK_STREAM, 0)) == INVALID_SOCKET)
+        return INVALID_SOCKET;
+    if (bind(s, (struct sockaddr *)&un, sizeof(un)) == SOCKET_ERROR ||
+        listen(s, 16) == SOCKET_ERROR) {
+        nsLog("cannot listen on %s: error %d", path, WSAGetLastError());
+        closesocket(s);
+        return INVALID_SOCKET;
+    }
+    ioctlsocket(s, FIONBIO, &nonblock);
+    return s;
+}
+
+
+/* The socket and the network filter of the interface @ifname of this
+ * bridge (its port file) */
+static void
+nsPortListenerSeen(nsSwitch *sw, const char *portdir, const char *ifname,
+                   const virMacAddr *mac)
+{
+    g_autofree char *rundir = g_path_get_dirname(sw->socketPath);
+    g_autofree char *fpath = g_strdup_printf("%s/nwfilter/%s", rundir, ifname);
+    g_autofree char *err = NULL;
+    nsPortListener *pl = NULL;
+    nsFilter *f;
+    size_t i;
+
+    for (i = 0; i < sw->portListeners->len; i++) {
+        nsPortListener *l = g_ptr_array_index(sw->portListeners, i);
+
+        if (STREQ(l->ifname, ifname)) {
+            pl = l;
+            break;
+        }
+    }
+    if (!pl) {
+        g_autofree char *path = g_strdup_printf("%s/%s.sock", portdir, ifname);
+        SOCKET s = nsListenUnix(path);
+
+        if (s != INVALID_SOCKET) {
+            pl = g_new0(nsPortListener, 1);
+            pl->sock = s;
+            pl->ifname = g_strdup(ifname);
+            pl->path = g_steal_pointer(&path);
+            pl->monPath = g_strdup_printf("%s/%s.mon", portdir, ifname);
+            pl->mon = nsListenUnix(pl->monPath);
+            pl->monitors = g_ptr_array_new_with_free_func(nsMonitorFree);
+            g_ptr_array_add(sw->portListeners, pl);
+            nsLog("interface %s: listening on %s", ifname, pl->path);
+        }
+    }
+    if (pl) {
+        pl->seen = true;
+        pl->mac = *mac;
+    }
+
+    if ((f = nsFilterLoad(fpath, &err))) {
+        nsLog("interface %s: network filter of %zu rules", ifname, nsFilterRuleCount(f));
+        g_hash_table_insert(sw->filters, g_strdup(ifname), f);
+    } else if (err) {
+        /* a filter that cannot be read lets nothing through */
+        nsLog("interface %s: cannot load the network filter %s: %s; dropping its traffic",
+              ifname, fpath, err);
+        g_hash_table_insert(sw->filters, g_strdup(ifname), nsFilterDropAll());
     }
 }
 
@@ -3773,6 +4118,9 @@ nsQosLoad(nsSwitch *sw)
 
     g_hash_table_remove_all(sw->qos);
     g_hash_table_remove_all(sw->floors);
+    g_hash_table_remove_all(sw->filters);
+    for (i = 0; i < sw->portListeners->len; i++)
+        ((nsPortListener *)g_ptr_array_index(sw->portListeners, i))->seen = false;
 
     if ((dir = g_dir_open(portdir, 0, NULL))) {
         while ((name = g_dir_read_name(dir))) {
@@ -3783,17 +4131,52 @@ nsQosLoad(nsSwitch *sw)
             virMacAddr m;
             uint64_t *key;
 
+            if (g_str_has_suffix(name, ".sock"))
+                continue;
             if (!g_key_file_load_from_file(kf, path, G_KEY_FILE_NONE, NULL) ||
                 !(bridge = g_key_file_get_string(kf, "port", "bridge", NULL)) ||
                 STRNEQ(bridge, sw->def->bridge) ||
                 !(mac = g_key_file_get_string(kf, "port", "mac", NULL)) ||
                 virMacAddrParse(mac, &m) < 0)
                 continue;
+            nsPortListenerSeen(sw, portdir, name, &m);
             key = g_new(uint64_t, 1);
             *key = nsMacKey(m.addr);
             g_hash_table_insert(sw->qos, key, g_steal_pointer(&kf));
         }
         g_clear_pointer(&dir, g_dir_close);
+    }
+
+    /* the interfaces gone: their sockets, and their guests if still there */
+    for (i = 0; i < sw->portListeners->len;) {
+        nsPortListener *pl = g_ptr_array_index(sw->portListeners, i);
+        size_t j;
+
+        if (pl->seen) {
+            i++;
+            continue;
+        }
+        for (j = 0; j < sw->ports->len; j++) {
+            nsPort *port = g_ptr_array_index(sw->ports, j);
+
+            if (port->ifname && STREQ(port->ifname, pl->ifname))
+                port->dead = true;
+        }
+        nsLog("interface %s removed", pl->ifname);
+        sw->nmonitors -= pl->monitors->len;
+        g_ptr_array_remove_index(sw->portListeners, i);
+    }
+
+    sw->ctNeeded = false;
+    {
+        GHashTableIter it;
+        nsFilter *f;
+
+        g_hash_table_iter_init(&it, sw->filters);
+        while (g_hash_table_iter_next(&it, NULL, (void **)&f)) {
+            if (nsFilterUsesConntrack(f))
+                sw->ctNeeded = true;
+        }
     }
 
     if ((dir = g_dir_open(floordir, 0, NULL))) {
@@ -3883,6 +4266,12 @@ nsRun(nsSwitch *sw)
             nsPollAdd(sw->dns6, SLIRP_POLL_IN, &p);
         if (sw->wake != INVALID_SOCKET)
             nsPollAdd(sw->wake, SLIRP_POLL_IN, &p);
+        for (i = 0; i < sw->portListeners->len; i++) {
+            nsPortListener *pl = g_ptr_array_index(sw->portListeners, i);
+
+            nsPollAdd(pl->sock, SLIRP_POLL_IN, &p);
+            nsPollAdd(pl->mon != INVALID_SOCKET ? pl->mon : pl->sock, SLIRP_POLL_IN, &p);
+        }
         for (i = 0; i < sw->ports->len; i++) {
             nsPort *port = g_ptr_array_index(sw->ports, i);
 
@@ -3910,7 +4299,7 @@ nsRun(nsSwitch *sw)
             size_t idx = 0;
 
             if (g_array_index(p.fds, WSAPOLLFD, idx++).revents)
-                nsAccept(sw);
+                nsAccept(sw, sw->listener, NULL);
             if (sw->dns4 != INVALID_SOCKET &&
                 g_array_index(p.fds, WSAPOLLFD, idx++).revents)
                 nsDnsUpstreamInput(sw, sw->dns4);
@@ -3920,6 +4309,20 @@ nsRun(nsSwitch *sw)
             if (sw->wake != INVALID_SOCKET &&
                 g_array_index(p.fds, WSAPOLLFD, idx++).revents)
                 nsRoutedDrain(sw);
+            {
+                /* nsAccept() does not change the listeners */
+                size_t nlisteners = sw->portListeners->len;
+
+                for (i = 0; i < nlisteners; i++, idx += 2) {
+                    nsPortListener *pl = g_ptr_array_index(sw->portListeners, i);
+
+                    if (g_array_index(p.fds, WSAPOLLFD, idx).revents)
+                        nsAccept(sw, pl->sock, pl);
+                    if (pl->mon != INVALID_SOCKET &&
+                        g_array_index(p.fds, WSAPOLLFD, idx + 1).revents)
+                        nsMonitorAccept(sw, pl);
+                }
+            }
             for (i = 0; i < sw->ports->len && idx < nfixed; i++, idx++) {
                 nsPort *port = g_ptr_array_index(sw->ports, i);
                 short r = g_array_index(p.fds, WSAPOLLFD, idx).revents;
@@ -3941,6 +4344,9 @@ nsRun(nsSwitch *sw)
             }
         }
         nsDnsTimeouts(sw);
+        if (sw->ctNeeded)
+            nsConntrackExpire(sw->ct);
+        nsMonitorsService(sw);
         if (sw->routed && sw->ip6 && sw->wintunSession &&
             nsNowMs() - sw->raTime >= NS_RA_INTERVAL_MS)
             nsRoutedAdvertiseAll(sw);
@@ -4086,6 +4492,10 @@ main(int argc, char **argv)
     sw.qos = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free,
                                    (GDestroyNotify)g_key_file_unref);
     sw.floors = g_hash_table_new_full(g_int64_hash, g_int64_equal, g_free, NULL);
+    sw.portListeners = g_ptr_array_new_with_free_func(nsPortListenerFree);
+    sw.filters = g_hash_table_new_full(g_str_hash, g_str_equal, g_free,
+                                       (GDestroyNotify)nsFilterFree);
+    sw.ct = nsConntrackNew();
 
     if (nsLoadConfig(&sw) < 0) {
         nsLog("cannot load %s: %s", sw.configFile, virGetLastErrorMessage());
@@ -4123,6 +4533,7 @@ main(int argc, char **argv)
     nsStopRouted(&sw);
     closesocket(sw.listener);
     DeleteFileA(sw.socketPath);
+    g_ptr_array_unref(sw.portListeners);
     if (sw.slirp)
         slirp_cleanup(sw.slirp);
     return EXIT_SUCCESS;

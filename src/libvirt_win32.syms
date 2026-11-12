@@ -36,6 +36,7 @@ virNetDevBridgeSwitchPortAdd;
 virNetDevBridgeSwitchPortGet;
 virNetDevBridgeSwitchPortPath;
 virNetDevBridgeSwitchPortRemove;
+virNetDevBridgeSwitchPortSocketPath;
 virNetDevBridgeSwitchSocketPath;
 
 # util/virxdrdefs.h

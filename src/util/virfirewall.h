@@ -51,6 +51,7 @@ typedef enum {
     VIR_FIREWALL_BACKEND_IPTABLES,
     VIR_FIREWALL_BACKEND_NFTABLES,
     VIR_FIREWALL_BACKEND_PF,
+    VIR_FIREWALL_BACKEND_NETSWITCH, /* the switch of a network, Windows */
 
     VIR_FIREWALL_BACKEND_LAST,
 } virFirewallBackend;

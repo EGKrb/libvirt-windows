@@ -228,10 +228,12 @@ int virNetDevExists(const char *ifname)
 int virNetDevExists(const char *ifname)
 {
     g_autofree char *sock = virNetDevBridgeSwitchSocketPath(ifname);
+    g_autofree char *port = virNetDevBridgeSwitchPortPath(ifname);
     g_autofree wchar_t *wname = (wchar_t *)g_utf8_to_utf16(ifname, -1, NULL, NULL, NULL);
     NET_LUID luid;
 
-    if (virFileExists(sock))
+    /* a switch, or an interface of a guest on one (its port file) */
+    if (virFileExists(sock) || virFileExists(port))
         return 1;
     if (!wname) {
         virReportSystemError(EINVAL, _("Unable to check interface %1$s"), ifname);
@@ -429,6 +431,35 @@ int virNetDevGetMAC(const char *ifname,
 
     virMacAddrSetRaw(macaddr, (unsigned char *)ifr.ifr_hwaddr.sa_data);
 
+    return 0;
+}
+#elif defined(WIN32)
+/* the guest's address for an interface on a switch (its port file), the
+ * adapter's for an adapter of the host */
+int virNetDevGetMAC(const char *ifname,
+                    virMacAddr *macaddr)
+{
+    g_autofree char *port = virNetDevBridgeSwitchPortPath(ifname);
+    g_autofree wchar_t *alias = NULL;
+    MIB_IF_ROW2 row = { 0 };
+
+    if (virFileExists(port)) {
+        g_autofree char *brname = NULL;
+
+        return virNetDevBridgeSwitchPortGet(ifname, &brname, macaddr);
+    }
+
+    alias = (wchar_t *)g_utf8_to_utf16(ifname, -1, NULL, NULL, NULL);
+    if (!alias ||
+        ConvertInterfaceAliasToLuid(alias, &row.InterfaceLuid) != NO_ERROR ||
+        GetIfEntry2(&row) != NO_ERROR ||
+        row.PhysicalAddressLength != VIR_MAC_BUFLEN) {
+        virReportSystemError(ENODEV,
+                             _("Cannot get interface MAC on '%1$s'"),
+                             ifname);
+        return -1;
+    }
+    virMacAddrSetRaw(macaddr, row.PhysicalAddress);
     return 0;
 }
 #else
@@ -994,11 +1025,30 @@ int virNetDevGetIndex(const char *ifname, int *ifindex)
     return 0;
 }
 #elif defined(WIN32)
+/* the index of a port of a switch: stable for its name, out of the range
+ * of the indexes of Windows */
+static int
+virNetDevSwitchPortIndex(const char *ifname)
+{
+    g_autofree char *port = virNetDevBridgeSwitchPortPath(ifname);
+
+    if (!virFileExists(port))
+        return -1;
+    return 0x40000000 | (g_str_hash(ifname) & 0x3fffffff);
+}
+
+
 int virNetDevGetIndex(const char *ifname, int *ifindex)
 {
     g_autofree wchar_t *alias = (wchar_t *)g_utf8_to_utf16(ifname, -1, NULL, NULL, NULL);
     NET_LUID luid;
     NET_IFINDEX index;
+    int portIndex;
+
+    if ((portIndex = virNetDevSwitchPortIndex(ifname)) >= 0) {
+        *ifindex = portIndex;
+        return 0;
+    }
 
     if (!alias ||
         ConvertInterfaceAliasToLuid(alias, &luid) != NO_ERROR ||
@@ -1172,6 +1222,36 @@ int virNetDevValidateConfig(const char *ifname,
 
         if (virMacAddrCmpRaw(macaddr,
                              (unsigned char *)ifr.ifr_hwaddr.sa_data) != 0)
+            return 0;
+    }
+
+    if (ifindex != -1) {
+        if (virNetDevGetIndex(ifname, &idx) < 0)
+            return -1;
+        if (idx != ifindex)
+            return 0;
+    }
+
+    return 1;
+}
+#elif defined(WIN32)
+int virNetDevValidateConfig(const char *ifname,
+                            const virMacAddr *macaddr, int ifindex)
+{
+    int idx;
+    int rc;
+
+    if ((rc = virNetDevExists(ifname)) <= 0)
+        return rc;
+
+    if (macaddr != NULL) {
+        virMacAddr mac;
+
+        if (virNetDevGetMAC(ifname, &mac) < 0) {
+            virResetLastError();
+            return 0;
+        }
+        if (virMacAddrCmp(macaddr, &mac) != 0)
             return 0;
     }
 

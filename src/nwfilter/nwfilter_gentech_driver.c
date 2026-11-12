@@ -33,6 +33,9 @@
 #include "nwfilter_ipaddrmap.h"
 #include "nwfilter_learnipaddr.h"
 #include "nwfilter_nftables_driver.h"
+#ifdef WIN32
+# include "nwfilter_netswitch_driver.h"
+#endif
 #include "virnetdev.h"
 
 #define VIR_FROM_THIS VIR_FROM_NWFILTER
@@ -50,6 +53,9 @@ static int _virNWFilterTeardownFilter(const char *ifname);
 static virNWFilterTechDriver *filter_tech_drivers[] = {
     &ebiptables_driver,
     &nftables_driver,
+#ifdef WIN32
+    &netswitch_driver,
+#endif
 };
 
 int virNWFilterTechDriversInit(bool privileged, virNWFilterDriverConfig *config)

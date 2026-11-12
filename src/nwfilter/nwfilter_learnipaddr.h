@@ -25,7 +25,11 @@
 
 #include "nwfilter_tech_driver.h"
 #include "virnwfilterbindingdef.h"
-#include <net/if.h>
+#ifndef WIN32
+# include <net/if.h>
+#else
+# include "nwfilter_win32_compat.h"
+#endif
 
 enum howDetect {
   DETECT_DHCP = 1,

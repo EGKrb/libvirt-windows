@@ -35,6 +35,10 @@ char *virNetDevBridgeSwitchSocketPath(const char *brname)
  */
 char *virNetDevBridgeSwitchPortPath(const char *ifname)
     ATTRIBUTE_NONNULL(1);
+/* The socket of the interface on its switch (ports/NAME.sock), made by the
+ * switch for its port file: a guest connected there is that interface's */
+char *virNetDevBridgeSwitchPortSocketPath(const char *ifname)
+    ATTRIBUTE_NONNULL(1);
 int virNetDevBridgeSwitchPortAdd(const char *brname,
                                  const char *ifname,
                                  const virMacAddr *mac)
