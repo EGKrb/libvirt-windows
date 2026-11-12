@@ -261,6 +261,7 @@ virStorageWin32NfsMount(virStoragePoolDef *def, const char *target)
     PROCESS_INFORMATION pi;
     const char *version = def->source.protocolVer ? def->source.protocolVer : "3";
     bool hadDir = false;
+    size_t logStart = 0;
     HANDLE log;
     int i;
 
@@ -292,6 +293,12 @@ virStorageWin32NfsMount(virStoragePoolDef *def, const char *target)
     g_mkdir_with_parents(logdir, 0777);
     g_mkdir_with_parents(statedir, 0777);
     wlog = virStorageWin32Wide(logpath);
+    {
+        struct stat sb;
+
+        if (stat(logpath, &sb) == 0)
+            logStart = sb.st_size;
+    }
     log = CreateFileW(wlog, FILE_APPEND_DATA | SYNCHRONIZE,
                       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                       &sa, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -327,16 +334,21 @@ virStorageWin32NfsMount(virStoragePoolDef *def, const char *target)
             break;
         if (WaitForSingleObject(pi.hProcess, 100) == WAIT_OBJECT_0) {
             g_autofree char *out = NULL;
+            char *msg = (char *)"";
 
             CloseHandle(pi.hProcess);
             if (hadDir)
                 CreateDirectoryW(wtarget, NULL);
-            ignore_value(virFileReadAll(logpath, 64 * 1024, &out));
+
+            /* what the helper wrote this time, on one line */
+            if (virFileReadAll(logpath, 1024 * 1024, &out) >= 0) {
+                msg = strlen(out) > logStart ? out + logStart : out;
+                g_strdelimit(msg, "\r\n", ' ');
+                g_strstrip(msg);
+            }
             virReportError(VIR_ERR_OPERATION_FAILED,
                            _("cannot mount %1$s:%2$s on '%3$s': %4$s"),
-                           def->source.hosts[0].name, export, target,
-                           out ? g_strstrip(strrchr(out, '\n') && strrchr(out, '\n')[1] ?
-                                            strrchr(out, '\n') + 1 : out) : "");
+                           def->source.hosts[0].name, export, target, msg);
             return -1;
         }
     }

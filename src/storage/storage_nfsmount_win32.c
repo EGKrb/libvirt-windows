@@ -43,6 +43,15 @@
 # define O_ACCMODE (O_RDONLY | O_WRONLY | O_RDWR)
 #endif
 
+/* an open file: its NFS handle, and whether it was written since its last
+ * COMMIT (close-to-open consistency, as the NFS client of Linux) */
+typedef struct _nmFile nmFile;
+struct _nmFile {
+    struct nfsfh *fh;
+    bool written;
+    int flags;
+};
+
 static struct nfs_context *nfs;
 static CRITICAL_SECTION nfsLock;
 static struct fuse *nmFuse;
@@ -153,7 +162,7 @@ nmFgetattr(const char *path, struct fuse_stat *stbuf, struct fuse_file_info *fi)
 
     if (!fi || !fi->fh)
         return nmGetattr(path, stbuf);
-    rc = NFS_LOCKED(nfs_fstat64(nfs, (struct nfsfh *)(uintptr_t)fi->fh, &st));
+    rc = NFS_LOCKED(nfs_fstat64(nfs, ((nmFile *)(uintptr_t)fi->fh)->fh, &st));
     if (rc < 0)
         return rc;
     nmStat(&st, stbuf);
@@ -195,15 +204,41 @@ nmReaddir(const char *path, void *buf, fuse_fill_dir_t filler,
 }
 
 
+/* the errors of operations, in the log of the mount */
+static int
+nmFail(const char *op, const char *path, int rc)
+{
+    const char *err = nfs_get_error(nfs);
+
+    fprintf(stderr, "libvirt_nfsmount: %s %s: %s%s%s\n", op, path,
+            g_strerror(rc < 0 ? -rc : rc), err && *err ? " - " : "",
+            err && *err ? err : "");
+    return rc < 0 ? rc : -EIO;
+}
+
+
+static nmFile *
+nmFileOf(struct fuse_file_info *fi)
+{
+    return fi && fi->fh ? (nmFile *)(uintptr_t)fi->fh : NULL;
+}
+
+
 static int
 nmOpen(const char *path, struct fuse_file_info *fi)
 {
     struct nfsfh *fh;
+    nmFile *f;
     int rc = NFS_LOCKED(nfs_open(nfs, path, fi->flags & O_ACCMODE, &fh));
 
-    if (rc < 0)
-        return rc;
-    fi->fh = (uintptr_t)fh;
+    if (rc < 0) {
+        fprintf(stderr, "libvirt_nfsmount: open flags 0x%x\n", fi->flags);
+        return nmFail("open", path, rc);
+    }
+    f = g_new0(nmFile, 1);
+    f->fh = fh;
+    f->flags = fi->flags;
+    fi->fh = (uintptr_t)f;
     return 0;
 }
 
@@ -212,39 +247,71 @@ static int
 nmCreate(const char *path, fuse_mode_t mode, struct fuse_file_info *fi)
 {
     struct nfsfh *fh;
+    nmFile *f;
     int rc = NFS_LOCKED(nfs_creat(nfs, path, mode & 07777, &fh));
 
     if (rc < 0)
-        return rc;
-    fi->fh = (uintptr_t)fh;
+        return nmFail("create", path, rc);
+    f = g_new0(nmFile, 1);
+    f->fh = fh;
+    f->flags = fi->flags;
+    fi->fh = (uintptr_t)f;
     return 0;
 }
 
 
 static int
-nmRelease(const char *path G_GNUC_UNUSED, struct fuse_file_info *fi)
+nmCommit(const char *path, nmFile *f)
 {
-    if (fi->fh)
-        NFS_LOCKED(nfs_close(nfs, (struct nfsfh *)(uintptr_t)fi->fh));
+    int rc;
+
+    if (!f || !f->written)
+        return 0;
+    if ((rc = NFS_LOCKED(nfs_fsync(nfs, f->fh))) < 0)
+        return nmFail("commit", path, rc);
+    f->written = false;
+    return 0;
+}
+
+
+static int
+nmFlush(const char *path, struct fuse_file_info *fi)
+{
+    return nmCommit(path, nmFileOf(fi));
+}
+
+
+static int
+nmRelease(const char *path, struct fuse_file_info *fi)
+{
+    nmFile *f = nmFileOf(fi);
+
+    if (!f)
+        return 0;
+    nmCommit(path, f);
+    NFS_LOCKED(nfs_close(nfs, f->fh));
+    g_free(f);
     fi->fh = 0;
     return 0;
 }
 
 
 static int
-nmRead(const char *path G_GNUC_UNUSED, char *buf, size_t size, fuse_off_t off,
+nmRead(const char *path, char *buf, size_t size, fuse_off_t off,
        struct fuse_file_info *fi)
 {
-    struct nfsfh *fh = (struct nfsfh *)(uintptr_t)fi->fh;
+    nmFile *f = nmFileOf(fi);
     size_t max = NFS_LOCKED(nfs_get_readmax(nfs));
     size_t done = 0;
 
+    if (!f)
+        return -EBADF;
     while (done < size) {
         size_t n = MIN(size - done, max);
-        int rc = NFS_LOCKED(nfs_pread(nfs, fh, buf + done, n, off + done));
+        int rc = NFS_LOCKED(nfs_pread(nfs, f->fh, buf + done, n, off + done));
 
         if (rc < 0)
-            return done ? (int)done : rc;
+            return done ? (int)done : nmFail("read", path, rc);
         if (rc == 0)
             break;
         done += rc;
@@ -254,50 +321,70 @@ nmRead(const char *path G_GNUC_UNUSED, char *buf, size_t size, fuse_off_t off,
 
 
 static int
-nmWrite(const char *path G_GNUC_UNUSED, const char *buf, size_t size,
+nmWrite(const char *path, const char *buf, size_t size,
         fuse_off_t off, struct fuse_file_info *fi)
 {
-    struct nfsfh *fh = (struct nfsfh *)(uintptr_t)fi->fh;
+    nmFile *f = nmFileOf(fi);
     size_t max = NFS_LOCKED(nfs_get_writemax(nfs));
     size_t done = 0;
 
+    if (!f)
+        return -EBADF;
     while (done < size) {
         size_t n = MIN(size - done, max);
-        int rc = NFS_LOCKED(nfs_pwrite(nfs, fh, buf + done, n, off + done));
+        int rc = NFS_LOCKED(nfs_pwrite(nfs, f->fh, buf + done, n, off + done));
 
-        if (rc < 0)
-            return done ? (int)done : rc;
+        if (rc < 0) {
+            fprintf(stderr, "libvirt_nfsmount: write flags 0x%x offset %lld\n",
+                    f->flags, (long long)(off + done));
+            return done ? (int)done : nmFail("write", path, rc);
+        }
         if (rc == 0)
             return -EIO;
         done += rc;
+        f->written = true;
     }
     return done;
 }
 
 
 static int
-nmFsync(const char *path G_GNUC_UNUSED, int datasync G_GNUC_UNUSED,
+nmFsync(const char *path, int datasync G_GNUC_UNUSED,
         struct fuse_file_info *fi)
 {
-    if (!fi || !fi->fh)
+    nmFile *f = nmFileOf(fi);
+    int rc;
+
+    if (!f)
         return 0;
-    return NFS_LOCKED(nfs_fsync(nfs, (struct nfsfh *)(uintptr_t)fi->fh));
+    if ((rc = NFS_LOCKED(nfs_fsync(nfs, f->fh))) < 0)
+        return nmFail("fsync", path, rc);
+    f->written = false;
+    return 0;
 }
 
 
 static int
 nmTruncate(const char *path, fuse_off_t size)
 {
-    return NFS_LOCKED(nfs_truncate(nfs, path, size));
+    int rc = NFS_LOCKED(nfs_truncate(nfs, path, size));
+
+    return rc < 0 ? nmFail("truncate", path, rc) : 0;
 }
 
 
 static int
 nmFtruncate(const char *path, fuse_off_t size, struct fuse_file_info *fi)
 {
-    if (!fi || !fi->fh)
+    nmFile *f = nmFileOf(fi);
+    int rc;
+
+    /* a SETATTR of the size: by path, as the server sees no difference,
+     * and a handle opened for reading only can truncate too */
+    if (!f)
         return nmTruncate(path, size);
-    return NFS_LOCKED(nfs_ftruncate(nfs, (struct nfsfh *)(uintptr_t)fi->fh, size));
+    rc = NFS_LOCKED(nfs_truncate(nfs, path, size));
+    return rc < 0 ? nmFail("ftruncate", path, rc) : 0;
 }
 
 
@@ -400,6 +487,7 @@ static const struct fuse_operations nmOps = {
     .readdir = nmReaddir,
     .open = nmOpen,
     .create = nmCreate,
+    .flush = nmFlush,
     .release = nmRelease,
     .read = nmRead,
     .write = nmWrite,
@@ -480,10 +568,13 @@ main(int argc, char **argv)
     nfs_set_uid(nfs, uid);
     nfs_set_gid(nfs, gid);
     nfs_set_timeout(nfs, 60000);
-    if (nfs_set_version(nfs, version) < 0 ||
-        nfs_mount(nfs, server, export) < 0) {
-        fprintf(stderr, "libvirt_nfsmount: cannot mount %s:%s: %s\n",
-                server, export, nfs_get_error(nfs));
+    if ((rc = nfs_set_version(nfs, version)) < 0 ||
+        (rc = nfs_mount(nfs, server, export)) < 0) {
+        const char *err = nfs_get_error(nfs);
+
+        fprintf(stderr, "libvirt_nfsmount: cannot mount %s:%s (NFS version %d): %s%s%s\n",
+                server, export, version, err && *err ? err : "",
+                err && *err ? ": " : "", g_strerror(-rc));
         return 1;
     }
 
