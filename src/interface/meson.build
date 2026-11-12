@@ -10,6 +10,10 @@ if conf.has('WITH_UDEV')
   interface_driver_sources += 'interface_backend_udev.c'
 endif
 
+if host_machine.system() == 'windows'
+  interface_driver_sources += 'interface_backend_win32.c'
+endif
+
 driver_source_files += files(interface_driver_sources)
 stateful_driver_source_files += files(interface_driver_sources)
 
@@ -24,6 +28,7 @@ if conf.has('WITH_INTERFACE')
       libnl_dep,
       netcf_dep,
       udev_dep,
+      win32_dep,
     ],
     'link_args': [
       libvirt_no_undefined,

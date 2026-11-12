@@ -24,3 +24,4 @@ int interfaceRegister(void);
 
 int netcfIfaceRegister(void);
 int udevIfaceRegister(void);
+int win32IfaceRegister(void);

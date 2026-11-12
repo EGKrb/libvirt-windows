@@ -35,5 +35,9 @@ interfaceRegister(void)
     if (udevIfaceRegister() == 0)
         return 0;
 #endif /* WITH_UDEV */
+#ifdef WIN32
+    if (win32IfaceRegister() == 0)
+        return 0;
+#endif /* WIN32 */
     return -1;
 }

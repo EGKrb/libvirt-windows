@@ -1540,10 +1540,10 @@ elif get_option('driver_hyperv').enabled()
   error('openwsman is required for the Hyper-V driver')
 endif
 
-if not get_option('driver_interface').disabled() and conf.has('WITH_LIBVIRTD') and (udev_dep.found() or conf.has('WITH_NETCF'))
+if not get_option('driver_interface').disabled() and conf.has('WITH_LIBVIRTD') and (udev_dep.found() or conf.has('WITH_NETCF') or host_machine.system() == 'windows')
   conf.set('WITH_INTERFACE', 1)
 elif get_option('driver_interface').enabled()
-  error('Requested the Interface driver without netcf or udev and libvirtd support')
+  error('Requested the Interface driver without netcf, udev or Windows, and libvirtd support')
 endif
 
 if not get_option('driver_libxl').disabled() and conf.has('WITH_LIBVIRTD')
