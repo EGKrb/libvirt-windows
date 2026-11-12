@@ -70,7 +70,20 @@ if [ ! -f "$BUILD/build.ninja" ]; then
         -Ddriver_qemu=enabled \
         -Ddriver_network=enabled \
         -Ddriver_secret=enabled \
-        -Ddriver_storage=disabled \
+        -Ddriver_nodedev=enabled \
+        -Ddriver_storage=enabled \
+        -Dstorage_dir=enabled \
+        -Dstorage_fs=disabled \
+        -Dstorage_disk=disabled \
+        -Dstorage_gluster=disabled \
+        -Dstorage_iscsi=disabled \
+        -Dstorage_iscsi_direct=disabled \
+        -Dstorage_lvm=disabled \
+        -Dstorage_mpath=disabled \
+        -Dstorage_rbd=disabled \
+        -Dstorage_scsi=disabled \
+        -Dstorage_vstorage=disabled \
+        -Dstorage_zfs=disabled \
         -Ddriver_vbox=disabled
 fi
 

@@ -2732,6 +2732,54 @@ virNetDevGetLinkInfo(const char *ifname,
     return 0;
 }
 
+#elif defined(WIN32)
+/* state and speed of the adapter of that connection name */
+int
+virNetDevGetLinkInfo(const char *ifname,
+                     virNetDevIfLink *lnk)
+{
+    MIB_IF_ROW2 row = { 0 };
+    int ifindex;
+
+    lnk->speed = lnk->state = 0;
+    if (virNetDevGetIndex(ifname, &ifindex) < 0)
+        return -1;
+    row.InterfaceIndex = ifindex;
+    if (GetIfEntry2(&row) != NO_ERROR) {
+        virReportSystemError(ENODEV,
+                             _("Unable to get the link of interface %1$s"), ifname);
+        return -1;
+    }
+
+    switch (row.OperStatus) {
+    case IfOperStatusUp:
+        lnk->state = VIR_NETDEV_IF_STATE_UP;
+        /* in bits per second; unknown is ~0 */
+        if (row.TransmitLinkSpeed && row.TransmitLinkSpeed != ~0ULL)
+            lnk->speed = row.TransmitLinkSpeed / 1000000;
+        break;
+    case IfOperStatusDown:
+        lnk->state = VIR_NETDEV_IF_STATE_DOWN;
+        break;
+    case IfOperStatusTesting:
+        lnk->state = VIR_NETDEV_IF_STATE_TESTING;
+        break;
+    case IfOperStatusDormant:
+        lnk->state = VIR_NETDEV_IF_STATE_DORMANT;
+        break;
+    case IfOperStatusNotPresent:
+        lnk->state = VIR_NETDEV_IF_STATE_NOT_PRESENT;
+        break;
+    case IfOperStatusLowerLayerDown:
+        lnk->state = VIR_NETDEV_IF_STATE_LOWER_LAYER_DOWN;
+        break;
+    default:
+        lnk->state = VIR_NETDEV_IF_STATE_UNKNOWN;
+        break;
+    }
+    return 0;
+}
+
 #else
 
 int

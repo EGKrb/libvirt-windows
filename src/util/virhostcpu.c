@@ -23,6 +23,10 @@
 
 #include <dirent.h>
 #include <fcntl.h>
+#ifdef WIN32
+# define WIN32_LEAN_AND_MEAN
+# include <windows.h>
+#endif
 #ifndef WIN32
 # include <sys/ioctl.h>
 #endif
@@ -171,6 +175,176 @@ virHostCPUGetStatsFreeBSD(int cpuNum,
 }
 
 #endif /* __FreeBSD__ */
+
+#ifdef WIN32
+/* Processors of all the processor groups of Windows */
+static int
+virHostCPUGetCountWin32(void)
+{
+    DWORD n = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+
+    if (n == 0) {
+        virReportError(VIR_ERR_INTERNAL_ERROR,
+                       _("Unable to count the processors: Windows error %1$lu"),
+                       GetLastError());
+        return -1;
+    }
+    return n;
+}
+
+
+/* Packages, cores and NUMA nodes from the processor relations of Windows,
+ * counted as libvirt does: sockets per node, cores per socket, threads per
+ * core */
+static int
+virHostCPUGetInfoWin32(unsigned int *cpus,
+                       unsigned int *mhz,
+                       unsigned int *nodes,
+                       unsigned int *sockets,
+                       unsigned int *cores,
+                       unsigned int *threads)
+{
+    g_autofree BYTE *buf = NULL;
+    DWORD len = 0;
+    DWORD off;
+    unsigned int npackages = 0;
+    unsigned int ncores = 0;
+    ULONG highest = 0;
+    DWORD freq = 0;
+    DWORD size = sizeof(freq);
+    int n;
+
+    if ((n = virHostCPUGetCountWin32()) < 0)
+        return -1;
+    *cpus = n;
+
+    GetLogicalProcessorInformationEx(RelationAll, NULL, &len);
+    buf = g_malloc0(len);
+    if (!GetLogicalProcessorInformationEx(RelationAll,
+                                          (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)buf,
+                                          &len)) {
+        virReportError(VIR_ERR_INTERNAL_ERROR,
+                       _("Unable to get the processor topology: Windows error %1$lu"),
+                       GetLastError());
+        return -1;
+    }
+    for (off = 0; off < len; ) {
+        PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX info =
+            (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)(void *)(buf + off);
+
+        if (info->Relationship == RelationProcessorPackage)
+            npackages++;
+        else if (info->Relationship == RelationProcessorCore)
+            ncores++;
+        if (info->Size == 0)
+            break;
+        off += info->Size;
+    }
+    if (!GetNumaHighestNodeNumber(&highest))
+        highest = 0;
+
+    npackages = MAX(npackages, 1);
+    ncores = MAX(ncores, 1);
+    *nodes = highest + 1;
+    *sockets = MAX(npackages / *nodes, 1);
+    *cores = MAX(ncores / npackages, 1);
+    *threads = MAX(*cpus / ncores, 1);
+
+    /* the nominal frequency, as Windows reports it */
+    if (RegGetValueW(HKEY_LOCAL_MACHINE,
+                     L"HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0",
+                     L"~MHz", RRF_RT_REG_DWORD, NULL, &freq, &size) != ERROR_SUCCESS)
+        freq = 0;
+    *mhz = freq;
+    return 0;
+}
+
+
+/* SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION of NtQuerySystemInformation
+ * (class 8), in units of 100 ns; the kernel time includes the idle time */
+typedef struct {
+    LARGE_INTEGER idle;
+    LARGE_INTEGER kernel;
+    LARGE_INTEGER user;
+    LARGE_INTEGER dpc;
+    LARGE_INTEGER interrupt;
+    ULONG interrupts;
+} virHostCPUWin32Times;
+
+typedef LONG (WINAPI *virHostCPUNtQuerySystemInformation)(ULONG cls, PVOID buf,
+                                                          ULONG len, PULONG ret);
+
+# define WIN32_CPU_STATS_ALL 4
+
+static int
+virHostCPUGetStatsWin32(int cpuNum,
+                        virNodeCPUStatsPtr params,
+                        int *nparams)
+{
+    virHostCPUNtQuerySystemInformation query;
+    g_autofree virHostCPUWin32Times *times = NULL;
+    unsigned long long kernel = 0, user = 0, idle = 0, intr = 0;
+    ULONG got = 0;
+    int ncpus;
+    int i;
+    struct {
+        const char *field;
+        unsigned long long *value;
+    } map[] = {
+        { VIR_NODE_CPU_STATS_KERNEL, &kernel },
+        { VIR_NODE_CPU_STATS_USER, &user },
+        { VIR_NODE_CPU_STATS_IDLE, &idle },
+        { VIR_NODE_CPU_STATS_INTR, &intr },
+    };
+
+    if ((*nparams) == 0) {
+        *nparams = WIN32_CPU_STATS_ALL;
+        return 0;
+    }
+    if ((*nparams) != WIN32_CPU_STATS_ALL) {
+        virReportInvalidArg(*nparams,
+                            _("nparams in %1$s must be equal to %2$d"),
+                            __FUNCTION__, WIN32_CPU_STATS_ALL);
+        return -1;
+    }
+    if ((ncpus = virHostCPUGetCountWin32()) < 0)
+        return -1;
+    if (cpuNum != VIR_NODE_CPU_STATS_ALL_CPUS && (cpuNum < 0 || cpuNum >= ncpus)) {
+        virReportInvalidArg(cpuNum, _("Invalid cpuNum in %1$s"), __FUNCTION__);
+        return -1;
+    }
+
+    query = (virHostCPUNtQuerySystemInformation)(void (*)(void))
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQuerySystemInformation");
+    times = g_new0(virHostCPUWin32Times, ncpus);
+    if (!query ||
+        query(8, times, sizeof(*times) * ncpus, &got) < 0) {
+        virReportError(VIR_ERR_INTERNAL_ERROR, "%s",
+                       _("Unable to read the processor times"));
+        return -1;
+    }
+
+    for (i = 0; i < ncpus && (ULONG)(i + 1) * sizeof(*times) <= got; i++) {
+        if (cpuNum != VIR_NODE_CPU_STATS_ALL_CPUS && i != cpuNum)
+            continue;
+        kernel += (times[i].kernel.QuadPart - times[i].idle.QuadPart) * 100ULL;
+        user += times[i].user.QuadPart * 100ULL;
+        idle += times[i].idle.QuadPart * 100ULL;
+        intr += (times[i].interrupt.QuadPart + times[i].dpc.QuadPart) * 100ULL;
+    }
+
+    for (i = 0; i < WIN32_CPU_STATS_ALL; i++) {
+        if (virStrcpyStatic(params[i].field, map[i].field) < 0) {
+            virReportError(VIR_ERR_INTERNAL_ERROR,
+                           _("Field '%1$s' too long for destination"),
+                           map[i].field);
+            return -1;
+        }
+        params[i].value = *map[i].value;
+    }
+    return 0;
+}
+#endif /* WIN32 */
 
 /*
  * Even though it doesn't exist on some platforms, the code is adjusted for
@@ -1031,6 +1205,8 @@ virHostCPUGetInfo(virArch hostarch G_GNUC_UNUSED,
 # endif /* __FreeBSD__ */
 
     return 0;
+#elif defined(WIN32)
+    return virHostCPUGetInfoWin32(cpus, mhz, nodes, sockets, cores, threads);
 #else
     /* XXX Solaris will need an impl later if they port QEMU driver */
     virReportError(VIR_ERR_NO_SUPPORT, "%s",
@@ -1061,6 +1237,8 @@ virHostCPUGetStats(int cpuNum G_GNUC_UNUSED,
     }
 #elif defined(__FreeBSD__)
     return virHostCPUGetStatsFreeBSD(cpuNum, params, nparams);
+#elif defined(WIN32)
+    return virHostCPUGetStatsWin32(cpuNum, params, nparams);
 #else
     virReportError(VIR_ERR_NO_SUPPORT, "%s",
                    _("node CPU stats not implemented on this platform"));
@@ -1076,6 +1254,8 @@ virHostCPUGetCount(void)
     return virHostCPUCountLinux();
 #elif defined(__FreeBSD__) || defined(__APPLE__)
     return virHostCPUGetCountAppleFreeBSD();
+#elif defined(WIN32)
+    return virHostCPUGetCountWin32();
 #else
     virReportError(VIR_ERR_NO_SUPPORT, "%s",
                    _("host cpu counting not implemented on this platform"));
@@ -1118,15 +1298,16 @@ virHostCPUGetOnlineBitmap(void)
     virFileReadValueBitmap(&ret, "%s/cpu/online", SYSFS_SYSTEM_PATH);
 
     return ret;
-#elif defined(__FreeBSD__)
+#elif defined(__FreeBSD__) || defined(WIN32)
     virBitmap *ret = NULL;
-    int ncpus = virHostCPUGetCountAppleFreeBSD();
+    int ncpus = virHostCPUGetCount();
 
     if (ncpus == -1)
         return ret;
 
     /* FreeBSD does not support CPU hotplug, so it is safe to assume
-     * that all available CPUs are online */
+     * that all available CPUs are online (and the active processors of
+     * Windows are online) */
     ret = virBitmapNew(ncpus);
     virBitmapSetAll(ret);
 
@@ -1633,6 +1814,57 @@ virHostCPUGetMSRFromKVM(unsigned long index G_GNUC_UNUSED,
     return -1;
 }
 
+#ifdef WIN32
+/*
+ * Windows gives no access to the MSRs from user space (no msr device, no
+ * KVM): reading them is best effort for the callers, so quietly nothing
+ */
+int
+virHostCPUGetMSR(unsigned long index,
+                 uint64_t *msr G_GNUC_UNUSED)
+{
+    VIR_DEBUG("MSR 0x%lx cannot be read on Windows", index);
+    return -1;
+}
+
+typedef HRESULT (WINAPI *virHostCPUWHvGetCapability)(UINT32 code, VOID *buf,
+                                                     UINT32 size, UINT32 *written);
+/* WHvCapabilityCodeProcessorClockFrequency of WinHvPlatformDefs.h */
+# define VIR_HOST_CPU_WHV_PROCESSOR_CLOCK_FREQUENCY 0x00001004
+
+/* The TSC frequency of the Windows Hypervisor Platform, which guests see */
+virHostCPUTscInfo *
+virHostCPUGetTscInfo(void)
+{
+    g_autofree virHostCPUTscInfo *info = g_new0(virHostCPUTscInfo, 1);
+    HMODULE whp = LoadLibraryExW(L"WinHvPlatform.dll", NULL,
+                                 LOAD_LIBRARY_SEARCH_SYSTEM32);
+    virHostCPUWHvGetCapability getCap = NULL;
+    UINT64 hz = 0;
+    HRESULT hr = E_NOTIMPL;
+
+    if (whp)
+        getCap = (virHostCPUWHvGetCapability)(void (*)(void))
+            GetProcAddress(whp, "WHvGetCapability");
+    if (getCap)
+        hr = getCap(VIR_HOST_CPU_WHV_PROCESSOR_CLOCK_FREQUENCY, &hz, sizeof(hz), NULL);
+    if (whp)
+        FreeLibrary(whp);
+
+    if (FAILED(hr) || hz == 0) {
+        virReportError(VIR_ERR_OPERATION_UNSUPPORTED,
+                       _("Unable to probe TSC frequency: the Windows Hypervisor Platform answered 0x%1$lx"),
+                       (unsigned long)hr);
+        return NULL;
+    }
+    info->frequency = hz;
+    /* WHPX tells nothing of TSC scaling */
+    info->scaling = VIR_TRISTATE_BOOL_ABSENT;
+
+    VIR_DEBUG("Detected TSC frequency %llu Hz", info->frequency);
+    return g_steal_pointer(&info);
+}
+#else
 int
 virHostCPUGetMSR(unsigned long index G_GNUC_UNUSED,
                  uint64_t *msr G_GNUC_UNUSED)
@@ -1649,6 +1881,7 @@ virHostCPUGetTscInfo(void)
                          _("Probing TSC is not supported on this platform"));
     return NULL;
 }
+#endif /* WIN32 */
 
 #endif /* WITH_LINUX_KVM_H && defined(KVM_GET_MSRS) && \
           (defined(__i386__) || defined(__x86_64__)) */

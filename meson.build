@@ -47,8 +47,9 @@ conf.set_quoted('VERSION', meson.project_version())
 
 if host_machine.system() == 'windows'
   # For AI_ADDRCONFIG
-  conf.set('_WIN32_WINNT', '0x0600') # Win Vista / Server 2008
-  conf.set('WINVER', '0x0600') # Win Vista / Server 2008
+  # Windows 10: the port needs its AF_UNIX sockets (1803)
+  conf.set('_WIN32_WINNT', '0x0A00')
+  conf.set('WINVER', '0x0A00')
 endif
 
 
@@ -1335,6 +1336,7 @@ if host_machine.system() == 'windows'
   winsock2_dep = cc.find_library('ws2_32')
   iphlpapi_dep = cc.find_library('iphlpapi')
   setupapi_dep = cc.find_library('setupapi')
+  cfgmgr32_dep = cc.find_library('cfgmgr32')
   win32_dep = declare_dependency(
     dependencies: [
       ole32_dep,
@@ -1342,6 +1344,7 @@ if host_machine.system() == 'windows'
       winsock2_dep,
       iphlpapi_dep,
       setupapi_dep,
+      cfgmgr32_dep,
     ],
   )
   if get_option('default_library') == 'static'
@@ -1656,12 +1659,12 @@ elif get_option('driver_network').enabled()
   error('libvirtd must be enabled to build the network driver')
 endif
 
-if not get_option('driver_nodedev').disabled() and conf.has('WITH_LIBVIRTD') and udev_dep.found()
+if not get_option('driver_nodedev').disabled() and conf.has('WITH_LIBVIRTD') and (udev_dep.found() or host_machine.system() == 'windows')
   conf.set('WITH_NODE_DEVICES', 1)
 elif get_option('driver_nodedev').enabled()
   if not conf.has('WITH_LIBVIRTD')
     error('libvirtd must be enabled to build the node device driver')
-  elif not udev_dep.found()
+  elif not udev_dep.found() and host_machine.system() != 'windows'
     error('udev library is required to build the node device driver')
   endif
 endif

@@ -37,6 +37,8 @@
 #include "node_device_driver.h"
 #if WITH_UDEV
 # include "node_device_udev.h"
+#elif defined(WIN32)
+# include "node_device_win32.h"
 #endif
 #include "virvhba.h"
 #include "viraccessapicheck.h"
@@ -1779,6 +1781,8 @@ nodedevRegister(void)
 {
 #ifdef WITH_UDEV
     return udevNodeRegister();
+#elif defined(WIN32)
+    return win32NodeRegister();
 #endif
 }
 

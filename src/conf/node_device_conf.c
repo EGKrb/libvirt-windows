@@ -3519,7 +3519,9 @@ int
 virNodeDeviceGetPCIDynamicCaps(const char *sysfsPath G_GNUC_UNUSED,
                                virNodeDevCapPCIDev *pci_dev G_GNUC_UNUSED)
 {
-    return -1;
+    /* nothing more to read without sysfs (SR-IOV, mdev types): what the
+     * node device driver found stands, as on Windows */
+    return 0;
 }
 
 

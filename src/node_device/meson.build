@@ -8,6 +8,10 @@ if conf.has('WITH_UDEV')
   node_device_driver_sources += 'node_device_udev.c'
 endif
 
+if host_machine.system() == 'windows'
+  node_device_driver_sources += 'node_device_win32.c'
+endif
+
 driver_source_files += files(node_device_driver_sources)
 
 if conf.has('WITH_NODE_DEVICES')
@@ -22,6 +26,7 @@ if conf.has('WITH_NODE_DEVICES')
       pciaccess_dep,
       src_dep,
       udev_dep,
+      win32_dep,
     ],
     include_directories: [
       conf_inc_dir,
