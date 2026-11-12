@@ -40,8 +40,12 @@ VIR_LOG_INIT("storage.storage_backend_fs");
 
 #if WITH_STORAGE_FS
 
-# include <mntent.h>
-# include <paths.h>
+# ifdef WIN32
+#  include "storage_backend_fs_win32.h"
+# else
+#  include <mntent.h>
+#  include <paths.h>
+# endif
 
 struct _virNetfsDiscoverState {
     const char *host;
@@ -86,7 +90,7 @@ virStorageBackendFileSystemNetFindPoolSourcesFunc(char **const groups,
 }
 
 
-static int
+static int G_GNUC_UNUSED
 virStorageBackendFileSystemNetFindNFSPoolSources(virNetfsDiscoverState *state)
 {
     /*
@@ -156,7 +160,12 @@ virStorageBackendFileSystemNetFindPoolSources(const char *srcSpec,
 
     state.host = source->hosts[0].name;
 
+#ifdef WIN32
+    /* the disk shares of the host, where showmount lists NFS exports */
+    retNFS = virStorageBackendFsWin32FindShares(state.host, &state.list);
+#else
     retNFS = virStorageBackendFileSystemNetFindNFSPoolSources(&state);
+#endif
 
     retGluster = virStorageBackendFindGlusterPoolSources(state.host,
                                                          VIR_STORAGE_POOL_NETFS,
@@ -237,6 +246,9 @@ virStorageBackendFileSystemIsValid(virStoragePoolObj *pool)
 static int
 virStorageBackendFileSystemIsMounted(virStoragePoolObj *pool)
 {
+#ifdef WIN32
+    return virStorageBackendFsWin32IsMounted(pool);
+#else
     int ret = -1;
     virStoragePoolDef *def = virStoragePoolObjGetDef(pool);
     FILE *mtab;
@@ -270,6 +282,7 @@ virStorageBackendFileSystemIsMounted(virStoragePoolObj *pool)
  cleanup:
     VIR_FORCE_FCLOSE(mtab);
     return ret;
+#endif /* !WIN32 */
 }
 
 
@@ -304,6 +317,9 @@ virStorageBackendFileSystemMount(virStoragePoolObj *pool)
     if (!(src = virStorageBackendFileSystemGetPoolSource(pool)))
         return -1;
 
+#ifdef WIN32
+    rc = virStorageBackendFsWin32Mount(pool);
+#else
     cmd = virStorageBackendFileSystemMountCmd("mount", def, src);
 
     /* Mounting a shared FS might take a long time. Don't hold
@@ -311,6 +327,7 @@ virStorageBackendFileSystemMount(virStoragePoolObj *pool)
     virObjectUnlock(pool);
     rc = virCommandRun(cmd, NULL);
     virObjectLock(pool);
+#endif
 
     return rc;
 }
@@ -351,7 +368,7 @@ virStorageBackendFileSystemStart(virStoragePoolObj *pool)
 static int
 virStorageBackendFileSystemStop(virStoragePoolObj *pool)
 {
-    virStoragePoolDef *def = virStoragePoolObjGetDef(pool);
+    virStoragePoolDef *def G_GNUC_UNUSED = virStoragePoolObjGetDef(pool);
     int rc;
     g_autoptr(virCommand) cmd = NULL;
 
@@ -362,8 +379,12 @@ virStorageBackendFileSystemStop(virStoragePoolObj *pool)
     if ((rc = virStorageBackendFileSystemIsMounted(pool)) != 1)
         return rc;
 
+#ifdef WIN32
+    return virStorageBackendFsWin32Unmount(pool);
+#else
     cmd = virCommandNewArgList("umount", def->target.path, NULL);
     return virCommandRun(cmd, NULL);
+#endif
 }
 #endif /* WITH_STORAGE_FS */
 
@@ -395,7 +416,7 @@ virStorageBackendFileSystemCheck(virStoragePoolObj *pool,
     return 0;
 }
 
-static int
+static int G_GNUC_UNUSED
 virStorageBackendExecuteMKFS(const char *device,
                              const char *format)
 {
@@ -428,6 +449,14 @@ static int
 virStorageBackendMakeFileSystem(virStoragePoolObj *pool,
                                 unsigned int flags)
 {
+#ifdef WIN32
+    int rc;
+
+    virObjectUnlock(pool);
+    rc = virStorageBackendFsWin32MakeFileSystem(pool, flags);
+    virObjectLock(pool);
+    return rc;
+#else
     virStoragePoolDef *def = virStoragePoolObjGetDef(pool);
     const char *device = NULL, *format = NULL;
     bool ok_to_mkfs = false;
@@ -465,6 +494,7 @@ virStorageBackendMakeFileSystem(virStoragePoolObj *pool,
  error:
     virObjectLock(pool);
     return ret;
+#endif /* !WIN32 */
 }
 
 

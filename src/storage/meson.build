@@ -15,6 +15,10 @@ storage_backend_fs_sources = [
   'storage_backend_fs.c',
 ]
 
+if host_machine.system() == 'windows'
+  storage_backend_fs_sources += 'storage_backend_fs_win32.c'
+endif
+
 storage_backend_disk_sources = [
   'storage_backend_disk.c',
 ]
