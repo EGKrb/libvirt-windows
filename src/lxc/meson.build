@@ -197,3 +197,23 @@ if conf.has('WITH_LXC')
     runstatedir / 'libvirt' / 'lxc',
   ]
 endif
+
+# Windows: virtlxcd runs the LXC driver of Linux in a VM (lxc_win32_vm.c)
+if host_machine.system() == 'windows'
+  virt_helpers += {
+    'name': 'virtlxcd',
+    'sources': [
+      files('lxc_win32_vm.c'),
+    ],
+    'deps': [
+      cc.find_library('ws2_32'),
+    ],
+    'install_dir': sbindir,
+  }
+
+  install_data(
+    'lxc-vm-setup.ps1',
+    'lxc-vm-provision.sh',
+    install_dir: pkgdatadir / 'lxc',
+  )
+endif
