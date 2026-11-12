@@ -37,6 +37,9 @@ virNetDevBridgeSwitchPortPath;
 virNetDevBridgeSwitchPortRemove;
 virNetDevBridgeSwitchSocketPath;
 
+# util/virxdrdefs.h
+virXDRUint64;
+
 # util/virprocess.h
 virProcessWin32AddChild;
 

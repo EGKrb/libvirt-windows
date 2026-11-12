@@ -28,3 +28,13 @@
 #ifndef IXDR_GET_U_INT32
 # define IXDR_GET_U_INT32 IXDR_GET_U_LONG
 #endif
+
+#ifdef WIN32
+/* portablexdr's xdr_uint64_t sign-extends the low word it decodes
+ * (0x80000000 reads back as 0xffffffff80000000): libvirt's own, see
+ * virxdrdefs.c */
+# include <stdint.h>
+bool_t virXDRUint64(XDR *xdrs, uint64_t *objp);
+# undef xdr_uint64_t
+# define xdr_uint64_t virXDRUint64
+#endif

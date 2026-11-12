@@ -109,6 +109,7 @@ util_sources = [
   'virvhba.c',
   'virpcivpd.c',
   'virvsock.c',
+  'virxdrdefs.c',
   'virxml.c',
 ]
 
