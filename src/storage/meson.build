@@ -96,6 +96,24 @@ if conf.has('WITH_STORAGE')
     ],
   }
 
+  # Windows: mount(8) of NFS, with libnfs and WinFsp
+  libnfs_helper_dep = dependency('libnfs', required: false)
+  if host_machine.system() == 'windows' and conf.has('WITH_STORAGE_FS') and libnfs_helper_dep.found()
+    virt_helpers += {
+      'name': 'libvirt_nfsmount',
+      'sources': [
+        files('storage_nfsmount_win32.c'),
+      ],
+      'include': [
+        include_directories('../../windows/winfsp/inc/fuse'),
+      ],
+      'deps': [
+        libnfs_helper_dep,
+        cc.find_library('ws2_32'),
+      ],
+    }
+  endif
+
   if host_machine.system() != 'windows'
     virt_modules += {
       'name': 'virt_storage_backend_fs',
