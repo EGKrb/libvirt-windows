@@ -27,15 +27,15 @@ The source of libvirt itself is the repository at this tag (*Source code* below)
 
 ## What works
 
-Daemons (modular and `libvirtd`), secrets, remote access over UNIX sockets and SSH, QEMU guests with WHPX (lifecycle, `virsh console`, screenshots, QMP, NIC hotplug, memory balloon, save/restore, dump, snapshots, live migration with or without storage copy), user networking, virtual networks (NAT, isolated, `route` and `open` through Wintun) with DHCP, DHCPv6, DNS, IPv6, QoS and Windows firewall rules, TAP-Windows interfaces and bridges to the host's LAN, storage pools of directories, node devices. The [status table](https://github.com/EGKrb/libvirt-windows#status) lists what is not done yet.
+Daemons (modular and `libvirtd`), secrets, remote access over UNIX sockets, TLS and SSH, QEMU guests with WHPX (lifecycle, `virsh console`, screenshots, QMP, NIC hotplug, memory balloon, save/restore, dump, snapshots, live migration with or without storage copy), user networking, virtual networks (NAT, isolated, `route` and `open` through Wintun) with DHCP, DHCPv6, DNS, IPv6, QoS and Windows firewall rules, TAP-Windows interfaces and bridges to the host's LAN, network filters, storage pools of directories, volumes and shares, node devices, host interfaces, LXC in a Linux VM. The [status table](https://github.com/EGKrb/libvirt-windows#status) lists what is not done.
 
-New in 0.4.0, tested on Windows 11 26300:
+New in 0.5.0, tested on Windows 11 26300:
 
-- Storage driver (`virtstoraged`): pools of type `dir` and their volumes (raw, and qcow2 with `qemu-img`): create, clone, resize, upload, download, wipe, delete. A migration with `--copy-storage-all` now creates the destination disk in the pool that holds its path, as on Linux.
-- Node device driver (`virtnodedevd`): `nodedev-list` and `nodedev-dumpxml` of the computer, PCI and USB devices, network interfaces and disks, under their parents in the device tree of Windows.
-- Host information: `virsh sysinfo` and `<smbios mode='host'/>` from the SMBIOS table, the host UUID from it, `nodeinfo`, `nodecpustats`, `nodecpumap`, the host CPU model and its TSC frequency in `capabilities`.
-- Snapshots (internal and external, with memory, revert, delete) and `--copy-storage-all` migrations, tested.
-- Remote access over SSH: `qemu+ssh` (with the `ssh` of Windows or of MSYS2), `qemu+libssh` and `qemu+libssh2`, with `virt-ssh-helper` on the remote side.
-- Fix: 64-bit unsigned values carried by the RPC protocol could read back wrong (MSYS2's XDR library sign-extended them), for example sizes of 2 GiB and more.
+- Network filters (`virtnwfilterd`): the filters of interfaces on a libvirt network (`clean-traffic`, your own) are applied by the network's switch, as ebtables/nftables apply them on Linux: every protocol and attribute of nwfilter, the chains and priorities, connection states (`ct state`, the replies of accepted connections), `reject`, filters changed on running guests, and the learning of the guest's IP address (`CTRL_IP_LEARNING` `any` and `dhcp`). Each interface now has its own socket on the switch, so that a guest cannot pass for another one by its MAC address.
+- Host interfaces (`virtinterfaced`): `iface-list`, `iface-dumpxml` (a network bridge of Windows is a bridge with its members; IPv4 and IPv6 configuration), `iface-mac`, `iface-name`, `iface-start` and `iface-destroy`.
+- Storage pools of type `netfs` (SMB shares; NFS with the Client for NFS of Windows) and `fs` (a volume mounted on the pool's directory, formatted by `pool-build --overwrite`); `find-storage-pool-sources` lists the shares of a host.
+- LXC (`virtlxcd`): `lxc:///system` is the LXC driver of libvirt running in a small Alpine Linux VM under WHPX, which `virtlxcd --setup` makes once; same commands and XML as on Linux, the containers live in that VM.
+- TLS (`qemu+tls://`), tested.
+- Not possible: PCI passthrough needs Hyper-V's device assignment (`pcip.sys`), which Windows Home does not have.
 
-Since 0.3.0: save, restore, `managedsave`, `dump` and live migration with WHPX (with the [QEMU patch](https://github.com/EGKrb/libvirt-windows/tree/main/windows/qemu)), bridges to the host's LAN, `managed='no'` TAP adapters. Since 0.2.0: TAP-Windows interfaces, forward modes `route` and `open` through Wintun, Windows firewall rules.
+Since 0.4.0: storage pools of directories, node devices, host information (SMBIOS, CPU, TSC), snapshots, SSH transports. Since 0.3.0: save, restore, `managedsave`, `dump` and live migration with WHPX (with the [QEMU patch](https://github.com/EGKrb/libvirt-windows/tree/main/windows/qemu)), bridges to the host's LAN, `managed='no'` TAP adapters. Since 0.2.0: TAP-Windows interfaces, forward modes `route` and `open` through Wintun, Windows firewall rules.

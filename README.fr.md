@@ -31,14 +31,17 @@ Alpine.
 | Domaine | Fonctionne et testé | Pas fait ou pas testé |
 | --- | --- | --- |
 | Démons | `libvirtd` et les démons modulaires, `--daemon`, rechargement et arrêt (signaux par événements nommés), reprise des invités après un redémarrage | services Windows |
-| Accès distant | sockets UNIX ; transports `ssh` (avec le `ssh` de Windows ou de MSYS2), `libssh`, `libssh2` et `ext` | TLS |
+| Accès distant | sockets UNIX ; TLS (`qemu+tls://`, avec `virtproxyd` ou `libvirtd`) ; transports `ssh` (avec le `ssh` de Windows ou de MSYS2), `libssh`, `libssh2` et `ext` | |
 | Secrets | define, set, get, undefine, persistance | |
 | QEMU | type de domaine `whpx` ; define, start, destroy, suspend, resume ; `screenshot` ; `qemu-monitor-command` ; `virsh console` (série sur socket UNIX) ; ajout et retrait de cartes à chaud ; `setmem` (ballon, mémoire rendue à l'hôte avec le [correctif QEMU](windows/qemu)) ; `dommemstat` ; `save`, `restore`, `managedsave`, `dump` ; migration à chaud (directe et `--p2p`, entre deux instances de libvirt, aussi avec `--copy-storage-all`), instantanés (internes et externes, avec ou sans mémoire, retour, suppression), avec le correctif QEMU ; `virsh sysinfo`, `<smbios mode='host'/>` et `<sysinfo>`, UUID de l'hôte tiré du SMBIOS | |
 | Réseau des invités | `type='user'` (libslirp) ; `type='network'` et `type='bridge'` vers un réseau libvirt ; `type='ethernet'` sur un adaptateur TAP-Windows (créé, nommé, adressé et supprimé par libvirt ; `domifstat`), ou un existant avec `managed='no'` ; `type='bridge'` et réseaux `<forward mode='bridge'/>` sur un pont réseau de Windows (le réseau local de l'hôte) | |
 | Réseaux virtuels | modes `nat` et isolé ; DHCP et DHCPv6 (plages, réservations par MAC, DUID ou nom) ; DNS (hôtes, TXT, SRV, PTR, redirecteurs, domaine local) ; IPv6 (SLAAC ou DHCPv6) ; `net-update` ; `net-dhcp-leases` ; `domifaddr` ; autostart ; QoS (`domiftune`, floors, bande passante du réseau) ; `domifstat` ; modes `route` et `open` (Wintun) | |
-| Stockage | pools de type `dir` : define, build, start, refresh, autostart ; volumes (raw, qcow2 par `qemu-img`) : create, clone, resize, upload, download, wipe, delete ; disques de `--copy-storage-all` créés dans le pool de la destination | autres types de pool (LVM, iSCSI, disque, NFS...) |
-| Périphériques de l'hôte | `nodedev-list` (et `--tree`), `nodedev-dumpxml` : l'ordinateur (SMBIOS), périphériques PCI et USB, interfaces réseau (état et débit du lien), disques ; `nodeinfo`, `nodecpustats`, `nodecpumap`, modèle du CPU de l'hôte et fréquence du TSC dans `capabilities` | événements de périphériques (un rechargement les énumère à nouveau), passthrough PCI, périphériques médiés |
-| Autres pilotes | | interface, nwfilter, LXC, VirtualBox |
+| Stockage | pools de type `dir` : define, build, start, refresh, autostart ; volumes (raw, qcow2 par `qemu-img`) : create, clone, resize, upload, download, wipe, delete ; disques de `--copy-storage-all` créés dans le pool de la destination | `netfs` (partages SMB, NFS avec le client NFS de Windows ; `find-storage-pool-sources` liste les partages d'un hôte) et `fs` (un volume monté sur le dossier cible ; `pool-build --overwrite` le formate) : écrits, erreurs testées, montage pas encore testé (il demande les droits d'administrateur) ; pools LVM, iSCSI, disque, multipath, RBD, Gluster, ZFS : pas d'équivalent Windows fait |
+| Périphériques de l'hôte | `nodedev-list` (et `--tree`), `nodedev-dumpxml` : l'ordinateur (SMBIOS), périphériques PCI et USB, interfaces réseau (état et débit du lien), disques ; `nodeinfo`, `nodecpustats`, `nodecpumap`, modèle du CPU de l'hôte et fréquence du TSC dans `capabilities` | événements de périphériques (un rechargement les énumère à nouveau) ; passthrough PCI et périphériques médiés : Windows ne prête des périphériques aux invités qu'avec Hyper-V (Discrete Device Assignment, `pcip.sys`), absent de Windows Famille, et QEMU ne s'en sert pas |
+| Interfaces de l'hôte | `iface-list` (`--all`, `--inactive`), `iface-dumpxml` (adaptateurs Ethernet, Wi-Fi, TAP et Wintun ; un pont réseau de Windows comme pont avec ses membres ; configuration IPv4 et IPv6), `iface-mac`, `iface-name` | `iface-start` et `iface-destroy` (activer et désactiver un adaptateur) : écrits, pas encore testés (droits d'administrateur) ; `iface-define` : Windows garde lui-même la configuration de ses adaptateurs |
+| Filtres réseau | `nwfilter-define`, `-list`, `-dumpxml`, liaisons ; les filtres des interfaces sur un réseau libvirt (`clean-traffic`...), avec tous les protocoles et attributs, les états de connexion, `reject` ; apprentissage de l'adresse IP (`any`, `dhcp`) | interfaces `type='ethernet'` et sur les ponts de Windows (adaptateurs TAP-Windows) : pas de filtre |
+| LXC | `lxc:///system` : le pilote LXC de libvirt dans une petite VM Alpine Linux que lance `virtlxcd` (`virtlxcd --setup` la crée une fois) | conteneurs, systèmes de fichiers et réseaux sont dans cette VM ; `lxc-enter-namespace` |
+| Autres pilotes | | VirtualBox |
 
 ## Fonctionnement
 
@@ -55,11 +58,16 @@ Alpine.
 | udev, sysfs (périphériques) | SetupAPI et l'arbre des périphériques de Windows, l'API IP helper, les IOCTL de stockage |
 | `/proc/cpuinfo`, `/proc/stat`, KVM (TSC) | les relations de processeurs de Windows, `NtQuerySystemInformation`, la Windows Hypervisor Platform (fréquence du TSC) ; les MSR, que Windows ne laisse pas lire depuis l'espace utilisateur, sont omis |
 | `statvfs`, `fallocate` (stockage) | `GetDiskFreeSpaceEx` ; volumes écrits en entier |
+| `mount` (pools `fs` et `netfs`) | un lien symbolique de dossier vers `\\HÔTE\PARTAGE` ; un point de montage de volume |
+| udev, netcf (interfaces de l'hôte) | l'API IP helper et la classe réseau de SetupAPI ; `netsh` pour activer et désactiver |
 | Bridge, TAP, dnsmasq, iptables | `libvirt_netswitch` : un processus par réseau, switch Ethernet sur socket UNIX que QEMU rejoint par `-netdev stream`, libslirp pour le NAT, DHCP/DHCPv6/DNS intégrés, QoS par seaux à jetons |
 | Périphériques TAP de `type='ethernet'` | adaptateurs TAP-Windows6 créés par SetupAPI ; adaptateurs Wintun pour `route` et `open` |
 | Ponts de l'hôte (`br0`), `brctl`/`ip link` | ponts réseau de Windows, `netsh bridge add`/`remove` |
 | Zone firewalld `libvirt` | règles du pare-feu Windows du groupe `libvirt` |
 | `tc` | le switch limite ce que reçoit un invité (file d'attente) et ce qu'il envoie (rejet) |
+| ebtables, iptables, nftables (nwfilter) | les filtres compilés en un programme que le switch exécute sur chaque trame du port, avec son propre suivi des connexions ; chaque interface a sa socket sur le switch |
+| libpcap (apprentissage de l'adresse IP, DHCP snooping) | une socket de surveillance de l'interface sur le switch |
+| Un noyau Linux (LXC) | une VM Alpine Linux sous WHPX, dont la libvirt est jointe par SSH |
 | Descripteurs passés à QEMU (`getfd`, SCM_RIGHTS) | sockets dupliquées pour QEMU (`get-win32-socket`) ; fichiers (save, restore, dump) relayés par un thread de libvirt sur une paire de sockets ; QEMU se connecte lui-même à la destination d'une migration |
 | Remplacer des binaires en cours d'exécution | renommés `NOM.busy-HORODATAGE` par l'installation, supprimés par la suivante |
 

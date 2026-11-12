@@ -142,11 +142,11 @@ Escape character is ^] (Ctrl + ])
           <thead><tr><th>Area</th><th>Works and tested</th><th>Not yet</th></tr></thead>
           <tbody>
             <tr><td>Daemons</td><td>modular and monolithic, reload, stop, reconnection</td><td>Windows services</td></tr>
-            <tr><td>Remote</td><td>UNIX sockets, <code>ssh</code>, <code>libssh</code>, <code>libssh2</code>, <code>ext</code></td><td>TLS</td></tr>
+            <tr><td>Remote</td><td>UNIX sockets, TLS, <code>ssh</code>, <code>libssh</code>, <code>libssh2</code>, <code>ext</code></td><td></td></tr>
             <tr><td>QEMU</td><td>lifecycle, console, screenshot, QMP, hotplug, balloon, memory stats, save/restore, dump, live migration (also with storage copy), snapshots, SMBIOS sysinfo</td><td></td></tr>
             <tr><td>Guest networking</td><td><code>user</code>, <code>network</code>, <code>bridge</code> to a libvirt network, <code>ethernet</code> (TAP-Windows), bridges to the host LAN (Windows network bridge)</td><td></td></tr>
             <tr><td>Virtual networks</td><td><code>nat</code>, isolated, <code>route</code> and <code>open</code> (Wintun), DHCP, DHCPv6, DNS, IPv6, QoS</td><td></td></tr>
-            <tr><td>Other drivers</td><td>secrets, storage (directory pools), node devices (PCI, USB, network, disks)</td><td>interface, nwfilter, LXC</td></tr>
+            <tr><td>Other drivers</td><td>secrets; storage (pools <code>dir</code>, <code>fs</code>, <code>netfs</code>); node devices (PCI, USB, network, disks); host interfaces; network filters (nwfilter, in the network switch, with IP address learning); LXC (in an Alpine Linux VM)</td><td>other pool types; PCI passthrough (Hyper-V only)</td></tr>
           </tbody>
         </table>
       </div>
@@ -167,6 +167,8 @@ Escape character is ^] (Ctrl + ])
             <tr><td>KVM</td><td>WHPX, TCG otherwise</td></tr>
             <tr><td>Bridge, TAP, dnsmasq, iptables</td><td><code>libvirt_netswitch</code>: one process per network, an Ethernet switch that QEMU joins with <code>-netdev stream</code>, libslirp for NAT, its own DHCP and DNS</td></tr>
             <tr><td><code>tc</code></td><td>token buckets in the switch</td></tr>
+            <tr><td>ebtables, nftables (nwfilter)</td><td>programs the switch runs on each frame, with connection tracking</td></tr>
+            <tr><td>A Linux kernel (LXC)</td><td>an Alpine Linux VM under WHPX</td></tr>
             <tr><td>Symbolic links</td><td>symbolic links, or the system files of Cygwin and MSYS2</td></tr>
           </tbody>
         </table>

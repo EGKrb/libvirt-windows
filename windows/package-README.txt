@@ -37,6 +37,8 @@ From PowerShell, in this folder:
     sbin\virtqemud.exe --daemon
     sbin\virtstoraged.exe --daemon
     sbin\virtnodedevd.exe --daemon
+    sbin\virtinterfaced.exe --daemon
+    sbin\virtnwfilterd.exe --daemon
     bin\virsh.exe -c qemu:///system net-list --all
 
 The "default" network (NAT, 192.168.122.0/24) starts with virtnetworkd.
@@ -47,6 +49,20 @@ which migrations with --copy-storage-all also create their disks in:
     bin\virsh.exe -c qemu:///system pool-build default
     bin\virsh.exe -c qemu:///system pool-start default
     bin\virsh.exe -c qemu:///system pool-autostart default
+
+Pools of type netfs link their target directory to a share (\\HOST\DIR),
+pools of type fs mount a volume (E: or \\?\Volume{GUID}\) on it: both take
+administrator rights (or the developer mode of Windows for netfs).
+
+Network filters (nwfilter) apply to the interfaces of guests on a libvirt
+network, enforced by its switch.
+
+LXC: containers run in a small Alpine Linux VM. Once, with Internet access
+(it downloads Alpine), then whenever LXC is wanted:
+
+    sbin\virtlxcd.exe --setup -Qemu C:\path\to\qemu-system-x86_64.exe
+    sbin\virtlxcd.exe --daemon
+    bin\virsh.exe -c lxc:///system list --all
 
 Domains use <domain type='whpx'>; see the README of the repository for a
 complete example.
