@@ -2112,6 +2112,45 @@ virWin32Symlink(const char *target, const char *linkpath)
 
 
 /*
+ * ftruncate() for Windows: the end of file is set (a SETATTR of the size
+ * on a network file system), where _chsize_s() of the C runtime grows a
+ * file by writing zeros 4 KiB at a time.  The file reads as zeros past its
+ * former end, as on POSIX.
+ */
+int
+virWin32Ftruncate(int fd, off_t length)
+{
+    HANDLE h = (HANDLE)_get_osfhandle(fd);
+    FILE_END_OF_FILE_INFO eof;
+
+    if (h == INVALID_HANDLE_VALUE) {
+        errno = EBADF;
+        return -1;
+    }
+    if (length < 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    eof.EndOfFile.QuadPart = length;
+    if (!SetFileInformationByHandle(h, FileEndOfFileInfo, &eof, sizeof(eof))) {
+        switch (GetLastError()) {
+        case ERROR_ACCESS_DENIED:
+            errno = EACCES;
+            break;
+        case ERROR_DISK_FULL:
+            errno = ENOSPC;
+            break;
+        default:
+            errno = EINVAL;
+            break;
+        }
+        return -1;
+    }
+    return 0;
+}
+
+
+/*
  * rename() for Windows, with the POSIX semantics callers rely on: an
  * existing @newpath is replaced, which the C runtime refuses to do.  As on
  * POSIX, moving to another volume fails with EXDEV.

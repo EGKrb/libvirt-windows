@@ -42,6 +42,11 @@ int virWin32Symlink(const char *target, const char *linkpath);
 int virWin32Rename(const char *oldpath, const char *newpath);
 # undef rename
 # define rename(oldpath, newpath) virWin32Rename(oldpath, newpath)
+/* ftruncate() of the C runtime (_chsize_s) grows a file by writing zeros
+ * 4 KiB at a time: the end of file is set instead, as on Linux */
+int virWin32Ftruncate(int fd, off_t length);
+# undef ftruncate
+# define ftruncate(fd, length) virWin32Ftruncate(fd, length)
 #endif
 
 #if defined(WIN32)

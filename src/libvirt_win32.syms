@@ -28,6 +28,7 @@ virWin32Uname;
 
 # util/virfile.h
 virWin32Rename;
+virWin32Ftruncate;
 virWin32Symlink;
 
 # util/virnetdevbridge.h

@@ -526,7 +526,7 @@ main(int argc, char **argv)
     int gid = 0;
     char evname[64];
     g_autofree char *volname = NULL;
-    char *fargv[8];
+    char *fargv[10];
     int fargc = 0;
     WSADATA wsa;
     int i;
@@ -587,6 +587,9 @@ main(int argc, char **argv)
     fargv[fargc++] = argv[0];
     fargv[fargc++] = (char *)"-f";
     fargv[fargc++] = (char *)"-s";
+    /* every request of WinFsp and its answer, in the log of the pool */
+    if (getenv("LIBVIRT_NFSMOUNT_DEBUG"))
+        fargv[fargc++] = (char *)"-d";
     fargv[fargc++] = volname;
     fargv[fargc++] = (char *)mountpoint;
     fargv[fargc] = NULL;

@@ -152,6 +152,10 @@ virStorageBackendCopyToFD(virStorageVolDef *vol,
 #ifndef WIN32
     if ((wbytes == 0) && fstat(fd, &st) == 0)
         wbytes = st.st_blksize;
+#else
+    /* no block size of files on Windows: 64 KiB blocks, rather than a
+     * request every 4 KiB on a network file system */
+    wbytes = 64 * 1024;
 #endif
     if (wbytes < WRITE_BLOCK_SIZE_DEFAULT)
         wbytes = WRITE_BLOCK_SIZE_DEFAULT;
@@ -2715,8 +2719,9 @@ storageBackendVolWipeLocalFile(const char *path,
     }
 
 #ifdef WIN32
-    /* no block counts on Windows: written over, by blocks of 4 KiB */
-    return storageBackendWipeLocal(path, fd, allocation, 4096, zero_end);
+    /* no block counts on Windows: written over, by blocks of 1 MiB (a
+     * request each on a network file system) */
+    return storageBackendWipeLocal(path, fd, allocation, 1024 * 1024, zero_end);
 #else
     if (S_ISREG(st.st_mode) && st.st_blocks < (st.st_size / DEV_BSIZE))
         return storageBackendVolZeroSparseFileLocal(path, st.st_size, fd);
