@@ -33,7 +33,7 @@ New in 0.5.0, tested on Windows 11 26300:
 
 - Network filters (`virtnwfilterd`): the filters of interfaces on a libvirt network (`clean-traffic`, your own) are applied by the network's switch, as ebtables/nftables apply them on Linux: every protocol and attribute of nwfilter, the chains and priorities, connection states (`ct state`, the replies of accepted connections), `reject`, filters changed on running guests, and the learning of the guest's IP address (`CTRL_IP_LEARNING` `any` and `dhcp`). Each interface now has its own socket on the switch, so that a guest cannot pass for another one by its MAC address.
 - Host interfaces (`virtinterfaced`): `iface-list`, `iface-dumpxml` (a network bridge of Windows is a bridge with its members; IPv4 and IPv6 configuration), `iface-mac`, `iface-name`, `iface-start` and `iface-destroy`.
-- Storage pools of type `netfs` (SMB shares; NFS with the Client for NFS of Windows) and `fs` (a volume mounted on the pool's directory, formatted by `pool-build --overwrite`); `find-storage-pool-sources` lists the shares of a host.
+- Storage pools of type `netfs` (SMB shares; NFS through the Client for NFS of Windows, which Windows Home lacks, is not tested) and `fs` (a volume mounted on the pool's directory, formatted by `pool-build --overwrite`); `find-storage-pool-sources` lists the shares of a host.
 - LXC (`virtlxcd`): `lxc:///system` is the LXC driver of libvirt running in a small Alpine Linux VM under WHPX, which `virtlxcd --setup` makes once; same commands and XML as on Linux, the containers live in that VM.
 - TLS (`qemu+tls://`), tested.
 - Not possible: PCI passthrough needs Hyper-V's device assignment (`pcip.sys`), which Windows Home does not have.
