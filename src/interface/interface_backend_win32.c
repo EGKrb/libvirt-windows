@@ -81,6 +81,7 @@ typedef struct {
     char *name;         /* connection name (alias) */
     char *mac;          /* NULL without an Ethernet address */
     bool active;        /* link up */
+    bool enabled;       /* administratively up */
     bool mux;           /* a multiplexor: a network bridge or a team */
     NET_IFINDEX index;
     NET_LUID luid;
@@ -248,6 +249,7 @@ win32IfaceListGet(win32IfaceList *list)
             iface->mac = g_strdup(virMacAddrFormat(&mac, macstr));
         }
         iface->active = row->OperStatus == IfOperStatusUp;
+        iface->enabled = row->AdminStatus == NET_IF_ADMIN_STATUS_UP;
         iface->mux = info[j].mux;
         iface->index = row->InterfaceIndex;
         iface->luid = row->InterfaceLuid;
@@ -866,6 +868,14 @@ win32InterfaceSetAdmin(virInterfacePtr ifinfo,
     } else {
         if (virInterfaceDestroyEnsureACL(ifinfo->conn, def) < 0)
             goto cleanup;
+    }
+
+    /* as ifup and ifdown: nothing to do for an adapter already enabled
+     * (whose link may be down, as a TAP adapter without its guest), or
+     * already disabled */
+    if (iface->enabled == enable) {
+        ret = 0;
+        goto cleanup;
     }
 
     cmd = virCommandNewArgList("netsh", "interface", "set", "interface",

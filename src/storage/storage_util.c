@@ -2816,7 +2816,15 @@ virStorageBackendBuildLocal(virStoragePoolObj *pool)
     int ret;
 
     parent = g_strdup(def->target.path);
-    if (!(p = strrchr(parent, '/'))) {
+#ifdef WIN32
+    /* C:\dir as well as C:/dir */
+    g_strdelimit(parent, "\\", '/');
+    if (!g_path_is_absolute(def->target.path))
+        p = NULL;
+    else
+#endif
+    p = strrchr(parent, '/');
+    if (!p) {
         virReportError(VIR_ERR_INVALID_ARG,
                        _("path '%1$s' is not absolute"),
                        def->target.path);

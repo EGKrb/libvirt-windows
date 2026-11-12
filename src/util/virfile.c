@@ -3634,6 +3634,12 @@ int virDirRead(DIR *dirp, struct dirent **ent, const char *name)
     do {
         errno = 0;
         *ent = readdir(dirp); /* exempt from syntax-check */
+#ifdef WIN32
+        /* the root of an empty volume has not even "." and "..": the
+         * readdir() of MinGW ends it with ENOENT */
+        if (!*ent && errno == ENOENT)
+            errno = 0;
+#endif
         if (!*ent && errno) {
             if (name)
                 virReportSystemError(errno, _("Unable to read directory '%1$s'"),
