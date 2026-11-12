@@ -22,7 +22,12 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
-#include <sys/statvfs.h>
+#ifdef WIN32
+# define WIN32_LEAN_AND_MEAN
+# include <windows.h>
+#else
+# include <sys/statvfs.h>
+#endif
 #include <sys/param.h>
 #include <dirent.h>
 #ifdef __linux__
@@ -126,7 +131,9 @@ virStorageBackendCopyToFD(virStorageVolDef *vol,
     size_t rbytes = READ_BLOCK_SIZE_DEFAULT;
     int wbytes = 0;
     int interval;
+#ifndef WIN32
     struct stat st;
+#endif
     g_autofree char *zerobuf = NULL;
     g_autofree char *buf = NULL;
     VIR_AUTOCLOSE inputfd = -1;
@@ -142,8 +149,10 @@ virStorageBackendCopyToFD(virStorageVolDef *vol,
     if (ioctl(fd, BLKBSZGET, &wbytes) < 0)
         wbytes = 0;
 #endif
+#ifndef WIN32
     if ((wbytes == 0) && fstat(fd, &st) == 0)
         wbytes = st.st_blksize;
+#endif
     if (wbytes < WRITE_BLOCK_SIZE_DEFAULT)
         wbytes = WRITE_BLOCK_SIZE_DEFAULT;
 
@@ -279,12 +288,17 @@ storageBackendCreateBlockFrom(virStoragePoolObj *pool G_GNUC_UNUSED,
 
     mode = (vol->target.perms->mode == (mode_t)-1 ?
             VIR_STORAGE_DEFAULT_VOL_PERM_MODE : vol->target.perms->mode);
+#ifdef WIN32
+    /* no POSIX modes on Windows files: the ACL of the folder applies */
+    VIR_DEBUG("mode %04o of '%s' not set on Windows", mode, vol->target.path);
+#else
     if (fchmod(fd, mode) < 0) {
         virReportSystemError(errno,
                              _("cannot set mode of '%1$s' to %2$04o"),
                              vol->target.path, mode);
         return -1;
     }
+#endif
     if (VIR_CLOSE(fd) < 0) {
         virReportSystemError(errno,
                              _("cannot close file '%1$s'"),
@@ -1585,7 +1599,12 @@ virStorageBackendVolOpen(const char *path, struct stat *sb,
     g_autofree char *base = g_path_get_basename(path);
     bool noerror = (flags & VIR_STORAGE_VOL_OPEN_NOERROR);
 
+#ifdef WIN32
+    /* GStatBuf is not struct stat on Windows */
+    if (stat(path, sb) < 0) {
+#else
     if (g_lstat(path, sb) < 0) {
+#endif
         if (errno == ENOENT) {
             if (noerror) {
                 VIR_WARN("ignoring missing file '%s'", path);
@@ -1633,6 +1652,9 @@ virStorageBackendVolOpen(const char *path, struct stat *sb,
      * root-squash environment. If the target path isn't on shared
      * file system, the open will fail in the OPEN_FORK path.
      */
+#ifndef O_NONBLOCK
+# define O_NONBLOCK 0
+#endif
     if ((fd = virFileOpenAs(path, O_RDONLY|O_NONBLOCK|O_NOCTTY,
                             0, sb->st_uid, sb->st_gid,
                             VIR_FILE_OPEN_NOFORK|VIR_FILE_OPEN_FORK)) < 0) {
@@ -1900,6 +1922,12 @@ virStorageBackendUpdateVolTargetInfoFD(virStorageSource *target,
     target->timestamps->btime = sb->st_birthtimespec;
     target->timestamps->ctime = sb->st_ctimespec;
     target->timestamps->mtime = sb->st_mtimespec;
+#elif defined(WIN32)
+    /* seconds only on Windows; no birth time */
+    target->timestamps->atime = (struct timespec){sb->st_atime, 0};
+    target->timestamps->btime = (struct timespec){0, 0};
+    target->timestamps->ctime = (struct timespec){sb->st_ctime, 0};
+    target->timestamps->mtime = (struct timespec){sb->st_mtime, 0};
 #else /* ! __APPLE__ */
     target->timestamps->atime = sb->st_atim;
 # ifdef __linux__
@@ -2527,6 +2555,7 @@ virStorageBackendVolDownloadLocal(virStoragePoolObj *pool G_GNUC_UNUSED,
  * the file. If the file size is increased, the extended area shall
  * appear as if it were zero-filled.
  */
+#ifndef WIN32
 static int
 storageBackendVolZeroSparseFileLocal(const char *path,
                                      off_t size,
@@ -2548,6 +2577,7 @@ storageBackendVolZeroSparseFileLocal(const char *path,
 
     return 0;
 }
+#endif /* !WIN32 */
 
 
 static int
@@ -2684,11 +2714,16 @@ storageBackendVolWipeLocalFile(const char *path,
         return virCommandRun(cmd, NULL);
     }
 
+#ifdef WIN32
+    /* no block counts on Windows: written over, by blocks of 4 KiB */
+    return storageBackendWipeLocal(path, fd, allocation, 4096, zero_end);
+#else
     if (S_ISREG(st.st_mode) && st.st_blocks < (st.st_size / DEV_BSIZE))
         return storageBackendVolZeroSparseFileLocal(path, st.st_size, fd);
 
     return storageBackendWipeLocal(path, fd, allocation, st.st_blksize,
                                    zero_end);
+#endif
 }
 
 
@@ -3528,7 +3563,9 @@ virStorageBackendRefreshLocal(virStoragePoolObj *pool)
     virStoragePoolDef *def = virStoragePoolObjGetDef(pool);
     g_autoptr(DIR) dir = NULL;
     struct dirent *ent;
+#ifndef WIN32
     struct statvfs sb;
+#endif
     struct stat statbuf;
     int direrr;
     g_autoptr(virStorageVolDef) vol = NULL;
@@ -3575,6 +3612,33 @@ virStorageBackendRefreshLocal(virStoragePoolObj *pool)
 
     target = virStorageSourceNew();
 
+#ifdef WIN32
+    {
+        /* a directory cannot be open()ed on Windows: its attributes, and
+         * the capacity of its volume */
+        g_autofree wchar_t *wpath = (wchar_t *)g_utf8_to_utf16(def->target.path, -1,
+                                                              NULL, NULL, NULL);
+        ULARGE_INTEGER avail, total, freeBytes;
+
+        if (stat(def->target.path, &statbuf) < 0) {
+            virReportSystemError(errno,
+                                 _("cannot stat path '%1$s'"),
+                                 def->target.path);
+            return -1;
+        }
+        if (virStorageBackendUpdateVolTargetInfoFD(target, -1, &statbuf) < 0)
+            return -1;
+        if (!wpath || !GetDiskFreeSpaceExW(wpath, &avail, &total, &freeBytes)) {
+            virReportError(VIR_ERR_SYSTEM_ERROR,
+                           _("cannot get the free space of '%1$s': Windows error %2$lu"),
+                           def->target.path, GetLastError());
+            return -1;
+        }
+        def->capacity = total.QuadPart;
+        def->available = freeBytes.QuadPart;
+        def->allocation = def->capacity - def->available;
+    }
+#else
     if ((fd = open(def->target.path, O_RDONLY)) < 0) {
         virReportSystemError(errno,
                              _("cannot open path '%1$s'"),
@@ -3605,6 +3669,7 @@ virStorageBackendRefreshLocal(virStoragePoolObj *pool)
     def->available = ((unsigned long long)sb.f_bfree *
                       (unsigned long long)sb.f_frsize);
     def->allocation = def->capacity - def->available;
+#endif
 
     def->target.perms.mode = target->perms->mode;
     def->target.perms.uid = target->perms->uid;

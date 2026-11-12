@@ -60,6 +60,11 @@ storage_backend_zfs_sources = [
 ]
 
 if conf.has('WITH_STORAGE')
+  # Windows: the fs backend is built in the driver (see storage_backend.c)
+  if host_machine.system() == 'windows'
+    storage_driver_sources += storage_backend_fs_sources
+  endif
+
   storage_driver_impl_lib = static_library(
     'virt_storage_driver_impl',
     [
@@ -87,13 +92,15 @@ if conf.has('WITH_STORAGE')
     ],
   }
 
-  virt_modules += {
-    'name': 'virt_storage_backend_fs',
-    'sources': [
-      files(storage_backend_fs_sources),
-    ],
-    'install_dir': storage_backend_install_dir,
-  }
+  if host_machine.system() != 'windows'
+    virt_modules += {
+      'name': 'virt_storage_backend_fs',
+      'sources': [
+        files(storage_backend_fs_sources),
+      ],
+      'install_dir': storage_backend_install_dir,
+    }
+  endif
 
   virt_daemons += {
     'name': 'virtstoraged',

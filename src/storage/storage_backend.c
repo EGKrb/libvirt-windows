@@ -26,6 +26,9 @@
 #include "virerror.h"
 #include "internal.h"
 #include "storage_backend.h"
+#ifdef WIN32
+# include "storage_backend_fs.h"
+#endif
 #include "virlog.h"
 #include "virmodule.h"
 #include "virfile.h"
@@ -76,7 +79,7 @@ static size_t virStorageBackendsCount;
 
 #define STORAGE_BACKEND_MODULE_DIR LIBDIR "/libvirt/storage-backend"
 
-static int
+static int G_GNUC_UNUSED
 virStorageDriverLoadBackendModule(const char *name,
                                   const char *regfunc,
                                   bool forceload)
@@ -102,7 +105,12 @@ virStorageDriverLoadBackendModule(const char *name,
 int
 virStorageBackendDriversRegister(bool allbackends G_GNUC_UNUSED)
 {
-#if WITH_STORAGE_DIR || WITH_STORAGE_FS
+#if (WITH_STORAGE_DIR || WITH_STORAGE_FS) && defined(WIN32)
+    /* built in the driver: a DLL cannot leave the driver's symbols it
+     * uses unresolved until it is loaded, as a module does on ELF */
+    if (virStorageBackendFsRegister() < 0)
+        return -1;
+#elif WITH_STORAGE_DIR || WITH_STORAGE_FS
     VIR_STORAGE_BACKEND_REGISTER(virStorageBackendFsRegister, "fs");
 #endif
 #if WITH_STORAGE_LVM

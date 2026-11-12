@@ -115,8 +115,16 @@ int virSetBlocking(int fd, bool blocking)
 {
     unsigned long arg = blocking ? 0 : 1;
 
-    if (ioctlsocket(fd, FIONBIO, &arg) < 0)
+    if (ioctlsocket(fd, FIONBIO, &arg) < 0) {
+        int type;
+        socklen_t len = sizeof(type);
+
+        /* files and pipes of the C runtime are always blocking (the error
+         * for them depends on the kind of handle) */
+        if (blocking && getsockopt(fd, SOL_SOCKET, SO_TYPE, (char *)&type, &len) < 0)
+            return 0;
         return -1;
+    }
 
     return 0;
 }
