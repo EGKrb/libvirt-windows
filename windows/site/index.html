@@ -142,11 +142,11 @@ Escape character is ^] (Ctrl + ])
           <thead><tr><th>Area</th><th>Works and tested</th><th>Not yet</th></tr></thead>
           <tbody>
             <tr><td>Daemons</td><td>modular and monolithic, reload, stop, reconnection</td><td>Windows services</td></tr>
-            <tr><td>Remote</td><td>UNIX sockets, <code>ext</code> transport</td><td><code>ssh</code> (untested), TLS</td></tr>
+            <tr><td>Remote</td><td>UNIX sockets, <code>ssh</code>, <code>libssh</code>, <code>libssh2</code>, <code>ext</code></td><td>TLS</td></tr>
             <tr><td>QEMU</td><td>lifecycle, console, screenshot, QMP, hotplug, balloon, memory stats, save/restore, dump, live migration (also with storage copy), snapshots, SMBIOS sysinfo</td><td></td></tr>
             <tr><td>Guest networking</td><td><code>user</code>, <code>network</code>, <code>bridge</code> to a libvirt network, <code>ethernet</code> (TAP-Windows), bridges to the host LAN (Windows network bridge)</td><td></td></tr>
             <tr><td>Virtual networks</td><td><code>nat</code>, isolated, <code>route</code> and <code>open</code> (Wintun), DHCP, DHCPv6, DNS, IPv6, QoS</td><td></td></tr>
-            <tr><td>Other drivers</td><td>secrets</td><td>storage, nodedev, interface, nwfilter, LXC</td></tr>
+            <tr><td>Other drivers</td><td>secrets, storage (directory pools), node devices (PCI, USB, network, disks)</td><td>interface, nwfilter, LXC</td></tr>
           </tbody>
         </table>
       </div>

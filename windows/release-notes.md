@@ -27,12 +27,15 @@ The source of libvirt itself is the repository at this tag (*Source code* below)
 
 ## What works
 
-Daemons (modular and `libvirtd`), secrets, QEMU guests with WHPX (lifecycle, `virsh console`, screenshots, QMP, NIC hotplug, memory balloon, save/restore, dump, live migration), user networking, virtual networks (NAT, isolated, `route` and `open` through Wintun) with DHCP, DHCPv6, DNS, IPv6, QoS, statistics and Windows firewall rules, TAP-Windows interfaces and bridges to the host's LAN. The [status table](https://github.com/EGKrb/libvirt-windows#status) lists what is not done yet: storage, nodedev, snapshots, migration with storage copy.
+Daemons (modular and `libvirtd`), secrets, remote access over UNIX sockets and SSH, QEMU guests with WHPX (lifecycle, `virsh console`, screenshots, QMP, NIC hotplug, memory balloon, save/restore, dump, snapshots, live migration with or without storage copy), user networking, virtual networks (NAT, isolated, `route` and `open` through Wintun) with DHCP, DHCPv6, DNS, IPv6, QoS and Windows firewall rules, TAP-Windows interfaces and bridges to the host's LAN, storage pools of directories, node devices. The [status table](https://github.com/EGKrb/libvirt-windows#status) lists what is not done yet.
 
-New in 0.3.0, tested on Windows 11 26300:
+New in 0.4.0, tested on Windows 11 26300:
 
-- `virsh save`, `restore`, `managedsave` and `dump`, and live migration (`virsh migrate --live`, direct or `--p2p`) between libvirt instances. They need the updated [QEMU patch](https://github.com/EGKrb/libvirt-windows/tree/main/windows/qemu), which adds to WHPX what migration needs (dirty page tracking, the guest's Hyper-V and CPU state, the partition's clock). With it, guests use the local APIC timer rather than Hyper-V's synthetic timers, whose state cannot be saved.
-- Bridges to the host's LAN: an `<interface type='bridge'>`, or a network `<forward mode='bridge'/>`, on a network bridge of Windows named as the bridge (`br0`) gets a TAP-Windows adapter that libvirt adds to the bridge and deletes with the guest. See the README for making the bridge.
-- `<interface type='ethernet'>` with `<target dev='NAME' managed='no'/>`: an existing TAP-Windows adapter, used as it is and left after the guest.
+- Storage driver (`virtstoraged`): pools of type `dir` and their volumes (raw, and qcow2 with `qemu-img`): create, clone, resize, upload, download, wipe, delete. A migration with `--copy-storage-all` now creates the destination disk in the pool that holds its path, as on Linux.
+- Node device driver (`virtnodedevd`): `nodedev-list` and `nodedev-dumpxml` of the computer, PCI and USB devices, network interfaces and disks, under their parents in the device tree of Windows.
+- Host information: `virsh sysinfo` and `<smbios mode='host'/>` from the SMBIOS table, the host UUID from it, `nodeinfo`, `nodecpustats`, `nodecpumap`, the host CPU model and its TSC frequency in `capabilities`.
+- Snapshots (internal and external, with memory, revert, delete) and `--copy-storage-all` migrations, tested.
+- Remote access over SSH: `qemu+ssh` (with the `ssh` of Windows or of MSYS2), `qemu+libssh` and `qemu+libssh2`, with `virt-ssh-helper` on the remote side.
+- Fix: 64-bit unsigned values carried by the RPC protocol could read back wrong (MSYS2's XDR library sign-extended them), for example sizes of 2 GiB and more.
 
-Since 0.2.0: TAP-Windows interfaces, forward modes `route` and `open` through Wintun (`wintun.dll` in `libexec`), and Windows firewall rules as firewalld's `libvirt` zone. TAP-Windows and Wintun need the TAP-Windows6 driver of OpenVPN (9.27 or later) or `wintun.dll`, and administrator rights.
+Since 0.3.0: save, restore, `managedsave`, `dump` and live migration with WHPX (with the [QEMU patch](https://github.com/EGKrb/libvirt-windows/tree/main/windows/qemu)), bridges to the host's LAN, `managed='no'` TAP adapters. Since 0.2.0: TAP-Windows interfaces, forward modes `route` and `open` through Wintun, Windows firewall rules.

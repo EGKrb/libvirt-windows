@@ -35,9 +35,19 @@ From PowerShell, in this folder:
 
     sbin\virtnetworkd.exe --daemon
     sbin\virtqemud.exe --daemon
+    sbin\virtstoraged.exe --daemon
+    sbin\virtnodedevd.exe --daemon
     bin\virsh.exe -c qemu:///system net-list --all
 
 The "default" network (NAT, 192.168.122.0/24) starts with virtnetworkd.
+Storage pools are directories (pool type "dir"); a pool of the images,
+which migrations with --copy-storage-all also create their disks in:
+
+    bin\virsh.exe -c qemu:///system pool-define-as default dir --target C:\libvirt\var\lib\libvirt\images
+    bin\virsh.exe -c qemu:///system pool-build default
+    bin\virsh.exe -c qemu:///system pool-start default
+    bin\virsh.exe -c qemu:///system pool-autostart default
+
 Domains use <domain type='whpx'>; see the README of the repository for a
 complete example.
 
