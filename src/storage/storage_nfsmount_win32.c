@@ -278,6 +278,10 @@ nmCreate(const char *path, fuse_mode_t mode, struct fuse_file_info *fi)
 
     if (rc < 0)
         return nmFail("create", path, rc);
+    /* libnfs leaves NFS 4 files created with the mode 0000, which WinFsp
+     * makes an ACL nobody may open: the mode is set again */
+    if ((rc = NFS_CALL(nfs_chmod(nfs, path, mode & 07777))) < 0)
+        nmFail("chmod", path, rc);
     f = g_new0(nmFile, 1);
     f->fh = fh;
     f->flags = fi->flags;
@@ -427,7 +431,14 @@ nmUnlink(const char *path)
 static int
 nmMkdir(const char *path, fuse_mode_t mode)
 {
-    return NFS_CALL(nfs_mkdir2(nfs, path, mode & 07777));
+    int rc = NFS_CALL(nfs_mkdir2(nfs, path, mode & 07777));
+
+    if (rc < 0)
+        return nmFail("mkdir", path, rc);
+    /* as for files (nmCreate) */
+    if ((rc = NFS_CALL(nfs_chmod(nfs, path, mode & 07777))) < 0)
+        nmFail("chmod", path, rc);
+    return 0;
 }
 
 

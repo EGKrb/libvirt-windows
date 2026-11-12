@@ -114,6 +114,17 @@ int virSetInherit(int fd G_GNUC_UNUSED, bool inherit G_GNUC_UNUSED)
 int virSetBlocking(int fd, bool blocking)
 {
     unsigned long arg = blocking ? 0 : 1;
+    HANDLE h = (HANDLE)_get_osfhandle(fd);
+
+    /* a file on a disk or a file system (WinFsp too, where the requests
+     * of Winsock reach the file system and fail otherwise) is always
+     * blocking; a socket is not FILE_TYPE_DISK */
+    if (h != INVALID_HANDLE_VALUE && GetFileType(h) == FILE_TYPE_DISK) {
+        if (blocking)
+            return 0;
+        errno = EINVAL;
+        return -1;
+    }
 
     if (ioctlsocket(fd, FIONBIO, &arg) < 0) {
         int type;
