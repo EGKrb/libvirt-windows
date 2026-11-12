@@ -61,6 +61,32 @@ static HANDLE nmTerm;
     ({ __typeof__(expr) _r; EnterCriticalSection(&nfsLock); _r = (expr); \
        LeaveCriticalSection(&nfsLock); _r; })
 
+/* the server asks to wait (the grace period of NFS 4 after it starts, or
+ * a busy server): the client of Linux waits and retries */
+static bool
+nmShouldRetry(void)
+{
+    const char *err = nfs_get_error(nfs);
+
+    return err && (strstr(err, "NFS4ERR_GRACE") || strstr(err, "NFS4ERR_DELAY") ||
+                   strstr(err, "NFS3ERR_JUKEBOX"));
+}
+
+/* an operation, retried every second for 2 minutes while the server says
+ * to wait */
+#define NFS_CALL(expr) \
+    ({ int _rc; int _tries = 0; bool _again; \
+       for (;;) { \
+           EnterCriticalSection(&nfsLock); \
+           _rc = (expr); \
+           _again = _rc < 0 && nmShouldRetry() && _tries++ < 120; \
+           LeaveCriticalSection(&nfsLock); \
+           if (!_again) \
+               break; \
+           Sleep(1000); \
+       } \
+       _rc; })
+
 
 /* ---------------------------------------------------------------------
  * WinFsp, loaded at run time
@@ -145,7 +171,7 @@ static int
 nmGetattr(const char *path, struct fuse_stat *stbuf)
 {
     struct nfs_stat_64 st;
-    int rc = NFS_LOCKED(nfs_stat64(nfs, path, &st));
+    int rc = NFS_CALL(nfs_stat64(nfs, path, &st));
 
     if (rc < 0)
         return rc;
@@ -162,7 +188,7 @@ nmFgetattr(const char *path, struct fuse_stat *stbuf, struct fuse_file_info *fi)
 
     if (!fi || !fi->fh)
         return nmGetattr(path, stbuf);
-    rc = NFS_LOCKED(nfs_fstat64(nfs, ((nmFile *)(uintptr_t)fi->fh)->fh, &st));
+    rc = NFS_CALL(nfs_fstat64(nfs, ((nmFile *)(uintptr_t)fi->fh)->fh, &st));
     if (rc < 0)
         return rc;
     nmStat(&st, stbuf);
@@ -229,7 +255,7 @@ nmOpen(const char *path, struct fuse_file_info *fi)
 {
     struct nfsfh *fh;
     nmFile *f;
-    int rc = NFS_LOCKED(nfs_open(nfs, path, fi->flags & O_ACCMODE, &fh));
+    int rc = NFS_CALL(nfs_open(nfs, path, fi->flags & O_ACCMODE, &fh));
 
     if (rc < 0) {
         fprintf(stderr, "libvirt_nfsmount: open flags 0x%x\n", fi->flags);
@@ -248,7 +274,7 @@ nmCreate(const char *path, fuse_mode_t mode, struct fuse_file_info *fi)
 {
     struct nfsfh *fh;
     nmFile *f;
-    int rc = NFS_LOCKED(nfs_creat(nfs, path, mode & 07777, &fh));
+    int rc = NFS_CALL(nfs_creat(nfs, path, mode & 07777, &fh));
 
     if (rc < 0)
         return nmFail("create", path, rc);
@@ -267,7 +293,7 @@ nmCommit(const char *path, nmFile *f)
 
     if (!f || !f->written)
         return 0;
-    if ((rc = NFS_LOCKED(nfs_fsync(nfs, f->fh))) < 0)
+    if ((rc = NFS_CALL(nfs_fsync(nfs, f->fh))) < 0)
         return nmFail("commit", path, rc);
     f->written = false;
     return 0;
@@ -308,7 +334,7 @@ nmRead(const char *path, char *buf, size_t size, fuse_off_t off,
         return -EBADF;
     while (done < size) {
         size_t n = MIN(size - done, max);
-        int rc = NFS_LOCKED(nfs_pread(nfs, f->fh, buf + done, n, off + done));
+        int rc = NFS_CALL(nfs_pread(nfs, f->fh, buf + done, n, off + done));
 
         if (rc < 0)
             return done ? (int)done : nmFail("read", path, rc);
@@ -332,7 +358,7 @@ nmWrite(const char *path, const char *buf, size_t size,
         return -EBADF;
     while (done < size) {
         size_t n = MIN(size - done, max);
-        int rc = NFS_LOCKED(nfs_pwrite(nfs, f->fh, buf + done, n, off + done));
+        int rc = NFS_CALL(nfs_pwrite(nfs, f->fh, buf + done, n, off + done));
 
         if (rc < 0) {
             fprintf(stderr, "libvirt_nfsmount: write flags 0x%x offset %lld\n",
@@ -357,7 +383,7 @@ nmFsync(const char *path, int datasync G_GNUC_UNUSED,
 
     if (!f)
         return 0;
-    if ((rc = NFS_LOCKED(nfs_fsync(nfs, f->fh))) < 0)
+    if ((rc = NFS_CALL(nfs_fsync(nfs, f->fh))) < 0)
         return nmFail("fsync", path, rc);
     f->written = false;
     return 0;
@@ -367,7 +393,7 @@ nmFsync(const char *path, int datasync G_GNUC_UNUSED,
 static int
 nmTruncate(const char *path, fuse_off_t size)
 {
-    int rc = NFS_LOCKED(nfs_truncate(nfs, path, size));
+    int rc = NFS_CALL(nfs_truncate(nfs, path, size));
 
     return rc < 0 ? nmFail("truncate", path, rc) : 0;
 }
@@ -383,7 +409,7 @@ nmFtruncate(const char *path, fuse_off_t size, struct fuse_file_info *fi)
      * and a handle opened for reading only can truncate too */
     if (!f)
         return nmTruncate(path, size);
-    rc = NFS_LOCKED(nfs_truncate(nfs, path, size));
+    rc = NFS_CALL(nfs_truncate(nfs, path, size));
     return rc < 0 ? nmFail("ftruncate", path, rc) : 0;
 }
 
@@ -391,35 +417,35 @@ nmFtruncate(const char *path, fuse_off_t size, struct fuse_file_info *fi)
 static int
 nmUnlink(const char *path)
 {
-    return NFS_LOCKED(nfs_unlink(nfs, path));
+    return NFS_CALL(nfs_unlink(nfs, path));
 }
 
 
 static int
 nmMkdir(const char *path, fuse_mode_t mode)
 {
-    return NFS_LOCKED(nfs_mkdir2(nfs, path, mode & 07777));
+    return NFS_CALL(nfs_mkdir2(nfs, path, mode & 07777));
 }
 
 
 static int
 nmRmdir(const char *path)
 {
-    return NFS_LOCKED(nfs_rmdir(nfs, path));
+    return NFS_CALL(nfs_rmdir(nfs, path));
 }
 
 
 static int
 nmRename(const char *from, const char *to)
 {
-    return NFS_LOCKED(nfs_rename(nfs, from, to));
+    return NFS_CALL(nfs_rename(nfs, from, to));
 }
 
 
 static int
 nmChmod(const char *path, fuse_mode_t mode)
 {
-    return NFS_LOCKED(nfs_chmod(nfs, path, mode & 07777));
+    return NFS_CALL(nfs_chmod(nfs, path, mode & 07777));
 }
 
 
@@ -432,7 +458,7 @@ nmUtimens(const char *path, const struct fuse_timespec tv[2])
     times[0].tv_usec = tv[0].tv_nsec / 1000;
     times[1].tv_sec = tv[1].tv_sec;
     times[1].tv_usec = tv[1].tv_nsec / 1000;
-    return NFS_LOCKED(nfs_utimes(nfs, path, times));
+    return NFS_CALL(nfs_utimes(nfs, path, times));
 }
 
 
@@ -440,7 +466,7 @@ static int
 nmStatfs(const char *path G_GNUC_UNUSED, struct fuse_statvfs *stbuf)
 {
     struct nfs_statvfs_64 sv;
-    int rc = NFS_LOCKED(nfs_statvfs64(nfs, "/", &sv));
+    int rc = NFS_CALL(nfs_statvfs64(nfs, "/", &sv));
 
     if (rc < 0)
         return rc;
