@@ -351,7 +351,10 @@ nmWrite(const char *path, const char *buf, size_t size,
         fuse_off_t off, struct fuse_file_info *fi)
 {
     nmFile *f = nmFileOf(fi);
-    size_t max = NFS_LOCKED(nfs_get_writemax(nfs));
+    /* libnfs on Windows never gets an answer to an NFS 4 WRITE of more
+     * than 128 KiB (as measured against the nfsd of Linux): requests of
+     * 128 KiB at most, the size the server gives NFS 3 */
+    size_t max = MIN(NFS_LOCKED(nfs_get_writemax(nfs)), 128 * 1024);
     size_t done = 0;
 
     if (!f)
