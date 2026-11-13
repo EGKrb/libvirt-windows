@@ -29,11 +29,16 @@ The source of libvirt itself is the repository at this tag (*Source code* below)
 
 Daemons (modular and `libvirtd`), secrets, remote access over UNIX sockets, TLS and SSH, QEMU guests with WHPX (lifecycle, `virsh console`, screenshots, QMP, NIC hotplug, memory balloon, save/restore, dump, snapshots, live migration with or without storage copy), user networking, virtual networks (NAT, isolated, `route` and `open` through Wintun) with DHCP, DHCPv6, DNS, IPv6, QoS and Windows firewall rules, TAP-Windows interfaces and bridges to the host's LAN, network filters, storage pools of directories, volumes and shares, node devices, host interfaces, LXC in a Linux VM. The [status table](https://github.com/EGKrb/libvirt-windows#status) lists what is not done.
 
-New in 0.5.0, tested on Windows 11 26300:
+New in 0.6.0, tested on Windows 11 26300:
+
+- NFS storage pools (`netfs` with source format `nfs`, NFS 3 and 4) without the Client for NFS of Windows, so on Windows Home too: `libvirt_nfsmount` mounts the export on the pool's directory with libnfs and [WinFsp](https://winfsp.dev), which must be installed. Tested against the nfsd of Linux: define, build, start, destroy, volumes created, resized, wiped, cloned, uploaded, downloaded and deleted, NFS 3 and 4. Without WinFsp, libvirt uses the Client for NFS of Windows as before.
+- Fixes: `ftruncate` sets the end of a file in one call (it wrote zeros 4 KiB at a time), files on file systems of WinFsp are no longer taken for sockets.
+
+New in 0.5.0:
 
 - Network filters (`virtnwfilterd`): the filters of interfaces on a libvirt network (`clean-traffic`, your own) are applied by the network's switch, as ebtables/nftables apply them on Linux: every protocol and attribute of nwfilter, the chains and priorities, connection states (`ct state`, the replies of accepted connections), `reject`, filters changed on running guests, and the learning of the guest's IP address (`CTRL_IP_LEARNING` `any` and `dhcp`). Each interface now has its own socket on the switch, so that a guest cannot pass for another one by its MAC address.
 - Host interfaces (`virtinterfaced`): `iface-list`, `iface-dumpxml` (a network bridge of Windows is a bridge with its members; IPv4 and IPv6 configuration), `iface-mac`, `iface-name`, `iface-start` and `iface-destroy`.
-- Storage pools of type `netfs` (SMB shares; NFS through the Client for NFS of Windows, which Windows Home lacks, is not tested) and `fs` (a volume mounted on the pool's directory, formatted by `pool-build --overwrite`); `find-storage-pool-sources` lists the shares of a host.
+- Storage pools of type `netfs` (SMB shares) and `fs` (a volume mounted on the pool's directory, formatted by `pool-build --overwrite`); `find-storage-pool-sources` lists the shares of a host.
 - LXC (`virtlxcd`): `lxc:///system` is the LXC driver of libvirt running in a small Alpine Linux VM under WHPX, which `virtlxcd --setup` makes once; same commands and XML as on Linux, the containers live in that VM.
 - TLS (`qemu+tls://`), tested.
 - Not possible: PCI passthrough needs Hyper-V's device assignment (`pcip.sys`), which Windows Home does not have.

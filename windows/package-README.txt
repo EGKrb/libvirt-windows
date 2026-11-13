@@ -53,6 +53,9 @@ which migrations with --copy-storage-all also create their disks in:
 Pools of type netfs link their target directory to a share (\\HOST\DIR),
 pools of type fs mount a volume (E: or \\?\Volume{GUID}\) on it: both take
 administrator rights (or the developer mode of Windows for netfs).
+NFS shares (source format nfs) are mounted by libvirt_nfsmount with
+libnfs when WinFsp (https://winfsp.dev) is installed; otherwise through
+the Client for NFS of Windows, which Windows Home does not have.
 
 Network filters (nwfilter) apply to the interfaces of guests on a libvirt
 network, enforced by its switch.

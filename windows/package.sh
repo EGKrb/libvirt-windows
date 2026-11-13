@@ -173,6 +173,8 @@ done
 rm -f "$dlls"
 
 cp "$SRC/COPYING" "$SRC/COPYING.LESSER" "$SRC/windows/stop-daemons.ps1" "$OUT/"
+mkdir -p "$OUT/share/licenses/winfsp-headers"
+cp "$SRC/windows/winfsp/License.txt" "$SRC/windows/winfsp/README.md" "$OUT/share/licenses/winfsp-headers/"
 cp "$SRC/windows/package-README.txt" "$OUT/README.txt"
 sed -i "s/@VERSION@/$VERSION/" "$OUT/README.txt"
 

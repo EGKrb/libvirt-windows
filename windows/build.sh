@@ -38,6 +38,7 @@ PACKAGES="
   mingw-w64-ucrt-x86_64-libssh2
   mingw-w64-ucrt-x86_64-readline
   mingw-w64-ucrt-x86_64-libslirp
+  mingw-w64-ucrt-x86_64-libnfs
   gettext
   perl
   git
